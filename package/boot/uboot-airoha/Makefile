@@ -81,6 +81,21 @@ define U-Boot/en7523_rfb
   BL31_IMAGE:=en7523-bl31.bin
 endef
 
+define U-Boot/an7563_rfb
+  NAME:=AN7563 Reference Board
+  UBOOT_CONFIG:=an7563_evb
+  BUILD_DEVICES:=airoha_an7563-evb
+  BUILD_SUBTARGET:=an7563
+  UBOOT_IMAGE:=u-boot.fip
+  BL2_IMAGE:=an7563-bl2.bin
+  BL31_IMAGE:=an7563-bl31.lzma
+  # BL31 is provided pre-compressed (.lzma); skip the separate lzma step
+  BL31_LZMA_PRECOMPRESSED:=1
+  # Legacy fip layout (matches the upstream Airoha ATF "preloader.bin"):
+  # u-boot.fip bundles BL2 + BL31 + U-Boot in a single fip.
+  FIP_LEGACY:=1
+endef
+
 UBOOT_TARGETS := \
 	an7581_gemtek_w1700k \
 	an7581_nokia_valyrian \
@@ -88,6 +103,7 @@ UBOOT_TARGETS := \
 	an7581_rfb \
 	an7583_nokia_xg-040g-mf \
 	an7583_rfb \
+	an7563_rfb \
 	en7523_rfb
 
 UBOOT_CUSTOMIZE_CONFIG := \
@@ -96,6 +112,33 @@ UBOOT_CUSTOMIZE_CONFIG := \
 	--disable TOOLS_MKEFICAPSULE \
 	--enable SERIAL_RX_BUFFER \
 	--set-val SERIAL_RX_BUFFER_SIZE 256
+
+# 1024-byte aligned bl2.fip used by SoCs (e.g. AN7563) whose
+# BootROM expects the legacy preloader alignment.
+define Build/fip-image-bl2-legacy
+	$(STAGING_DIR_HOST)/bin/fiptool create \
+		--align 1024 \
+		--tb-fw files/$(BL2_IMAGE) \
+		$(PKG_BUILD_DIR)/bl2.fip
+endef
+
+# Legacy single-FIP layout used by SoCs whose BootROM expects every
+# stage in one container, 1024-byte aligned:
+#   FIP { BL2, BL31 [+lzma], U-Boot [+lzma] }
+# When BL31_LZMA_PRECOMPRESSED is set the BL31 file is taken as-is;
+# otherwise it is lzma-compressed when LZMA_COMPRESS is set.
+define Build/fip-image-legacy
+	$(if $(BL31_LZMA_PRECOMPRESSED),, \
+		$(if $(LZMA_COMPRESS), $(STAGING_DIR_HOST)/bin/lzma e \
+			files/$(BL31_IMAGE) \
+			$(PKG_BUILD_DIR)/bl31.bin.lzma))
+	$(STAGING_DIR_HOST)/bin/fiptool create \
+		--align 1024 \
+		--tb-fw files/$(BL2_IMAGE) \
+		--soc-fw $(if $(BL31_LZMA_PRECOMPRESSED),files/$(BL31_IMAGE),$(PKG_BUILD_DIR)/bl31.bin$(if $(LZMA_COMPRESS),.lzma)) \
+		--nt-fw $(PKG_BUILD_DIR)/u-boot.$(if $(LZMA_COMPRESS),lzma,bin) \
+		$(PKG_BUILD_DIR)/u-boot.fip
+endef
 
 define Build/Configure
 	$(call Build/Configure/U-Boot)
@@ -107,6 +150,10 @@ define Build/Compile
 	$(if $(LZMA_COMPRESS), $(STAGING_DIR_HOST)/bin/lzma e \
 		$(PKG_BUILD_DIR)/u-boot.bin \
 		$(PKG_BUILD_DIR)/u-boot.lzma)
+ifeq ($(FIP_LEGACY),1)
+	$(call Build/fip-image-bl2-legacy)
+	$(call Build/fip-image-legacy)
+endif
 endef
 
 # don't stage files to bindir, let target/linux/airoha/image/*.mk do that
@@ -115,6 +162,10 @@ endef
 
 define Build/InstallDev
 	$(INSTALL_DIR) $(STAGING_DIR_IMAGE)
+ifeq ($(FIP_LEGACY),1)
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/bl2.fip $(STAGING_DIR_IMAGE)/$(BUILD_VARIANT)-bl2.fip
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/u-boot.fip $(STAGING_DIR_IMAGE)/$(BUILD_VARIANT)-bl2-bl31-u-boot.fip
+endif
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/u-boot.$(if $(LZMA_COMPRESS),lzma,bin) \
 		$(STAGING_DIR_IMAGE)/$(BUILD_VARIANT)-u-boot.$(if $(LZMA_COMPRESS),lzma,bin)
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/u-boot.dtb \
