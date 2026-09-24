@@ -1,0 +1,15 @@
+Avoid indexing the 15-element link array with IEEE80211_LINK_UNSPECIFIED
+(0xf). This matches current upstream mt7996_mac_write_txwi:
+https://github.com/openwrt/mt76/blob/master/mt7996/mac.c
+
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -884,7 +884,7 @@
+ 	if (mvif) {
+ 		if (wcid->offchannel)
+ 			mlink = rcu_dereference(mvif->mt76.offchannel_link);
+-		if (!mlink)
++		if (!mlink && link_id != IEEE80211_LINK_UNSPECIFIED)
+ 			mlink = rcu_dereference(mvif->mt76.link[link_id]);
+ 	}
+ 
