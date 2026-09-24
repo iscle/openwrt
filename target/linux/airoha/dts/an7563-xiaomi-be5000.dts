@@ -28,15 +28,54 @@
 	};
 };
 
+&an7563_pinctrl {
+	gpio-ranges = <&an7563_pinctrl 0 0 28>;
+
+	wifi-enable-hog {
+		/* Stock BL2 drives GPIO 6 high from its embedded environment. */
+		gpio-hog;
+		gpios = <6 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "wifi-enable";
+	};
+};
+
 &pcie0 {
+	compatible = "airoha,an7563-pcie";
+	ranges = <0x82000000 0 0x20000000 0x20000000 0 0x4000000>;
 	status = "okay";
+
+	pcie@0,0 {
+		device_type = "pci";
+		reg = <0x0000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi@0,0 {
+			compatible = "mediatek,mt7992";
+			reg = <0x0000 0 0 0 0>;
+			nvmem-cells = <&wifi_eeprom>;
+			nvmem-cell-names = "eeprom";
+		};
+	};
 };
 
 &pcie1 {
+	compatible = "airoha,an7563-pcie";
+	ranges = <0x82000000 0 0x24000000 0x24000000 0 0x4000000>;
 	status = "okay";
 };
 
 &snfi {
+	status = "okay";
+};
+
+&eth {
+	status = "okay";
+};
+
+&gdm1 {
 	status = "okay";
 };
 
@@ -58,18 +97,28 @@
 			read-only;
 		};
 
-		partition@1 {
+		partition@7c000 {
 			label = "u-boot-env";
 			reg = <0x7c000 0x4000>;
 		};
 
-		partition@2 {
+		partition@80000 {
 			label = "art";
 			reg = <0x80000 0x40000>;
 			read-only;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				wifi_eeprom: eeprom@20000 {
+					reg = <0x20000 0x1e00>;
+				};
+			};
 		};
 
-		partition@3 {
+		partition@c0000 {
 			compatible = "denx,fit";
 			label = "firmware";
 			reg = <0xc0000 0x4000000>;
