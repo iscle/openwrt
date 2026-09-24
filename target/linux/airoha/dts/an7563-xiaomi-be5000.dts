@@ -14,6 +14,10 @@
 	compatible = "xiaomi,be5000", "airoha,an7563", "airoha,en7581";
 
 	aliases {
+		led-boot = &led_status_orange;
+		led-failsafe = &led_status_orange;
+		led-running = &led_status_blue;
+		led-upgrade = &led_status_orange;
 		serial0 = &uart1;
 	};
 
@@ -26,10 +30,39 @@
 		device_type = "memory";
 		reg = <0x80000000 0x20000000>;
 	};
+
+	pwm-leds {
+		compatible = "pwm-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&status_led_pins>;
+
+		led_status_blue: led-0 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_STATUS;
+			pwms = <&an7563_pwm 1 4000000 0>;
+			max-brightness = <255>;
+			active-low;
+		};
+
+		led_status_orange: led-1 {
+			color = <LED_COLOR_ID_ORANGE>;
+			function = LED_FUNCTION_STATUS;
+			pwms = <&an7563_pwm 4 4000000 0>;
+			max-brightness = <255>;
+			active-low;
+			default-state = "on";
+		};
+	};
 };
 
 &an7563_pinctrl {
 	gpio-ranges = <&an7563_pinctrl 0 0 28>;
+
+	status_led_pins: status-led-pins {
+		function = "pwm";
+		pins = "gpio1", "gpio4";
+		output-enable;
+	};
 
 	wifi-enable-hog {
 		/* Stock BL2 drives GPIO 6 high from its embedded environment. */
@@ -38,6 +71,10 @@
 		output-high;
 		line-name = "wifi-enable";
 	};
+};
+
+&an7563_pwm {
+	status = "okay";
 };
 
 &pcie0 {

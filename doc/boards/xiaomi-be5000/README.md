@@ -23,6 +23,12 @@ verifies the resulting frequency. Both cores and all operating points remain
 available. The older baseline release retains its original clock behavior.
 See [VALIDATION.md](VALIDATION.md) for the reproduction and test limits.
 
+The status LED uses hardware PWM: blue on GPIO/PWM 1 and orange on GPIO/PWM 4,
+both active-low. Orange indicates boot, failsafe and upgrade; blue stays on when
+OpenWrt is ready. This indicates system readiness, not Internet connectivity.
+Both colours expose standard LED brightness and trigger controls as
+`blue:status` and `orange:status`.
+
 ## Build
 
 From this repository's root on an OpenWrt-supported build host:

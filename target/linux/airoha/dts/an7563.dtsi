@@ -267,6 +267,12 @@
 				     "simple-mfd";
 			reg = <0x1fbf0200 0xc0>;
 
+			an7563_pwm: pwm {
+				compatible = "airoha,en7581-pwm";
+				#pwm-cells = <3>;
+				status = "disabled";
+			};
+
 			an7563_pinctrl: pinctrl {
 				compatible = "airoha,an7563-pinctrl",
 					     "airoha,en7581-pinctrl";

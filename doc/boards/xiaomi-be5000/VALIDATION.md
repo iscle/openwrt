@@ -1,5 +1,19 @@
 # Upstream validation
 
+## Status LED wiring (2026-09-25)
+
+Stock 1.0.53 uses a `pwm-rgb` consumer with a 4-ms period. Its device-tree
+child names are misleading: the driver assigns packed brightness bytes in
+child order, and the stock `xqled` actions select PWM 4 for orange and PWM 1
+for blue. Direct pin tests confirmed active-low operation and both colours;
+the owner confirmed the blue colour again with the upstream Airoha PWM driver.
+The unchanged upstream driver completed 1,024 duty-cycle updates over both
+channels, including fully on and off, without an error. The board uses the
+standard `pwm-leds` consumer and OpenWrt diagnostic LED aliases; no custom
+LED daemon or direct register writes are installed.
+
+## CPU and wireless validation (2026-09-24)
+
 Official OpenWrt base: `98bc30d154f67557598a2114463e9b97c915463d`.
 Kernel: Linux 6.18.52. Test date: 2026-09-24.
 Test hardware: one Xiaomi BE5000, 512 MiB RAM.
