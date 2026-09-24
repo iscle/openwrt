@@ -23,3 +23,15 @@ endef
 $(eval $(call KernelPackage,pwm-airoha))
 
 
+
+
+define KernelPackage/mdio-an7563
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=Airoha AN7563 external PHY MDIO
+  DEPENDS:=@TARGET_airoha_an7563 +kmod-phy-airoha-en8811h
+  KCONFIG:=CONFIG_MDIO_AN7563
+  FILES:=$(LINUX_DIR)/drivers/net/mdio/mdio-an7563.ko
+  AUTOLOAD:=$(call AutoLoad,20,mdio-an7563,1)
+endef
+
+$(eval $(call KernelPackage,mdio-an7563))

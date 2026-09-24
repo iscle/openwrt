@@ -14,8 +14,10 @@ wireless.
   official OpenWrt main. See the branch's validation record for its exact base.
 
 These are development branches, not an official OpenWrt-supported release.
-The vendor Ethernet path currently treats the physical Ethernet ports as one
-LAN; separate WAN/LAN ports and hardware offload are not validated. The CPU
+The three gigabit sockets share `eth0`; the 2.5-Gbit socket is `eth1`. Both
+interfaces belong to the default LAN bridge. The external EN8811H uses its
+standard Linux PHY driver and firmware, with AN7563 MDIO and 2500BASE-X PCS
+drivers. Separate WAN/LAN operation and hardware offload are not validated. The CPU
 cluster supports 500–1000 MHz in 50-MHz steps on the upstream branch, using
 `ondemand` by default. The AN7563 driver temporarily divides the CPU clock
 during the firmware's clock-source handoff, then restores the divider and

@@ -4,3 +4,6 @@ CONFIG_TARGET_airoha_an7563_DEVICE_xiaomi_be5000=y
 CONFIG_TARGET_ROOTFS_INITRAMFS=y
 CONFIG_PACKAGE_luci=y
 CONFIG_PACKAGE_pciutils=y
+CONFIG_PACKAGE_kmod-mdio-an7563=y
+CONFIG_PACKAGE_kmod-phy-airoha-en8811h=y
+CONFIG_PACKAGE_airoha-en8811h-firmware=y

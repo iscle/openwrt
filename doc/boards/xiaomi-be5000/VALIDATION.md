@@ -1,5 +1,35 @@
 # Upstream validation
 
+## External 2.5-Gbit Ethernet (2026-09-25)
+
+The missing port required three pieces: MDIO access to the EN8811H at address
+15, the PON SerDes in fixed 2500BASE-X Ethernet mode, and GDM2 transmit/receive
+routing through QDMA0. Loading the PHY firmware alone did not establish a link.
+The register fields were checked against the stock firmware and the AN7552
+hardware initialization in [the vendor SDK](https://github.com/lotusmomo/airoha_sdk).
+The new PCS implementation uses masked updates to retain unrelated calibration
+and reset fields; the existing upstream EN8811H driver is unchanged.
+
+A full build and generic-image audit passed. The RAM candidate passed:
+
+* EN8811H firmware initialization (version 25062302), with both Ethernet MACs.
+* 2500-Mbit/s full-duplex negotiation reported by both link partners.
+* DHCP from the existing LAN through the bridged 2.5-Gbit port, with the router
+  acting only as an AP and management DHCP client.
+* Router and upstream gateway pings without loss, and Internet HTTPS explicitly
+  bound to the computer's Ethernet interface.
+* A 128-MiB transfer in each direction with matching SHA-256 checksums.
+* Router interface down/up and computer Ethernet connection restart, followed
+  by link recovery and successful forwarding.
+* Warm reboot from the RAM candidate back to U-Boot without intervention.
+* Both wireless interfaces operational, with existing runtime configuration
+  and the ondemand CPU governor retained; no kernel warning or oops observed.
+
+These are functional tests on one unit, not a line-rate throughput benchmark
+or long-term endurance test. The gigabit sockets remain one switch interface.
+Lower negotiated speeds on the external socket and VLAN isolation have not
+been validated. Final installed-image checks are recorded in release notes.
+
 ## Status LED wiring (2026-09-25)
 
 Stock 1.0.53 uses a `pwm-rgb` consumer with a 4-ms period. Its device-tree

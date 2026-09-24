@@ -162,3 +162,24 @@
 		};
 	};
 };
+
+&hsgmii_pcs {
+	status = "okay";
+};
+
+&mdio {
+	status = "okay";
+
+	phy_2p5g: ethernet-phy@f {
+		compatible = "ethernet-phy-id03a2.a411";
+		reg = <15>;
+		reset-gpios = <&an7563_pinctrl 13 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <1000000>;
+		reset-deassert-us = <100000>;
+	};
+};
+
+&gdm2 {
+	status = "okay";
+	phy-handle = <&phy_2p5g>;
+};

@@ -379,6 +379,23 @@
 			};
 		};
 
+		hsgmii_pcs: pcs@1faf3000 {
+			compatible = "airoha,an7563-pcs";
+			reg = <0x1faf3000 0x2000>, <0x1fa80000 0x6400>;
+			reg-names = "ana", "mac";
+			airoha,scu = <&scu>;
+			#pcs-cells = <0>;
+			status = "disabled";
+		};
+
+		mdio: mdio@1fb5f01c {
+			compatible = "airoha,an7563-mdio";
+			reg = <0x1fb5f01c 0x4>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		eth: ethernet@1fb50000 {
 			compatible = "airoha,an7563-eth", "airoha,en7523-eth";
 			reg = <0x1fb50000 0x2600>,
@@ -423,6 +440,13 @@
 					full-duplex;
 					pause;
 				};
+			};
+			gdm2: ethernet@2 {
+				compatible = "airoha,eth-mac";
+				reg = <2>;
+				phy-mode = "2500base-x";
+				pcs-handle = <&hsgmii_pcs>;
+				status = "disabled";
 			};
 		};
 
