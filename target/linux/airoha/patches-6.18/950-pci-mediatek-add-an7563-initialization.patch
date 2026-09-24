@@ -1,0 +1,193 @@
+--- a/drivers/pci/controller/pcie-mediatek.c
++++ b/drivers/pci/controller/pcie-mediatek.c
+@@ -105,6 +105,7 @@
+ /* PCIe V2 configuration transaction header */
+ #define PCIE_CFG_HEADER0	0x460
+ #define PCIE_CFG_HEADER1	0x464
++#define AN7563_CFG_TAG		(7 << 8)
+ #define PCIE_CFG_HEADER2	0x468
+ #define PCIE_CFG_WDATA		0x470
+ #define PCIE_APP_TLP_REQ	0x488
+@@ -154,6 +155,7 @@
+  * @setup_irq: pointer to initialize IRQ functions
+  */
+ struct mtk_pcie_soc {
++	bool an7563;
+ 	bool need_fix_class_id;
+ 	bool need_fix_device_id;
+ 	bool no_msi;
+@@ -290,7 +292,12 @@
+ 	/* Write PCIe configuration transaction header for Cfgrd */
+ 	writel(CFG_HEADER_DW0(CFG_WRRD_TYPE_0, CFG_RD_FMT),
+ 	       port->base + PCIE_CFG_HEADER0);
+-	writel(CFG_HEADER_DW1(where, size), port->base + PCIE_CFG_HEADER1);
++	/* Keep software configuration TLPs distinct from hardware MMIO reads.
++	 * Airoha's runtime configuration API uses tag 7 on this controller.
++	 */
++	writel(CFG_HEADER_DW1(where, size) |
++	       (port->pcie->soc->an7563 ? AN7563_CFG_TAG : 0),
++	       port->base + PCIE_CFG_HEADER1);
+ 	writel(CFG_HEADER_DW2(where, PCI_FUNC(devfn), PCI_SLOT(devfn), bus),
+ 	       port->base + PCIE_CFG_HEADER2);
+ 
+@@ -320,7 +327,12 @@
+ 	/* Write PCIe configuration transaction header for Cfgwr */
+ 	writel(CFG_HEADER_DW0(CFG_WRRD_TYPE_0, CFG_WR_FMT),
+ 	       port->base + PCIE_CFG_HEADER0);
+-	writel(CFG_HEADER_DW1(where, size), port->base + PCIE_CFG_HEADER1);
++	/* Keep software configuration TLPs distinct from hardware MMIO reads.
++	 * Airoha's runtime configuration API uses tag 7 on this controller.
++	 */
++	writel(CFG_HEADER_DW1(where, size) |
++	       (port->pcie->soc->an7563 ? AN7563_CFG_TAG : 0),
++	       port->base + PCIE_CFG_HEADER1);
+ 	writel(CFG_HEADER_DW2(where, PCI_FUNC(devfn), PCI_SLOT(devfn), bus),
+ 	       port->base + PCIE_CFG_HEADER2);
+ 
+@@ -343,6 +355,14 @@
+ 	struct mtk_pcie *pcie = bus->sysdata;
+ 	struct mtk_pcie_port *port;
+ 	struct pci_dev *dev = NULL;
++
++	/* Each AN7563 controller is a separate PCI domain, at device 0. */
++	if (pcie->soc->an7563) {
++		if (PCI_SLOT(devfn))
++			return NULL;
++		return list_first_entry_or_null(&pcie->ports,
++					       struct mtk_pcie_port, list);
++	}
+ 
+ 	/*
+ 	 * Walk the bus hierarchy to get the devfn value
+@@ -660,6 +680,61 @@
+ 	return 0;
+ }
+ 
++/*
++ * AN7563 uses the v2 configuration/IRQ block but external SCU resets.
++ * Sequence and PHY values follow Airoha's GPL AN7552 PCIe driver
++ * (pcie-ecnt.c and pcie-ecnt-phy.c, version 7552.1.20230912).
++ * Reset both ports once: their host-bridge reset is shared.
++ */
++static int an7563_pcie_init(struct mtk_pcie_port *port)
++{
++	static bool initialized;
++	struct device *dev = port->pcie->dev;
++	void __iomem *scu, *chip, *phy;
++	u32 val, reset_mask = BIT(26) | BIT(27) | BIT(29);
++	int i;
++
++	if (initialized)
++		return 0;
++
++	scu = ioremap(0x1fb00000, 0x900);
++	chip = ioremap(0x1fa20000, 0x200);
++	phy = ioremap(0x1fa93700, 0x2600);
++	if (!scu || !chip || !phy) {
++		iounmap(phy);
++		iounmap(chip);
++		iounmap(scu);
++		return -ENOMEM;
++	}
++
++	/* Open-drain PERST pads, assert endpoints, enable reference clocks. */
++	writel(readl(chip + 0x18c) | 7, chip + 0x18c);
++	val = readl(scu + 0x88);
++	val = (val & ~(BIT(29) | BIT(26))) | BIT(23) | BIT(22);
++	writel(val, scu + 0x88);
++	usleep_range(1000, 2000);
++	writel(readl(scu + 0x834) & ~reset_mask, scu + 0x834);
++	usleep_range(1000, 2000);
++	writel(readl(scu + 0x834) | reset_mask, scu + 0x834);
++	msleep(100);
++	writel(readl(scu + 0x834) & ~reset_mask, scu + 0x834);
++	usleep_range(5000, 6000);
++
++	for (i = 0; i < 2; i++) {
++		writel(0x0c010000, phy + i * 0x2000 + 0x418);
++		writel(0x60080007, phy + i * 0x2000 + 0x404);
++		writel(0x04100803, phy + i * 0x2000 + 0x318);
++	}
++	writel(val | BIT(29) | BIT(26), scu + 0x88);
++	msleep(250);
++	iounmap(phy);
++	iounmap(chip);
++	iounmap(scu);
++	initialized = true;
++	dev_info(dev, "AN7563 PCIe SCU/PHY initialization complete\n");
++	return 0;
++}
++
+ static int mtk_pcie_startup_port_v2(struct mtk_pcie_port *port)
+ {
+ 	struct mtk_pcie *pcie = port->pcie;
+@@ -675,6 +750,15 @@
+ 		mem = entry->res;
+ 	if (!mem)
+ 		return -EINVAL;
++
++	if (soc->an7563) {
++		err = an7563_pcie_init(port);
++		if (err)
++			return err;
++		writel(0x00804201, port->base);
++		writel(0x06040001, port->base + 0x104);
++		goto wait_link;
++	}
+ 
+ 	/* MT7622 platforms need to enable LTSSM and ASPM from PCIe subsys */
+ 	if (pcie->base) {
+@@ -723,6 +807,7 @@
+ 	if (soc->need_fix_device_id)
+ 		writew(soc->device_id, port->base + PCIE_CONF_DEVICE_ID);
+ 
++wait_link:
+ 	/* 100ms timeout value should be enough for Gen1/2 training */
+ 	err = readl_poll_timeout(port->base + PCIE_LINK_STATUS_V2, val,
+ 				 !!(val & PCIE_PORT_LINKUP_V2), 20,
+@@ -740,15 +825,27 @@
+ 
+ 	/* Set AHB to PCIe translation windows */
+ 	val = lower_32_bits(mem->start) |
+-	      AHB2PCIE_SIZE(fls(resource_size(mem)));
++	      AHB2PCIE_SIZE(fls(resource_size(mem)) - (soc->an7563 ? 1 : 0));
+ 	writel(val, port->base + PCIE_AHB_TRANS_BASE0_L);
+ 
+ 	val = upper_32_bits(mem->start);
+ 	writel(val, port->base + PCIE_AHB_TRANS_BASE0_H);
+ 
+ 	/* Set PCIe to AXI translation memory space.*/
+-	val = PCIE2AHB_SIZE | WIN_ENABLE;
++	val = soc->an7563 ? 0x80 : PCIE2AHB_SIZE | WIN_ENABLE;
+ 	writel(val, port->base + PCIE_AXI_WINDOW0);
++	if (soc->an7563) {
++		void __iomem *pbus = ioremap(0x1fbe3400 + port->slot * 8, 8);
++
++		if (!pbus)
++			return -ENOMEM;
++		writel(lower_32_bits(mem->start), pbus);
++		writel(~0U << (fls(resource_size(mem)) - 1), pbus + 4);
++		iounmap(pbus);
++		/* Vendor workaround for AN7563/MT7992 DMA coherency. */
++		writel(readl(port->base + 0x564) | BIT(0), port->base + 0x564);
++	}
++
+ 
+ 	return 0;
+ }
+@@ -1244,7 +1341,15 @@
+ 	.setup_irq = mtk_pcie_setup_irq,
+ };
+ 
++static const struct mtk_pcie_soc mtk_pcie_soc_an7563 = {
++	.an7563 = true,
++	.ops = &mtk_pcie_ops_v2,
++	.startup = mtk_pcie_startup_port_v2,
++	.setup_irq = mtk_pcie_setup_irq,
++};
++
+ static const struct of_device_id mtk_pcie_ids[] = {
++	{ .compatible = "airoha,an7563-pcie", .data = &mtk_pcie_soc_an7563 },
+ 	{ .compatible = "mediatek,mt2701-pcie", .data = &mtk_pcie_soc_v1 },
+ 	{ .compatible = "mediatek,mt7623-pcie", .data = &mtk_pcie_soc_v1 },
+ 	{ .compatible = "mediatek,mt2712-pcie", .data = &mtk_pcie_soc_mt2712 },
