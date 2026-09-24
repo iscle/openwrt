@@ -16,11 +16,12 @@ wireless.
 These are development branches, not an official OpenWrt-supported release.
 The vendor Ethernet path currently treats the physical Ethernet ports as one
 LAN; separate WAN/LAN ports and hardware offload are not validated. The CPU
-cluster stays at the bootloader's 1 GHz, matching the actual working baseline
-and stock configuration. Dynamic CPU frequency scaling is not supported: the
-vendor SMC transition path caused secondary-core corruption in controlled SMP
-tests. This is a stated support limit, not a claim that the firmware defect is
-fixed. Both CPU cores remain available.
+cluster supports 500–1000 MHz in 50-MHz steps on the upstream branch, using
+`ondemand` by default. The AN7563 driver temporarily divides the CPU clock
+during the firmware's clock-source handoff, then restores the divider and
+verifies the resulting frequency. Both cores and all operating points remain
+available. The older baseline release retains its original clock behavior.
+See [VALIDATION.md](VALIDATION.md) for the reproduction and test limits.
 
 ## Build
 

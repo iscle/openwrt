@@ -9,7 +9,7 @@ calibration validation/rejection/no-overwrite tests passed.
 
 The generic RAM candidate passed:
 
-* Normal boot arguments, both CPU cores online, fixed 1-GHz CPU clock.
+* Normal boot arguments, both CPU cores online, dynamic 500–1000 MHz CPU clock.
 * Wired connectivity and SSH through the directly connected Ethernet interface.
 * Wi-Fi firmware loading and simultaneous 2.4/5-GHz WPA2 access points.
 * 4000 PCI configuration reads concurrent with 20 successful Wi-Fi scans,
@@ -24,17 +24,45 @@ validation. The baseline branch has its own separately published record.
 Country and credentials are supplied only at runtime for temporary tests.
 No throughput, DFS, MLO or prolonged endurance claim is made.
 
-## CPU clock support limit
+## CPU clock transition repair
 
-The stock configuration requests a fixed 1 GHz. On the working Linux 6.12
-baseline, requesting 500 MHz changes the policy's reported target to 500 MHz,
-but the firmware's actual-frequency query still reports 1 GHz. Its older
-power-domain integration never applies those requested transitions.
+The stock configuration requests a fixed 1 GHz. On the older Linux 6.12
+baseline, a 500-MHz policy request changes the reported target, but the
+firmware's actual-frequency query remains at 1 GHz: its power-domain
+integration does not apply the requested transition.
 
-The Linux 6.18 integration activates the vendor frequency-change SMC, exposing
-secondary-core corruption and boot lockups. Tests reproduced the problem with
-both cores busy, and with a stop-machine rendezvous. The corresponding traces
-and diagnostic code are not included in released images. The port therefore
-models the validated fixed clock and does not expose unsupported dynamic
-frequency scaling. Both cores and native PCIe PME remain enabled. This support
-limit does not claim to repair the vendor firmware's transition defect.
+The active firmware transition reproduces a crash with both the upstream
+kernel and Xiaomi's stock 5.4.55 kernel/CPUfreq driver. In a RAM-backed,
+write-protected stock test, 800/1000-MHz cycling stalled after 36 completed
+cycles. Steady 800-MHz memory tests passed. Source-switch tests failed at
+800 MHz even with CPU 1 offline, without SMC calls, with the temporary PLL
+kept enabled, and with increased settling delays.
+
+The vendor source defines a separate MCU CPU divider (BUS_PLL_DIV bits
+21:17, encoding 0x0a for divide-by-two). Applying it around each firmware
+transition, then restoring the original divider, passed:
+
+* 100 source-switch cycles at 800 MHz and 200 direct PLL transitions.
+* 200 transitions through the unmodified firmware SMC routine.
+* 1100 firmware transitions across all eleven operating points while running
+  20 cross-core, 16-MiB memory-pattern tests (12 rounds each).
+* A negative control: removing the divider guard after those successful tests
+  reproduced the failure again.
+* A full firmware RAM boot with the default ondemand governor, followed by
+  1100 CPUfreq sysfs transitions with actual-frequency readback at every step,
+  20 memory-test runs, 4000 PCIe configuration reads and 20 Wi-Fi scans.
+* Independent per-core timing at 500, 800 and 1000 MHz, plus ondemand
+  scaling from 500 MHz idle to 1000 MHz under load and back to 500 MHz.
+
+The driver confines this sequence to AN7563, quiesces the shared cluster with
+stop_machine, preserves the firmware's mux fields, restores the divider, and
+checks the actual frequency because the vendor setter returns -2 even on
+success. No operating point, CPU core, or PCIe PME capability is removed.
+The implementation uses the divider encoding from
+[the vendor-derived clock source](https://github.com/Ansuel/atf-airoha/blob/94892b9e42eb1f6992e60bce904c3ef42ea995c8/plat/ecnt/en7523/ecnt_cpufreq.c).
+
+These tests establish a working transition sequence on this unit; they do not
+establish the underlying silicon erratum or guarantee other board revisions.
+The firmware still manages the PLL; this is a Linux-side correction around
+its incomplete handoff sequence, not a replacement secure-firmware release.
+Final installed-image checks and hashes are recorded in release notes.
