@@ -1,0 +1,9 @@
+CONFIG_TARGET_airoha=y
+CONFIG_TARGET_airoha_an7563=y
+CONFIG_TARGET_airoha_an7563_DEVICE_xiaomi_be5000=y
+CONFIG_TARGET_ROOTFS_INITRAMFS=y
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_pciutils=y
+# CONFIG_FEED_luci is not set
+# CONFIG_FEED_packages is not set
+# CONFIG_FEED_routing is not set
