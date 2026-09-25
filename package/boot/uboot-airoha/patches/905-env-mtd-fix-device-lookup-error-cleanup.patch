@@ -1,0 +1,29 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] env: mtd: do not release a device after lookup failure
+
+setup_mtd_device() leaves its output pointer untouched on error. Skip
+put_mtd_device() when lookup fails and only release the allocated buffer.
+Otherwise a missing environment device passes an uninitialized pointer
+to the MTD core and can trigger a BUG during boot.
+
+Signed-off-by: Iscle <albertiscle9@gmail.com>
+---
+--- a/env/mtd.c
++++ b/env/mtd.c
+@@ -157,7 +157,7 @@
+ 
+ 	ret = setup_mtd_device(&mtd_env);
+ 	if (ret)
+-		goto out;
++		goto free_buf;
+ 
+ 	sect_size = mtd_env->erasesize;
+ 
+@@ -192,6 +192,7 @@
+ out:
+ 	put_mtd_device(mtd_env);
+ 
++free_buf:
+ 	free(buf);
+ 
+ 	return ret;
