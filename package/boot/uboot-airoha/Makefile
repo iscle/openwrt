@@ -88,8 +88,16 @@ define U-Boot/an7563_rfb
   BUILD_SUBTARGET:=an7563
 endef
 
+define U-Boot/an7563_xiaomi_be5000
+  NAME:=Xiaomi BE5000
+  UBOOT_CONFIG:=an7563_xiaomi_be5000
+  BUILD_DEVICES:=xiaomi_be5000
+  BUILD_SUBTARGET:=an7563
+endef
+
 UBOOT_TARGETS := \
 	an7563_rfb \
+	an7563_xiaomi_be5000 \
 	an7581_gemtek_w1700k \
 	an7581_nokia_valyrian \
 	an7581_nokia_xg-040g-md \
