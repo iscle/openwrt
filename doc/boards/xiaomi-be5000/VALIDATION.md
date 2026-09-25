@@ -186,9 +186,11 @@ connections. Bridger fixes consume command acknowledgements correctly and
 invalidate member flows when bridge policy changes. No runtime VLAN changes
 are embedded in firmware.
 
-The updated Xiaomi 1.0.91 NPU firmware was examined without booting or flashing
-it. Its mailbox dispatcher at 0x84005d1a accepts SET_WAIT IDs 0–28 and GET_WAIT
+At the Ethernet-only milestone, Xiaomi 1.0.91 NPU firmware was examined
+without booting or flashing it. Its mailbox dispatcher at 0x84005d1a accepts SET_WAIT IDs 0–28 and GET_WAIT
 IDs 0–7. OpenWrt's current NPU/Wi-Fi integration requires additional buffer,
 token and version commands. This binary is not a compatible replacement for
 the EN7581 firmware and is not redistributed in this tree. NPU compatibility
-requires a separately validated legacy interface or suitable vendor firmware.
+required a separately validated legacy interface or suitable vendor firmware.
+The subsequent receive-only integration and its validation are described in
+[NPU.md](NPU.md).
