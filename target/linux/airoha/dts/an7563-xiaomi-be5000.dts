@@ -31,6 +31,22 @@
 		reg = <0x80000000 0x20000000>;
 	};
 
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		npu_firmware: npu-firmware@84000000 {
+			reg = <0x84000000 0x300000>;
+			no-map;
+		};
+
+		npu_pkt: npu-pkt@84400000 {
+			reg = <0x84400000 0x1600000>;
+			no-map;
+		};
+	};
+
 	pwm-leds {
 		compatible = "pwm-leds";
 		pinctrl-names = "default";
@@ -83,6 +99,13 @@
 	status = "okay";
 };
 
+&npu {
+	memory-region = <&npu_firmware>, <&npu_pkt>;
+	memory-region-names = "firmware", "pkt";
+	status = "okay";
+};
+
+
 &pcie0 {
 	ranges = <0x82000000 0 0x20000000 0x20000000 0 0x4000000>;
 	status = "okay";
@@ -96,6 +119,8 @@
 
 		wifi@0,0 {
 			compatible = "pci14c3,7992";
+			airoha,npu = <&npu>;
+			airoha,eth = <&eth>;
 			reg = <0x0000 0 0 0 0>;
 			nvmem-cells = <&wifi_eeprom>;
 			nvmem-cell-names = "eeprom";

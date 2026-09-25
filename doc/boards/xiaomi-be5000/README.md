@@ -16,8 +16,10 @@ PPE supports Ethernet flow offload, including traffic between the gigabit switch
 and 2.5-Gbit port. The supplied build profile includes `bridger` to install
 hardware bridge flows automatically. The active-Ethernet port uses direct MAC
 forwarding; hardware HTB/ETS queue offload is rejected. Per-flow hardware byte
-and packet counters require NPU support and are unavailable. Wi-Fi still uses
-the software path: the AN7552 NPU firmware interface is not supported. The CPU
+and packet counters are unavailable. Optional AN7552 NPU firmware enables
+Wi-Fi receive and Wi-Fi-to-Ethernet flow acceleration; Wi-Fi transmission remains
+on the normal mt76 path. See [NPU.md](NPU.md) for firmware extraction, scope and
+validation details. The CPU
 cluster supports 500–1000 MHz in 50-MHz steps on the upstream branch, using
 `ondemand` by default. The AN7563 driver temporarily divides the CPU clock
 during the firmware's clock-source handoff, then restores the divider and
