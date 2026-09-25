@@ -1,0 +1,20 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] mt76: mt7996: avoid scheduling reset work during probe
+
+Probe errors are unwound by the caller. Do not queue reset work until
+initialization has completed, so recovery cannot race with probe cleanup.
+
+Signed-off-by: Iscle <albertiscle9@gmail.com>
+---
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -229,7 +229,8 @@
+ 		dev_err(mdev->dev, "Message %08x (seq %d) timeout\n",
+ 			cmd, seq);
+ 
+-		if (!test_and_set_bit(MT76_MCU_RESET, &dev->mphy.state)) {
++		if (dev->recovery.hw_init_done &&
++		    !test_and_set_bit(MT76_MCU_RESET, &dev->mphy.state)) {
+ 			dev->recovery.restart = true;
+ 			wake_up(&dev->mt76.mcu.wait);
+ 			queue_work(dev->mt76.wq, &dev->reset_work);
