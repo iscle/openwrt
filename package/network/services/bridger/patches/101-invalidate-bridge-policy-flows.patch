@@ -1,0 +1,42 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] bridger: invalidate member flows when bridge policy changes
+
+Bridge VLAN filtering and protocol changes affect every member port.
+Clear flows throughout the bridge FDB when updating the bridge device,
+including flows between ports that are not attached to its own FDB list.
+
+Do not insert an existing member into the same list again when its
+master has not changed.
+
+Signed-off-by: Iscle <albertiscle9@gmail.com>
+---
+--- a/device.c
++++ b/device.c
+@@ -246,6 +246,10 @@
+ 
+ 	list_for_each_entry(f, &dev->fdb_entries, dev_list)
+ 		fdb_clear_flows(f);
++
++	if (dev->br)
++		avl_for_each_element(&dev->br->fdb, f, node)
++			fdb_clear_flows(f);
+ }
+ 
+ void device_free(struct device *dev)
+@@ -314,12 +318,10 @@
+ 			list_del_init(&dev->member_list);
+ 	}
+ 
+-	if (master) {
+-		if (master->br)
+-			list_add_tail(&dev->member_list, &master->br->members);
+-		else
+-			master = NULL;
+-	}
++	if (master && !master->br)
++		master = NULL;
++	if (master && dev->master != master)
++		list_add_tail(&dev->member_list, &master->br->members);
+ 
+ 	if (dev->master != master)
+ 		D("Set device %s master to %s\n", dev->ifname,
