@@ -1,0 +1,1745 @@
+Subject: [PATCH] net: airoha: support AN7563 native bridge offload
+
+Manage the AN7563 SRAM flow table from the host and use its native bridge
+key and action formats. Preserve ingress port, MAC, VLAN and IP-family
+identity, validate the triggering packet before binding and retain the
+packet DS field. Unsupported or ambiguous keys remain in software.
+
+Track hardware-slot ownership and station/device references so teardown
+cannot leave stale destinations or erase a replacement flow. Source-NPU
+station tags provide separate Wi-Fi ingress domains and are stripped on
+forwarding or restored on a CPU miss.
+
+Do not advertise routed offload, per-flow counters or hardware HTB/ETS
+scheduling on this implementation.
+
+---
+diff --git b/drivers/net/ethernet/airoha/airoha_eth.c a/drivers/net/ethernet/airoha/airoha_eth.c
+index 782e651..8c96a0f 100644
+--- b/drivers/net/ethernet/airoha/airoha_eth.c
++++ a/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1924,8 +1924,7 @@ static int airoha_hw_init(struct platform_device *pdev,
+ 		airoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM1_IDX),
+ 			     GDM_PAD_EN_MASK);
+ 
+-	if (eth->soc->version != 0x7563)
+-		err = airoha_ppe_init(eth);
++	err = airoha_ppe_init(eth);
+ 
+ 	if (err)
+ 		goto error;
+@@ -2227,8 +2226,7 @@ static int airoha_dev_open(struct net_device *netdev)
+ 	struct airoha_gdm_port *port = dev->port;
+ 	struct airoha_eth *eth = dev->eth;
+ 	struct airoha_qdma *qdma;
+-	u32 pse_port = eth->soc->version == 0x7563 ?
+-		       FE_PSE_PORT_CDM1 : FE_PSE_PORT_PPE1;
++	u32 pse_port = FE_PSE_PORT_PPE1;
+ 	int err, qdma_id;
+ 
+ 	/* HW LRO is configured on the QDMA and it is shared between
+@@ -3821,6 +3819,12 @@ static int airoha_tc_setup_qdisc_htb(struct net_device *netdev,
+ static int airoha_dev_tc_setup(struct net_device *dev,
+ 			       enum tc_setup_type type, void *type_data)
+ {
++	struct airoha_gdm_dev *gdm = netdev_priv(dev);
++
++	if (airoha_is_7563(gdm->eth) &&
++	    (type == TC_SETUP_QDISC_ETS || type == TC_SETUP_QDISC_HTB))
++		return -EOPNOTSUPP;
++
+ 	switch (type) {
+ 	case TC_SETUP_QDISC_ETS:
+ 		return airoha_tc_setup_qdisc_ets(dev, type_data);
+@@ -4083,8 +4087,9 @@ static int airoha_alloc_gdm_device(struct airoha_eth *eth,
+ 	netdev->features |= AIROHA_HW_FEATURES;
+ 	netdev->vlan_features = AIROHA_HW_FEATURES;
+ 	if (eth->soc->version == 0x7563) {
+-		netdev->hw_features = 0;
++		netdev->hw_features = NETIF_F_HW_TC;
+ 		netdev->features &= ~(AIROHA_HW_FEATURES | NETIF_F_LRO);
++		netdev->features |= NETIF_F_HW_TC;
+ 		netdev->vlan_features = 0;
+ 	}
+ 	SET_NETDEV_DEV(netdev, eth->dev);
+@@ -4587,6 +4592,20 @@ static const struct airoha_eth_soc_data an7583_soc_data = {
+ 	},
+ };
+ 
++static int airoha_an7563_get_dev_from_sport(struct airoha_qdma_desc *desc,
++					    u16 *port, u16 *dev)
++{
++	u32 sport = FIELD_GET(QDMA_ETH_RXMSG_SPORT_MASK,
++			      le32_to_cpu(READ_ONCE(desc->msg1)));
++
++	if (sport >= 0x18 && sport <= 0x1c) {
++		*port = 0;
++		*dev = 0;
++		return 0;
++	}
++	return airoha_an7583_get_dev_from_sport(desc, port, dev);
++}
++
+ static const char * const an7563_xsi_rsts_names[] = {
+ 	"hsi0-mac",
+ 	"hsi1-mac",
+@@ -4600,7 +4619,7 @@ static const struct airoha_eth_soc_data an7563_soc_data = {
+ 	.num_ppe = 1,
+ 	.ops = {
+ 		.get_sport = airoha_an7583_get_sport,
+-		.get_dev_from_sport = airoha_an7583_get_dev_from_sport,
++		.get_dev_from_sport = airoha_an7563_get_dev_from_sport,
+ 		.get_vip_port = airoha_an7583_get_vip_port,
+ 	},
+ };
+diff --git b/drivers/net/ethernet/airoha/airoha_eth.h a/drivers/net/ethernet/airoha/airoha_eth.h
+index aa19f3d..41b1242 100644
+--- b/drivers/net/ethernet/airoha/airoha_eth.h
++++ a/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -353,6 +353,24 @@ struct airoha_foe_bridge {
+ 	struct airoha_foe_mac_info l2;
+ };
+ 
++/* AN7563 native L2 entries keep the learned key and do not rewrite MACs. */
++struct airoha_foe_bridge_an7563 {
++	u32 key[5];
++	u32 reserved0[2];
++	u32 flags;
++	u32 reserved1;
++	u32 data;
++	u32 ib2;
++	u16 vlan1;
++	u16 etype;
++	u32 reserved2;
++	u16 vlan2;
++	u16 reserved3;
++	u32 reserved4;
++	u32 meter;
++	u32 reserved5[3];
++};
++
+ struct airoha_foe_ipv4_tuple {
+ 	u32 src_ip;
+ 	u32 dest_ip;
+@@ -429,6 +447,7 @@ struct airoha_foe_entry {
+ 			u32 ib1;
+ 			union {
+ 				struct airoha_foe_bridge bridge;
++				struct airoha_foe_bridge_an7563 bridge_an7563;
+ 				struct airoha_foe_ipv4 ipv4;
+ 				struct airoha_foe_ipv4_dslite dslite;
+ 				struct airoha_foe_ipv6 ipv6;
+@@ -486,6 +505,18 @@ enum airoha_flow_entry_type {
+ 	FLOW_TYPE_L2_SUBFLOW,
+ };
+ 
++struct airoha_bridge_vlan_match {
++	__be16 tpid, tpid_mask;
++	__be16 proto, proto_mask;
++	u16 tci, tci_mask;
++};
++
++struct airoha_bridge_match {
++	struct airoha_bridge_vlan_match vlan[2];
++	__be16 proto, proto_mask;
++	u8 num_vlans, num_vlans_mask;
++};
++
+ struct airoha_flow_table_entry {
+ 	union {
+ 		struct hlist_node list; /* PPE L3 flow entry */
+@@ -495,6 +526,19 @@ struct airoha_flow_table_entry {
+ 		};
+ 	};
+ 
++	/* Protected by ppe_lock, including the cached WDMA identity. */
++	struct hlist_node ingress_node;
++	struct net_device *ingress_dev;
++	struct airoha_bridge_match match;
++	struct hlist_node wlan_node;
++	struct net_device *wdma_dev;
++	bool wdma_dead;
++	bool vlan_dsa;
++	u8 vlan_pop, vlan_push;
++	u8 wdma_addr[ETH_ALEN];
++	u8 wdma_idx;
++	u16 wdma_wcid;
++
+ 	struct hlist_node l2_subflow_node; /* PPE L2 subflow entry */
+ 	u32 hash;
+ 
+@@ -598,7 +642,12 @@ struct airoha_ppe {
+ 
+ 	struct rhashtable l2_flows;
+ 
++	struct hlist_head ingress_flows;
++	struct hlist_head wlan_flows;
++	struct notifier_block netdevice_nb;
++	bool netdevice_registered;
+ 	struct hlist_head *foe_flow;
++	struct airoha_flow_table_entry **foe_owner;
+ 	u16 *foe_check_time;
+ 
+ 	struct airoha_foe_stats *foe_stats;
+@@ -687,6 +736,11 @@ static inline bool airoha_is_7581(struct airoha_eth *eth)
+ 	return eth->soc->version == 0x7581;
+ }
+ 
++static inline bool airoha_is_7563(struct airoha_eth *eth)
++{
++	return eth->soc->version == 0x7563;
++}
++
+ static inline bool airoha_is_7583(struct airoha_eth *eth)
+ {
+ 	return eth->soc->version == 0x7583;
+diff --git b/drivers/net/ethernet/airoha/airoha_ppe.c a/drivers/net/ethernet/airoha/airoha_ppe.c
+index 903e336..7d2df86 100644
+--- b/drivers/net/ethernet/airoha/airoha_ppe.c
++++ a/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -9,6 +9,8 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/rhashtable.h>
++#include <linux/unaligned.h>
++#include <net/dst_metadata.h>
+ #include <net/ipv6.h>
+ #include <linux/if_vlan.h>
+ #include <net/pkt_cls.h>
+@@ -42,7 +44,7 @@ static int airoha_ppe_get_num_stats_entries(struct airoha_ppe *ppe)
+ 	if (!IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS))
+ 		return -EOPNOTSUPP;
+ 
+-	if (airoha_is_7583(ppe->eth))
++	if (airoha_is_7583(ppe->eth) || airoha_is_7563(ppe->eth))
+ 		return -EOPNOTSUPP;
+ 
+ 	return PPE_STATS_NUM_ENTRIES;
+@@ -61,11 +63,16 @@ static int airoha_ppe_get_total_num_stats_entries(struct airoha_ppe *ppe)
+ 	return num_stats;
+ }
+ 
++static u32 airoha_ppe_get_sram_num_entries(struct airoha_ppe *ppe)
++{
++	return airoha_is_7563(ppe->eth) ? 512 : PPE_SRAM_NUM_ENTRIES;
++}
++
+ static u32 airoha_ppe_get_total_sram_num_entries(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_eth *eth = ppe->eth;
+ 
+-	return PPE_SRAM_NUM_ENTRIES * eth->soc->num_ppe;
++	return airoha_ppe_get_sram_num_entries(ppe) * eth->soc->num_ppe;
+ }
+ 
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe)
+@@ -138,8 +145,8 @@ void airoha_ppe_set_mtu(struct airoha_gdm_dev *dev)
+ 
+ static void airoha_ppe_hw_init(struct airoha_ppe *ppe)
+ {
+-	u32 sram_ppe_num_data_entries = PPE_SRAM_NUM_ENTRIES, sram_num_entries;
+-	u32 sram_tb_size, dram_num_entries;
++	u32 sram_ppe_num_data_entries = airoha_ppe_get_sram_num_entries(ppe);
++	u32 sram_num_entries, sram_tb_size, dram_num_entries;
+ 	struct airoha_eth *eth = ppe->eth;
+ 	int i, sram_num_stats_entries;
+ 
+@@ -151,6 +158,7 @@ static void airoha_ppe_hw_init(struct airoha_ppe *ppe)
+ 	if (sram_num_stats_entries > 0)
+ 		sram_ppe_num_data_entries -= sram_num_stats_entries;
+ 	sram_ppe_num_data_entries =
++		sram_ppe_num_data_entries == 512 ? 7 :
+ 		PPE_RAM_NUM_ENTRIES_SHIFT(sram_ppe_num_data_entries);
+ 
+ 	for (i = 0; i < eth->soc->num_ppe; i++) {
+@@ -315,6 +323,48 @@ static int airoha_ppe_get_wdma_info(struct net_device *dev, const u8 *addr,
+ 	return 0;
+ }
+ 
++/* Rebinding must not reuse a station identity cached before a reconnect. */
++static int
++airoha_ppe_foe_refresh_wdma(struct airoha_flow_table_entry *e)
++{
++	struct airoha_foe_mac_info_common *l2;
++	struct airoha_wdma_info info = {};
++	u32 *ib2, *data;
++	int type, err;
++
++	if (e->wdma_dead)
++		return -ENODEV;
++	if (!e->wdma_dev)
++		return 0;
++
++	lockdep_assert_held(&ppe_lock);
++	err = airoha_ppe_get_wdma_info(e->wdma_dev, e->wdma_addr, &info);
++	if (err)
++		return err;
++
++	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->data.ib1);
++	if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
++		l2 = &e->data.ipv6.l2;
++		ib2 = &e->data.ipv6.ib2;
++		data = &e->data.ipv6.data;
++	} else {
++		l2 = &e->data.bridge.l2.common;
++		ib2 = &e->data.bridge.ib2;
++		data = &e->data.bridge.data;
++	}
++	l2->etype &= ~(AIROHA_FOE_MAC_WDMA_BAND | AIROHA_FOE_MAC_WDMA_WCID);
++	l2->etype |= FIELD_PREP(AIROHA_FOE_MAC_WDMA_BAND, info.idx) |
++		     FIELD_PREP(AIROHA_FOE_MAC_WDMA_WCID, info.wcid);
++	*ib2 = (*ib2 & ~AIROHA_FOE_IB2_NBQ) |
++		FIELD_PREP(AIROHA_FOE_IB2_NBQ, info.idx);
++	*data = (*data & ~AIROHA_FOE_ACTDP) |
++		FIELD_PREP(AIROHA_FOE_ACTDP, info.bss);
++	e->wdma_idx = info.idx;
++	e->wdma_wcid = info.wcid;
++
++	return 0;
++}
++
+ static int airoha_get_dsa_port(struct net_device **dev)
+ {
+ #if IS_ENABLED(CONFIG_NET_DSA)
+@@ -348,15 +398,17 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 	u32 qdata = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f), ports_pad, val;
+ 	int wlan_etype = -EINVAL, dsa_port = airoha_get_dsa_port(&netdev);
+ 	struct airoha_foe_mac_info_common *l2;
+-	u8 smac_id = 0xf;
++	u8 smac_id = 0xf, vpm = 0;
+ 
+ 	memset(hwe, 0, sizeof(*hwe));
++	if (data->vlan.num)
++		vpm = data->vlan.hdr[0].proto == htons(ETH_P_8021AD) ? 2 : 1;
+ 
+ 	val = FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, type) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_UDP, l4proto == IPPROTO_UDP) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VLAN_LAYER, data->vlan.num) |
+-	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, data->vlan.num) |
++	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, vpm) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PPPOE, data->pppoe.num) |
+ 	      AIROHA_FOE_IB1_BIND_TTL;
+ 	hwe->ib1 = val;
+@@ -397,6 +449,9 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 			 * on port id otherwise.
+ 			 */
+ 			channel = dsa_port >= 0 ? dsa_port : port->id;
++			if (airoha_is_7563(eth) &&
++			    port->id == AIROHA_GDM2_IDX)
++				channel = 0;
+ 			channel = channel % AIROHA_NUM_QOS_CHANNELS;
+ 			priority = rt_tos2priority(dsfield);
+ 			priority = priority % AIROHA_NUM_QOS_QUEUES;
+@@ -406,10 +461,14 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 			val |= FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT, pse_port) |
+ 			       FIELD_PREP(AIROHA_FOE_IB2_DSCP, dsfield) |
+ 			       AIROHA_FOE_IB2_PSE_QOS;
++			/* Use direct MAC forwarding for active Ethernet. */
++			if (airoha_is_7563(eth) &&
++			    port->id == AIROHA_GDM2_IDX)
++				val &= ~AIROHA_FOE_IB2_PSE_QOS;
+ 			/* For downlink traffic consume SRAM memory for hw
+ 			 * forwarding descriptors queue.
+ 			 */
+-			if (airoha_is_lan_gdm_dev(dev))
++			if (airoha_is_lan_gdm_dev(dev) && !airoha_is_7563(eth))
+ 				val |= AIROHA_FOE_IB2_FAST_PATH;
+ 			if (dsa_port >= 0)
+ 				val |= FIELD_PREP(AIROHA_FOE_IB2_NBQ,
+@@ -696,7 +755,7 @@ airoha_ppe_foe_get_entry_locked(struct airoha_ppe *ppe, u32 hash)
+ 
+ 	if (hash < sram_num_entries) {
+ 		u32 *hwe = ppe->foe + hash * sizeof(struct airoha_foe_entry);
+-		bool ppe2 = hash >= PPE_SRAM_NUM_ENTRIES;
++		bool ppe2 = hash >= airoha_ppe_get_sram_num_entries(ppe);
+ 		struct airoha_eth *eth = ppe->eth;
+ 		u32 val;
+ 		int i;
+@@ -737,7 +796,8 @@ static bool airoha_ppe_foe_compare_entry(struct airoha_flow_table_entry *e,
+ 	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->data.ib1);
+ 	int len;
+ 
+-	if ((hwe->ib1 ^ e->data.ib1) & AIROHA_FOE_IB1_BIND_UDP)
++	if ((hwe->ib1 ^ e->data.ib1) & (AIROHA_FOE_IB1_BIND_UDP |
++				      AIROHA_FOE_IB1_BIND_PACKET_TYPE))
+ 		return false;
+ 
+ 	if (type > PPE_PKT_TYPE_IPV4_DSLITE)
+@@ -751,7 +811,7 @@ static bool airoha_ppe_foe_compare_entry(struct airoha_flow_table_entry *e,
+ static int airoha_ppe_foe_commit_sram_entry(struct airoha_ppe *ppe, u32 hash)
+ {
+ 	struct airoha_foe_entry *hwe = ppe->foe + hash * sizeof(*hwe);
+-	bool ppe2 = hash >= PPE_SRAM_NUM_ENTRIES;
++	bool ppe2 = hash >= airoha_ppe_get_sram_num_entries(ppe);
+ 	u32 *ptr = (u32 *)hwe, val;
+ 	int i;
+ 
+@@ -790,12 +850,12 @@ static int airoha_ppe_foe_commit_entry(struct airoha_ppe *ppe,
+ 	rcu_read_lock();
+ 
+ 	npu = rcu_dereference(eth->npu);
+-	if (!npu) {
++	if (!npu && !airoha_is_7563(eth)) {
+ 		err = -ENODEV;
+ 		goto unlock;
+ 	}
+ 
+-	if (!rx_wlan)
++	if (!rx_wlan && npu)
+ 		airoha_ppe_foe_flow_stats_update(ppe, npu, hwe, hash);
+ 
+ 	if (hash < sram_num_entries)
+@@ -806,25 +866,74 @@ unlock:
+ 	return err;
+ }
+ 
++static void airoha_ppe_foe_write_failed(struct airoha_ppe *ppe, int err)
++{
++	int i;
++
++	/* A timed out write may have reached hardware. Stop forwarding before
++	 * releasing its software owner or any referenced destination.
++	 */
++	for (i = 0; i < ppe->eth->soc->num_ppe; i++)
++		airoha_fe_clear(ppe->eth, REG_PPE_GLO_CFG(i),
++				PPE_GLO_CFG_EN_MASK);
++	dev_err(ppe->eth->dev, "PPE disabled after flow write failure: %d\n",
++		err);
++}
++
++static void airoha_ppe_foe_unbind_flow(struct airoha_ppe *ppe,
++				       struct airoha_flow_table_entry *e)
++{
++	struct airoha_foe_entry *entry, hwe;
++	int err = 0;
++	u32 hash = e->hash;
++
++	lockdep_assert_held(&ppe_lock);
++	if (hash == 0xffff)
++		return;
++	if (ppe->foe_owner[hash] != e)
++		goto clear_hash;
++
++	entry = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!entry) {
++		err = -EIO;
++	} else if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, entry->ib1) ==
++		   AIROHA_FOE_STATE_BIND) {
++		hwe = *entry;
++		hwe.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++		err = airoha_ppe_foe_commit_entry(ppe, &hwe, hash, false);
++	}
++	if (err)
++		airoha_ppe_foe_write_failed(ppe, err);
++	ppe->foe_owner[hash] = NULL;
++clear_hash:
++	e->hash = 0xffff;
++}
++
+ static void airoha_ppe_foe_remove_flow(struct airoha_ppe *ppe,
+ 				       struct airoha_flow_table_entry *e)
+ {
+ 	lockdep_assert_held(&ppe_lock);
+ 
+ 	hlist_del_init(&e->list);
+-	if (e->hash != 0xffff) {
+-		e->data.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
+-		e->data.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
+-					  AIROHA_FOE_STATE_INVALID);
+-		airoha_ppe_foe_commit_entry(ppe, &e->data, e->hash, false);
+-		e->hash = 0xffff;
+-	}
++	airoha_ppe_foe_unbind_flow(ppe, e);
+ 	if (e->type == FLOW_TYPE_L2_SUBFLOW) {
+ 		hlist_del_init(&e->l2_subflow_node);
+ 		kfree(e);
+ 	}
+ }
+ 
++static void airoha_ppe_foe_release_slot(struct airoha_ppe *ppe, u32 hash)
++{
++	struct airoha_flow_table_entry *e = ppe->foe_owner[hash];
++
++	lockdep_assert_held(&ppe_lock);
++	if (!e)
++		return;
++	airoha_ppe_foe_unbind_flow(ppe, e);
++	if (e->type == FLOW_TYPE_L2_SUBFLOW)
++		airoha_ppe_foe_remove_flow(ppe, e);
++}
++
+ static void airoha_ppe_foe_remove_l2_flow(struct airoha_ppe *ppe,
+ 					  struct airoha_flow_table_entry *e)
+ {
+@@ -844,6 +953,8 @@ static void airoha_ppe_foe_flow_remove_entry(struct airoha_ppe *ppe,
+ {
+ 	spin_lock_bh(&ppe_lock);
+ 
++	hlist_del_init(&e->ingress_node);
++	hlist_del_init(&e->wlan_node);
+ 	if (e->type == FLOW_TYPE_L2)
+ 		airoha_ppe_foe_remove_l2_flow(ppe, e);
+ 	else
+@@ -852,32 +963,455 @@ static void airoha_ppe_foe_flow_remove_entry(struct airoha_ppe *ppe,
+ 	spin_unlock_bh(&ppe_lock);
+ }
+ 
++/* The hardware miss arrives before DSA decapsulation. Resolve its input
++ * from the descriptor metadata rather than treating all switch ports as eth0.
++ */
++static bool airoha_ppe_bridge_ingress_match(struct airoha_flow_table_entry *e,
++					    struct sk_buff *skb)
++{
++	struct net_device *dev = skb->dev;
++
++	if (!e->ingress_dev || !dev)
++		return false;
++	if (e->ingress_dev == dev)
++		return true;
++#if IS_ENABLED(CONFIG_NET_DSA)
++	if (netdev_uses_dsa(dev)) {
++		struct metadata_dst *md = skb_metadata_dst(skb);
++		struct dsa_port *dp;
++
++		if (!md || md->type != METADATA_HW_PORT_MUX)
++			return false;
++		list_for_each_entry(dp, &dev->dsa_ptr->dst->ports, list)
++			if (!dp->ds->index && dp->index == md->u.port_info.port_id &&
++			    dp->type == DSA_PORT_TYPE_USER)
++				return e->ingress_dev == dp->user;
++	}
++#endif
++	return false;
++}
++
++static bool airoha_ppe_bridge_match(struct airoha_flow_table_entry *e,
++				    struct sk_buff *skb)
++{
++	struct airoha_bridge_match *match = &e->match;
++	__be16 proto = eth_hdr(skb)->h_proto;
++	int offset = skb_mac_offset(skb) + ETH_HLEN;
++	unsigned int count = 0;
++
++	if (!airoha_ppe_bridge_ingress_match(e, skb))
++		return false;
++	while (eth_type_vlan(proto) || (!count && skb_vlan_tag_present(skb))) {
++		struct airoha_bridge_vlan_match *vlan;
++		__be16 tpid = proto;
++		u16 tci;
++
++		if (count == ARRAY_SIZE(match->vlan))
++			return false;
++		if (!count && skb_vlan_tag_present(skb)) {
++			tpid = skb->vlan_proto;
++			tci = skb_vlan_tag_get(skb);
++		} else {
++			struct vlan_hdr buffer, *vh;
++
++			vh = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++			if (!vh)
++				return false;
++			tci = ntohs(vh->h_vlan_TCI);
++			proto = vh->h_vlan_encapsulated_proto;
++			offset += VLAN_HLEN;
++		}
++		vlan = &match->vlan[count++];
++		if (((tpid ^ vlan->tpid) & vlan->tpid_mask) ||
++		    ((tci ^ vlan->tci) & vlan->tci_mask) ||
++		    ((proto ^ vlan->proto) & vlan->proto_mask))
++			return false;
++	}
++	if (((count ^ match->num_vlans) & match->num_vlans_mask) ||
++	    ((proto ^ match->proto) & match->proto_mask))
++		return false;
++	/* An absent tag must not satisfy a masked zero-valued tag condition. */
++	for (; count < ARRAY_SIZE(match->vlan); count++) {
++		struct airoha_bridge_vlan_match *vlan = &match->vlan[count];
++
++		if (vlan->tpid_mask || vlan->tci_mask || vlan->proto_mask)
++			return false;
++	}
++	return true;
++}
++
++/* A bridge rule without VLAN actions must retain the packet's tag stack.
++ * Use the triggering packet, including a hardware-stripped outer tag, rather
++ * than interpreting the absence of a VLAN push as a request to strip tags.
++ */
++static int airoha_ppe_foe_preserve_vlan(struct airoha_ppe *ppe,
++					struct airoha_flow_table_entry *e,
++					struct airoha_foe_entry *hwe,
++					struct sk_buff *skb)
++{
++	__be16 proto = eth_hdr(skb)->h_proto, tpid[2];
++	int offset = skb_mac_offset(skb) + ETH_HLEN;
++	u16 tags[2] = {};
++	u32 *ib2;
++	u16 *vlan1, *vlan2, *etype;
++	u8 count = 0, vpm = 0;
++	bool preserve = true;
++	int type;
++
++	if (skb_vlan_tag_present(skb)) {
++		tags[count] = skb_vlan_tag_get(skb);
++		tpid[count++] = skb->vlan_proto;
++	}
++	while (eth_type_vlan(proto)) {
++		struct vlan_hdr buffer, *vh;
++
++		if (count == ARRAY_SIZE(tags))
++			return -EOPNOTSUPP;
++		vh = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		if (!vh)
++			return -EINVAL;
++		tpid[count] = proto;
++		tags[count++] = ntohs(vh->h_vlan_TCI);
++		proto = vh->h_vlan_encapsulated_proto;
++		offset += VLAN_HLEN;
++	}
++	if (count) {
++		if (tpid[0] == htons(ETH_P_8021Q))
++			vpm = 1;
++		else if (tpid[0] == htons(ETH_P_8021AD))
++			vpm = 2;
++		else
++			return -EOPNOTSUPP;
++		/* Only the outer TPID has a programmable selector. */
++		if (count == 2 && tpid[1] != htons(ETH_P_8021Q))
++			return -EOPNOTSUPP;
++	}
++
++	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1);
++	if (airoha_is_7563(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
++		ib2 = &hwe->bridge_an7563.ib2;
++		vlan1 = &hwe->bridge_an7563.vlan1;
++		vlan2 = &hwe->bridge_an7563.vlan2;
++		etype = &hwe->bridge_an7563.etype;
++	} else if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
++		ib2 = &hwe->ipv6.ib2;
++		vlan1 = &hwe->ipv6.l2.vlan1;
++		vlan2 = &hwe->ipv6.l2.vlan2;
++		etype = &hwe->ipv6.l2.etype;
++	} else {
++		ib2 = &hwe->bridge.ib2;
++		vlan1 = &hwe->bridge.l2.common.vlan1;
++		vlan2 = &hwe->bridge.l2.common.vlan2;
++		etype = &hwe->bridge.l2.common.etype;
++	}
++	if (e->vlan_pop || e->vlan_push) {
++		u8 pop = min_t(u8, count, e->vlan_pop);
++		u8 retained = count - pop;
++		u16 output[2] = { *vlan1, *vlan2 };
++		u32 key_mask = PPE_L2B_VID_MASK | PPE_L2B_PBITS_MASK;
++		int i;
++
++		if (retained + e->vlan_push > ARRAY_SIZE(tags))
++			return -EOPNOTSUPP;
++		if (retained) {
++			/* Shifted or mixed priorities cannot use the global PCP
++			 * selector. Copy them only if every input TCI bit is keyed.
++			 */
++			if (!airoha_is_7563(ppe->eth) ||
++			    type != PPE_PKT_TYPE_BRIDGE ||
++			    ppe->eth->soc->num_ppe != 1)
++				return -EOPNOTSUPP;
++			if (count == 2)
++				key_mask |= PPE_L2B_SECOND_VLAN_MASK;
++			if ((airoha_fe_rr(ppe->eth, REG_PPE_L2B_CFG(0)) & key_mask) !=
++			    key_mask)
++				return -EOPNOTSUPP;
++			if (e->vlan_push && tpid[pop] != htons(ETH_P_8021Q))
++				return -EOPNOTSUPP;
++		}
++		for (i = 0; i < retained; i++)
++			output[e->vlan_push + i] = tags[pop + i];
++		if (e->vlan_push)
++			vpm = FIELD_GET(AIROHA_FOE_IB1_BIND_VPM, hwe->ib1);
++		else if (retained)
++			vpm = tpid[pop] == htons(ETH_P_8021AD) ? 2 : 1;
++		else
++			vpm = 0;
++		preserve = false;
++		count = retained + e->vlan_push;
++		tags[0] = count ? output[0] : 0;
++		tags[1] = count == 2 ? output[1] : 0;
++	}
++
++	hwe->ib1 &= ~(AIROHA_FOE_IB1_BIND_VLAN_LAYER | AIROHA_FOE_IB1_BIND_VPM);
++	hwe->ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_VLAN_LAYER, count) |
++		    FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, vpm);
++	*vlan1 = tags[0];
++	*vlan2 = tags[1];
++	/* Preserve PCP and DEI per packet, not just those of the first packet. */
++	*ib2 &= ~AIROHA_FOE_IB2_PCP;
++	if (preserve)
++		*ib2 |= AIROHA_FOE_IB2_PCP;
++	if (e->vlan_dsa) {
++		*etype &= ~BIT(15);
++		if (!count)
++			*etype |= BIT(15);
++	}
++	return 0;
++}
++
++/* Keep switch inputs in a separate source-port range. The hardware key
++ * includes all five bits: GDM1 occupies 24..28, GDM2 uses 2 and NPU uses 7.
++ */
++static int airoha_ppe_bridge_source_port(struct airoha_ppe *ppe,
++					 struct sk_buff *skb)
++{
++	struct airoha_eth *eth = ppe->eth;
++	unsigned int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
++		struct airoha_gdm_port *port = eth->ports[i];
++
++		if (!port)
++			continue;
++		for (j = 0; j < ARRAY_SIZE(port->devs); j++) {
++			struct airoha_gdm_dev *gdm = port->devs[j];
++
++			if (!gdm || netdev_from_priv(gdm) != skb->dev)
++				continue;
++			if (port->id == AIROHA_GDM2_IDX)
++				return 2;
++#if IS_ENABLED(CONFIG_NET_DSA)
++			if (port->id == AIROHA_GDM1_IDX && netdev_uses_dsa(skb->dev)) {
++				struct metadata_dst *md = skb_metadata_dst(skb);
++
++				if (md && md->type == METADATA_HW_PORT_MUX &&
++				    md->u.port_info.port_id < 5)
++					return 24 + md->u.port_info.port_id;
++			}
++#endif
++			return -EOPNOTSUPP;
++		}
++	}
++	return -ENODEV;
++}
++
++static bool airoha_ppe_native_bridge_match(struct airoha_ppe *ppe,
++					   struct airoha_foe_entry *hwe,
++					   struct sk_buff *skb, u16 domain)
++{
++	const struct ethhdr *eh = eth_hdr(skb);
++	const u32 *key = hwe->bridge_an7563.key;
++	__be16 proto = eh->h_proto, tpid = 0;
++	int offset = skb_mac_offset(skb) + ETH_HLEN;
++	u32 hsk;
++	u16 tci = 0;
++	int port;
++
++	if (key[0] != get_unaligned_be32(eh->h_dest) ||
++	    key[1] >> 16 != get_unaligned_be16(eh->h_dest + 4) ||
++	    key[3] != get_unaligned_be32(eh->h_source) ||
++	    key[4] >> 16 != get_unaligned_be16(eh->h_source + 4))
++		return false;
++	if (domain) {
++		/* Firmware only tags complete, untagged IP frames. */
++		if (domain > 2048 || skb_vlan_tag_present(skb) || eth_type_vlan(proto))
++			return false;
++		tci = domain;
++		tpid = htons(ETH_P_8021Q);
++		port = 7;
++	} else {
++		port = airoha_ppe_bridge_source_port(ppe, skb);
++		if (port < 0)
++			return false;
++		if (skb_vlan_tag_present(skb)) {
++			tci = skb_vlan_tag_get(skb);
++			tpid = skb->vlan_proto;
++		} else if (eth_type_vlan(proto)) {
++			struct vlan_hdr buffer, *vh;
++
++			vh = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++			if (!vh)
++				return false;
++			tci = ntohs(vh->h_vlan_TCI);
++			tpid = proto;
++			proto = vh->h_vlan_encapsulated_proto;
++		}
++	}
++	/* AN7552 collapses double-tag TPIDs and arbitrary non-IP EtherTypes.
++	 * Those keys cannot represent a Linux bridge rule without ambiguity.
++	 */
++	if (proto == htons(ETH_P_IP))
++		hsk = AN7563_L2_KEY_IPV4;
++	else if (proto == htons(ETH_P_IPV6))
++		hsk = AN7563_L2_KEY_IPV6;
++	else
++		return false;
++	if (tpid == htons(ETH_P_8021Q))
++		hsk |= AN7563_L2_KEY_CTAG;
++	else if (tpid == htons(ETH_P_8021AD))
++		hsk |= AN7563_L2_KEY_STAG;
++	else if (tpid)
++		return false;
++	hsk |= port;
++
++	return (key[1] & 0xffff) == tci && key[2] == hsk;
++}
++
++/* Receive notifications can outlive an unbound hardware entry. Do not
++ * attach a bridge action to a recycled slot based on the old packet's MACs.
++ */
++static bool airoha_ppe_foe_packet_match(struct airoha_ppe *ppe,
++					struct airoha_foe_entry *hwe,
++					struct sk_buff *skb)
++{
++	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1);
++	int offset = skb_mac_offset(skb) + ETH_HLEN;
++	__be16 proto = eth_hdr(skb)->h_proto;
++	struct flow_keys keys = {};
++	__be32 ports_buffer;
++	bool ports;
++	int i;
++
++	if (airoha_is_7563(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
++		const struct ethhdr *eh = eth_hdr(skb);
++		const u32 *key = hwe->bridge_an7563.key;
++
++		/* Native classification remains disabled until all key fields
++		 * distinguish supported ingress domains. Check the MAC fields
++		 * here as well, without claiming that they are the complete key.
++		 */
++		return key[0] == get_unaligned_be32(eh->h_dest) &&
++		       key[1] >> 16 == get_unaligned_be16(eh->h_dest + 4) &&
++		       key[3] == get_unaligned_be32(eh->h_source) &&
++		       key[4] >> 16 == get_unaligned_be16(eh->h_source + 4);
++	}
++	/* Parse inline tags explicitly: Wi-Fi has not called eth_type_trans()
++	 * yet, and DSA may have replaced skb->protocol with ETH_P_XDSA.
++	 */
++	for (i = 0; eth_type_vlan(proto); i++) {
++		struct vlan_hdr buffer, *vh;
++
++		if (i == 2)
++			return false;
++		vh = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		if (!vh)
++			return false;
++		proto = vh->h_vlan_encapsulated_proto;
++		offset += VLAN_HLEN;
++	}
++	if (proto != htons(ETH_P_IP) && proto != htons(ETH_P_IPV6))
++		return false;
++	if (!__skb_flow_dissect(NULL, skb, &flow_keys_dissector, &keys,
++				skb->data, proto, offset, skb_headlen(skb),
++				FLOW_DISSECTOR_F_STOP_BEFORE_ENCAP) ||
++	    keys.control.flags & (FLOW_DIS_IS_FRAGMENT | FLOW_DIS_ENCAPSULATION))
++		return false;
++
++	switch (type) {
++	case PPE_PKT_TYPE_IPV4_HNAPT:
++	case PPE_PKT_TYPE_IPV4_ROUTE:
++		if (keys.control.addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
++		    hwe->ipv4.orig_tuple.src_ip != ntohl(keys.addrs.v4addrs.src) ||
++		    hwe->ipv4.orig_tuple.dest_ip != ntohl(keys.addrs.v4addrs.dst))
++			return false;
++		ports = type == PPE_PKT_TYPE_IPV4_HNAPT;
++		if (!ports)
++			return hwe->ipv4.orig_tuple.protocol == keys.basic.ip_proto;
++		if (hwe->ipv4.orig_tuple.src_port != ntohs(keys.ports.src) ||
++		    hwe->ipv4.orig_tuple.dest_port != ntohs(keys.ports.dst))
++			return false;
++		break;
++	case PPE_PKT_TYPE_IPV6_ROUTE_3T:
++	case PPE_PKT_TYPE_IPV6_ROUTE_5T:
++		if (keys.control.addr_type != FLOW_DISSECTOR_KEY_IPV6_ADDRS)
++			return false;
++		for (i = 0; i < ARRAY_SIZE(hwe->ipv6.src_ip); i++)
++			if (hwe->ipv6.src_ip[i] !=
++			    ntohl(keys.addrs.v6addrs.src.s6_addr32[i]) ||
++			    hwe->ipv6.dest_ip[i] !=
++			    ntohl(keys.addrs.v6addrs.dst.s6_addr32[i]))
++				return false;
++		ports = type == PPE_PKT_TYPE_IPV6_ROUTE_5T;
++		if (!ports)
++			return hwe->ipv6.protocol == keys.basic.ip_proto;
++		if (hwe->ipv6.src_port != ntohs(keys.ports.src) ||
++		    hwe->ipv6.dest_port != ntohs(keys.ports.dst))
++			return false;
++		break;
++	default:
++		/* Encapsulated hardware formats require their own full match. */
++		return false;
++	}
++
++	if (keys.basic.ip_proto != IPPROTO_TCP &&
++	    keys.basic.ip_proto != IPPROTO_UDP)
++		return false;
++	/* The dissector can return zero ports for a truncated transport header. */
++	if (!skb_header_pointer(skb, keys.control.thoff, sizeof(ports_buffer),
++				&ports_buffer))
++		return false;
++	return !!(hwe->ib1 & AIROHA_FOE_IB1_BIND_UDP) ==
++	       (keys.basic.ip_proto == IPPROTO_UDP);
++}
++
+ static int
+ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 				    struct airoha_flow_table_entry *e,
+-				    u32 hash, bool rx_wlan)
++				    struct sk_buff *skb,
++				    u32 hash, bool rx_wlan, u16 domain)
+ {
+ 	u32 mask = AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP;
+ 	struct airoha_foe_entry *hwe_p, hwe;
+ 	struct airoha_flow_table_entry *f;
+-	int type;
++	int type, err;
+ 
+ 	hwe_p = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe_p)
+ 		return -EINVAL;
++	memcpy(&hwe, hwe_p, sizeof(hwe));
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe.ib1) !=
++	    AIROHA_FOE_STATE_UNBIND ||
++	    !airoha_ppe_foe_packet_match(ppe, &hwe, skb))
++		return -ESTALE;
++
++	if (airoha_is_7563(ppe->eth) &&
++	    (FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1) !=
++	     PPE_PKT_TYPE_BRIDGE ||
++	     !airoha_ppe_native_bridge_match(ppe, &hwe, skb, domain)))
++		return -EOPNOTSUPP;
++
++	if (airoha_ppe_foe_refresh_wdma(e))
++		return -ENODEV;
++
++	/* Native L2 entries cannot insert or remove PPPoE headers. */
++	if (airoha_is_7563(ppe->eth) &&
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1) ==
++	    PPE_PKT_TYPE_BRIDGE && (e->data.ib1 & AIROHA_FOE_IB1_BIND_PPPOE))
++		return -EOPNOTSUPP;
+ 
+ 	f = kzalloc(sizeof(*f), GFP_ATOMIC);
+ 	if (!f)
+ 		return -ENOMEM;
+ 
+-	hlist_add_head(&f->l2_subflow_node, &e->l2_flows);
+-	f->type = FLOW_TYPE_L2_SUBFLOW;
+-	f->hash = hash;
+-
+-	memcpy(&hwe, hwe_p, sizeof(*hwe_p));
+ 	hwe.ib1 = (hwe.ib1 & mask) | (e->data.ib1 & ~mask);
+ 
+ 	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1);
++	if (airoha_is_7563(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
++		struct airoha_foe_bridge_an7563 *br = &hwe.bridge_an7563;
++		struct airoha_foe_mac_info_common *l2 = &e->data.bridge.l2.common;
++
++		/* Preserve the complete hardware-learned key. The remainder
++		 * contains actions, with DSCP remarking disabled for bridging.
++		 */
++		memset_after(br, 0, key);
++		br->data = e->data.bridge.data;
++		br->ib2 = e->data.bridge.ib2 & ~AIROHA_FOE_IB2_DSCP;
++		br->vlan1 = l2->vlan1;
++		br->vlan2 = l2->vlan2;
++		br->etype = l2->etype;
++		goto commit;
++	}
+ 	if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
+ 		memcpy(&hwe.ipv6.l2, &e->data.bridge.l2, sizeof(hwe.ipv6.l2));
+ 		hwe.ipv6.ib2 = e->data.bridge.ib2;
+@@ -896,14 +1430,31 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 	}
+ 
+ 	hwe.bridge.data = e->data.bridge.data;
+-	airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
++commit:
++	err = airoha_ppe_foe_preserve_vlan(ppe, e, &hwe, skb);
++	if (err) {
++		kfree(f);
++		return err;
++	}
++	airoha_ppe_foe_release_slot(ppe, hash);
++	err = airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
++	if (err) {
++		airoha_ppe_foe_write_failed(ppe, err);
++		kfree(f);
++		return err;
++	}
++	f->data = hwe;
++	f->type = FLOW_TYPE_L2_SUBFLOW;
++	f->hash = hash;
++	ppe->foe_owner[hash] = f;
++	hlist_add_head(&f->l2_subflow_node, &e->l2_flows);
+ 
+ 	return 0;
+ }
+ 
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 					struct sk_buff *skb,
+-					u32 hash, bool rx_wlan)
++					u32 hash, bool rx_wlan, u16 domain)
+ {
+ 	struct airoha_flow_table_entry *e;
+ 	struct airoha_foe_bridge br = {};
+@@ -919,15 +1470,19 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 		goto unlock;
+ 
+ 	state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1);
+-	if (state == AIROHA_FOE_STATE_BIND)
++	if (state != AIROHA_FOE_STATE_UNBIND)
+ 		goto unlock;
+ 
++	if (airoha_is_7563(ppe->eth) &&
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
++	    PPE_PKT_TYPE_BRIDGE)
++		goto bridge;
++
+ 	index = airoha_ppe_foe_get_entry_hash(ppe, hwe);
+ 	hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
+ 		if (e->type == FLOW_TYPE_L2_SUBFLOW) {
+ 			state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1);
+ 			if (state != AIROHA_FOE_STATE_BIND) {
+-				e->hash = 0xffff;
+ 				airoha_ppe_foe_remove_flow(ppe, e);
+ 			}
+ 			continue;
+@@ -936,19 +1491,29 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 		if (!airoha_ppe_foe_compare_entry(e, hwe))
+ 			continue;
+ 
+-		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
++		if (airoha_ppe_foe_refresh_wdma(e))
++			continue;
++		airoha_ppe_foe_unbind_flow(ppe, e);
++		airoha_ppe_foe_release_slot(ppe, hash);
++		if (airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan)) {
++			airoha_ppe_foe_write_failed(ppe, -EIO);
++			goto unlock;
++		}
+ 		commit_done = true;
+ 		e->hash = hash;
++		ppe->foe_owner[hash] = e;
++		break;
+ 	}
+ 
+ 	if (commit_done)
+ 		goto unlock;
+ 
++bridge:
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
+-	if (e)
+-		airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan);
++	if (e && airoha_ppe_bridge_match(e, skb))
++		airoha_ppe_foe_commit_subflow_entry(ppe, e, skb, hash, rx_wlan, domain);
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+ }
+@@ -968,9 +1533,10 @@ airoha_ppe_foe_l2_flow_commit_entry(struct airoha_ppe *ppe,
+ 	if (IS_ERR(prev))
+ 		return PTR_ERR(prev);
+ 
+-	return rhashtable_replace_fast(&ppe->l2_flows, &prev->l2_node,
+-				       &e->l2_node,
+-				       airoha_l2_flow_table_params);
++	/* Both TC cookies must retain their own lifetime. A MAC-only table
++	 * cannot represent a second owner with different forwarding actions.
++	 */
++	return -EEXIST;
+ }
+ 
+ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
+@@ -978,21 +1544,190 @@ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
+ {
+ 	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->data.ib1);
+ 	u32 hash;
++	int ret = 0;
+ 
+-	if (type == PPE_PKT_TYPE_BRIDGE)
+-		return airoha_ppe_foe_l2_flow_commit_entry(ppe, e);
+-
+-	hash = airoha_ppe_foe_get_entry_hash(ppe, &e->data);
+-	e->type = FLOW_TYPE_L4;
+ 	e->hash = 0xffff;
+-
+ 	spin_lock_bh(&ppe_lock);
+-	hlist_add_head(&e->list, &ppe->foe_flow[hash]);
++	if ((e->wdma_dev &&
++	     READ_ONCE(e->wdma_dev->reg_state) != NETREG_REGISTERED) ||
++	    (e->ingress_dev &&
++	     READ_ONCE(e->ingress_dev->reg_state) != NETREG_REGISTERED)) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (type == PPE_PKT_TYPE_BRIDGE) {
++		ret = airoha_ppe_foe_l2_flow_commit_entry(ppe, e);
++	} else {
++		hash = airoha_ppe_foe_get_entry_hash(ppe, &e->data);
++		e->type = FLOW_TYPE_L4;
++		hlist_add_head(&e->list, &ppe->foe_flow[hash]);
++	}
++	if (!ret && e->ingress_dev)
++		hlist_add_head(&e->ingress_node, &ppe->ingress_flows);
++	if (!ret && e->wdma_dev)
++		hlist_add_head(&e->wlan_node, &ppe->wlan_flows);
++unlock:
+ 	spin_unlock_bh(&ppe_lock);
+ 
++	return ret;
++}
++
++static int airoha_ppe_foe_invalidate_wdma(struct airoha_ppe *ppe, u32 hash,
++					  u16 wcid, u8 band)
++{
++	struct airoha_foe_entry *entry, hwe;
++	u32 type, ib2;
++	u16 etype;
++
++	if (hash == 0xffff)
++		return 0;
++	entry = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!entry)
++		return -EIO;
++	hwe = *entry;
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe.ib1) != AIROHA_FOE_STATE_BIND)
++		return 0;
++	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1);
++	if (airoha_is_7563(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
++		ib2 = hwe.bridge_an7563.ib2;
++		etype = hwe.bridge_an7563.etype;
++	} else if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
++		ib2 = hwe.ipv6.ib2;
++		etype = hwe.ipv6.l2.etype;
++	} else {
++		ib2 = hwe.bridge.ib2;
++		etype = hwe.bridge.l2.common.etype;
++	}
++	if (FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, ib2) != FE_PSE_PORT_CDM4 ||
++	    FIELD_GET(AIROHA_FOE_MAC_WDMA_WCID, etype) != wcid ||
++	    FIELD_GET(AIROHA_FOE_MAC_WDMA_BAND, etype) != band)
++		return 0;
++
++	hwe.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++	return airoha_ppe_foe_commit_entry(ppe, &hwe, hash, false);
++}
++
++static int
++airoha_ppe_flush_wdma_entry(struct airoha_ppe *ppe,
++			    struct airoha_flow_table_entry *e)
++{
++	struct airoha_flow_table_entry *sub;
++	struct hlist_node *next;
++	int err;
++
++	lockdep_assert_held(&ppe_lock);
++	if (e->type != FLOW_TYPE_L2) {
++		err = airoha_ppe_foe_invalidate_wdma(ppe, e->hash,
++						     e->wdma_wcid, e->wdma_idx);
++		if (!err)
++			airoha_ppe_foe_unbind_flow(ppe, e);
++		return err;
++	}
++
++	hlist_for_each_entry_safe(sub, next, &e->l2_flows, l2_subflow_node) {
++		err = airoha_ppe_foe_invalidate_wdma(ppe, sub->hash,
++						     e->wdma_wcid, e->wdma_idx);
++		if (err)
++			return err;
++		airoha_ppe_foe_remove_flow(ppe, sub);
++	}
++
+ 	return 0;
+ }
+ 
++static void airoha_ppe_flush_wdma_failed(struct airoha_ppe *ppe, int err)
++{
++	int i;
++
++	/* A failed table write must not leave a reusable radio ID bound. */
++	for (i = 0; i < ppe->eth->soc->num_ppe; i++)
++		airoha_fe_clear(ppe->eth, REG_PPE_GLO_CFG(i),
++				PPE_GLO_CFG_EN_MASK);
++	dev_err(ppe->eth->dev, "PPE disabled after station flush failure: %d\n",
++		err);
++}
++
++/* Called after radio authorization is revoked, before its WCID is reused. */
++static int airoha_ppe_flush_wdma(struct airoha_ppe_dev *dev, u16 wcid, u8 band)
++{
++	struct airoha_ppe *ppe = dev->priv;
++	struct airoha_flow_table_entry *e;
++	int err = 0;
++
++	spin_lock_bh(&ppe_lock);
++	if (airoha_is_7563(ppe->eth)) {
++		unsigned int hash;
++
++		for (hash = 0; hash < airoha_ppe_get_total_num_entries(ppe); hash++) {
++			const u32 *key;
++
++			e = ppe->foe_owner[hash];
++			if (!e || e->type != FLOW_TYPE_L2_SUBFLOW ||
++			    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->data.ib1) !=
++			    PPE_PKT_TYPE_BRIDGE)
++				continue;
++			key = e->data.bridge_an7563.key;
++			if (FIELD_GET(AN7563_L2_KEY_SPORT, key[2]) == 7 &&
++			    (key[1] & 0xffff) == wcid + 1)
++				airoha_ppe_foe_release_slot(ppe, hash);
++		}
++	}
++	hlist_for_each_entry(e, &ppe->wlan_flows, wlan_node) {
++		if (e->wdma_wcid != wcid || e->wdma_idx != band)
++			continue;
++		err = airoha_ppe_flush_wdma_entry(ppe, e);
++		if (err)
++			break;
++	}
++	if (err)
++		airoha_ppe_flush_wdma_failed(ppe, err);
++	spin_unlock_bh(&ppe_lock);
++
++	return err;
++}
++
++static int airoha_ppe_netdevice_event(struct notifier_block *nb,
++				      unsigned long event, void *ptr)
++{
++	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
++	struct airoha_ppe *ppe = container_of(nb, struct airoha_ppe,
++					     netdevice_nb);
++	struct airoha_flow_table_entry *e;
++	int err;
++
++	if (event != NETDEV_UNREGISTER)
++		return NOTIFY_DONE;
++
++	spin_lock_bh(&ppe_lock);
++	hlist_for_each_entry(e, &ppe->ingress_flows, ingress_node) {
++		struct airoha_flow_table_entry *sub;
++		struct hlist_node *next;
++
++		if (e->ingress_dev != netdev)
++			continue;
++		hlist_for_each_entry_safe(sub, next, &e->l2_flows, l2_subflow_node)
++			airoha_ppe_foe_remove_flow(ppe, sub);
++		e->ingress_dev = NULL;
++		dev_put(netdev);
++	}
++	hlist_for_each_entry(e, &ppe->wlan_flows, wlan_node) {
++		if (e->wdma_dev != netdev)
++			continue;
++		err = airoha_ppe_flush_wdma_entry(ppe, e);
++		if (err)
++			airoha_ppe_flush_wdma_failed(ppe, err);
++		/* TC rules may outlive their redirect device. Keep their owner
++		 * until TC deletes it, but never rebind its old radio identity.
++		 */
++		e->wdma_dead = true;
++		e->wdma_dev = NULL;
++		dev_put(netdev);
++	}
++	spin_unlock_bh(&ppe_lock);
++
++	return NOTIFY_DONE;
++}
++
+ static int airoha_ppe_get_entry_idle_time(struct airoha_ppe *ppe, u32 ib1)
+ {
+ 	u32 state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
+@@ -1034,7 +1769,6 @@ airoha_ppe_foe_flow_l2_entry_update(struct airoha_ppe *ppe,
+ 		ib1 = READ_ONCE(hwe->ib1);
+ 		state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
+ 		if (state != AIROHA_FOE_STATE_BIND) {
+-			iter->hash = 0xffff;
+ 			airoha_ppe_foe_remove_flow(ppe, iter);
+ 			continue;
+ 		}
+@@ -1070,6 +1804,8 @@ static void airoha_ppe_foe_flow_entry_update(struct airoha_ppe *ppe,
+ 
+ 	memcpy(&hwe, hwe_p, sizeof(*hwe_p));
+ 	if (!airoha_ppe_foe_compare_entry(e, &hwe)) {
++		if (ppe->foe_owner[e->hash] == e)
++			ppe->foe_owner[e->hash] = NULL;
+ 		e->hash = 0xffff;
+ 		goto unlock;
+ 	}
+@@ -1087,6 +1823,84 @@ static int airoha_ppe_entry_idle_time(struct airoha_ppe *ppe,
+ 	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
+ }
+ 
++static void airoha_ppe_bridge_vlan_match_parse(struct airoha_bridge_vlan_match *vlan,
++					       struct flow_match_vlan *match)
++{
++	vlan->tpid = match->key->vlan_tpid;
++	vlan->tpid_mask = match->mask->vlan_tpid;
++	vlan->proto = match->key->vlan_eth_type;
++	vlan->proto_mask = match->mask->vlan_eth_type;
++	vlan->tci = match->key->vlan_id | match->key->vlan_dei << 12 |
++		    match->key->vlan_priority << VLAN_PRIO_SHIFT;
++	vlan->tci_mask = match->mask->vlan_id | match->mask->vlan_dei << 12 |
++			 match->mask->vlan_priority << VLAN_PRIO_SHIFT;
++}
++
++static int airoha_ppe_bridge_match_parse(struct airoha_flow_table_entry *e,
++					 struct flow_rule *rule,
++					 struct net_device *odev)
++{
++	struct flow_match_eth_addrs eth;
++	struct flow_match_basic basic;
++	struct flow_match_meta meta;
++	u64 supported = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_VLAN) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_NUM_OF_VLANS);
++
++	if (rule->match.dissector->used_keys & ~supported)
++		return -EOPNOTSUPP;
++	flow_rule_match_meta(rule, &meta);
++	if (meta.mask->ingress_ifindex != -1 || meta.mask->ingress_iftype ||
++	    meta.mask->l2_miss)
++		return -EOPNOTSUPP;
++	flow_rule_match_eth_addrs(rule, &eth);
++	if (!is_broadcast_ether_addr(eth.mask->src) ||
++	    !is_broadcast_ether_addr(eth.mask->dst))
++		return -EOPNOTSUPP;
++	flow_rule_match_basic(rule, &basic);
++	if (basic.mask->ip_proto)
++		return -EOPNOTSUPP;
++	e->match.proto = basic.key->n_proto;
++	e->match.proto_mask = basic.mask->n_proto;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_match_vlan match;
++
++		flow_rule_match_vlan(rule, &match);
++		airoha_ppe_bridge_vlan_match_parse(&e->match.vlan[0], &match);
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN)) {
++		struct flow_match_vlan match;
++
++		flow_rule_match_cvlan(rule, &match);
++		airoha_ppe_bridge_vlan_match_parse(&e->match.vlan[1], &match);
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_NUM_OF_VLANS)) {
++		struct flow_dissector_key_num_of_vlans *key, *mask;
++
++		key = skb_flow_dissector_target(rule->match.dissector,
++						FLOW_DISSECTOR_KEY_NUM_OF_VLANS,
++						rule->match.key);
++		mask = skb_flow_dissector_target(rule->match.dissector,
++						 FLOW_DISSECTOR_KEY_NUM_OF_VLANS,
++						 rule->match.mask);
++		e->match.num_vlans = key->num_of_vlans;
++		e->match.num_vlans_mask = mask->num_of_vlans;
++	}
++	if (!odev)
++		return -ENODEV;
++	e->ingress_dev = dev_get_by_index(dev_net(odev), meta.key->ingress_ifindex);
++	if (!e->ingress_dev)
++		return -ENODEV;
++	/* The hardware miss precedes VLAN upper-device demultiplexing. */
++	if (is_vlan_dev(e->ingress_dev))
++		return -EOPNOTSUPP;
++	return 0;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1096,7 +1910,7 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 	struct net_device *odev = NULL;
+ 	struct flow_action_entry *act;
+ 	struct airoha_foe_entry hwe;
+-	u8 dsfield = 0, l4proto = 0;
++	u8 dsfield = 0, l4proto = 0, vlan_pop = 0;
+ 	int err, i, offload_type;
+ 	u16 addr_type = 0;
+ 
+@@ -1174,14 +1988,26 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 			break;
+ 		case FLOW_ACTION_VLAN_PUSH:
+ 			if (data.vlan.num == 2 ||
+-			    act->vlan.proto != htons(ETH_P_8021Q))
++			    (act->vlan.proto != htons(ETH_P_8021Q) &&
++			     act->vlan.proto != htons(ETH_P_8021AD)))
+ 				return -EOPNOTSUPP;
+ 
+-			data.vlan.hdr[data.vlan.num].id = act->vlan.vid;
+-			data.vlan.hdr[data.vlan.num].proto = act->vlan.proto;
++			/* Each push inserts a new outer tag. */
++			data.vlan.hdr[1] = data.vlan.hdr[0];
++			data.vlan.hdr[0].id = act->vlan.vid |
++					     (act->vlan.prio << VLAN_PRIO_SHIFT);
++			data.vlan.hdr[0].proto = act->vlan.proto;
+ 			data.vlan.num++;
+ 			break;
+ 		case FLOW_ACTION_VLAN_POP:
++			if (data.vlan.num) {
++				data.vlan.hdr[0] = data.vlan.hdr[1];
++				memset(&data.vlan.hdr[1], 0,
++				       sizeof(data.vlan.hdr[1]));
++				data.vlan.num--;
++			} else if (vlan_pop < 2) {
++				vlan_pop++;
++			}
+ 			break;
+ 		case FLOW_ACTION_PPPOE_PUSH:
+ 			if (data.pppoe.num == 1 || data.vlan.num == 2)
+@@ -1195,6 +2021,10 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 		}
+ 	}
+ 
++	if (data.vlan.num == 2 &&
++	    data.vlan.hdr[1].proto != htons(ETH_P_8021Q))
++		return -EOPNOTSUPP;
++
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+ 	    !is_valid_ether_addr(data.eth.h_dest))
+ 		return -EINVAL;
+@@ -1273,7 +2103,29 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 		return -ENOMEM;
+ 
+ 	e->cookie = f->cookie;
++	e->vlan_pop = vlan_pop;
++	e->vlan_push = data.vlan.num;
++	if (offload_type == PPE_PKT_TYPE_BRIDGE) {
++		struct net_device *dev = odev;
++
++		err = airoha_ppe_bridge_match_parse(e, rule, odev);
++		if (err)
++			goto free_entry;
++		e->vlan_dsa = airoha_get_dsa_port(&dev) >= 0;
++	}
+ 	memcpy(&e->data, &hwe, sizeof(e->data));
++	if (offload_type >= PPE_PKT_TYPE_IPV6_ROUTE_3T ?
++	    FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, hwe.ipv6.ib2) == FE_PSE_PORT_CDM4 :
++	    FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, hwe.bridge.ib2) == FE_PSE_PORT_CDM4) {
++		u16 etype = offload_type >= PPE_PKT_TYPE_IPV6_ROUTE_3T ?
++			    hwe.ipv6.l2.etype : hwe.bridge.l2.common.etype;
++
++		dev_hold(odev);
++		e->wdma_dev = odev;
++		ether_addr_copy(e->wdma_addr, data.eth.h_dest);
++		e->wdma_idx = FIELD_GET(AIROHA_FOE_MAC_WDMA_BAND, etype);
++		e->wdma_wcid = FIELD_GET(AIROHA_FOE_MAC_WDMA_WCID, etype);
++	}
+ 
+ 	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
+ 	if (err)
+@@ -1289,6 +2141,8 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ remove_foe_entry:
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ free_entry:
++	dev_put(e->ingress_dev);
++	dev_put(e->wdma_dev);
+ 	kfree(e);
+ 
+ 	return err;
+@@ -1307,6 +2161,8 @@ static int airoha_ppe_flow_offload_destroy(struct airoha_eth *eth,
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ 	rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 			       airoha_flow_table_params);
++	dev_put(e->ingress_dev);
++	dev_put(e->wdma_dev);
+ 	kfree(e);
+ 
+ 	return 0;
+@@ -1397,8 +2253,6 @@ static int airoha_ppe_flush_sram_entries(struct airoha_ppe *ppe)
+ 	int i, err = 0;
+ 
+ 	for (i = 0; i < sram_num_entries; i++) {
+-		int err;
+-
+ 		memset(&hwe[i], 0, sizeof(*hwe));
+ 		err = airoha_ppe_foe_commit_sram_entry(ppe, i);
+ 		if (err)
+@@ -1498,7 +2352,7 @@ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data)
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 
+-	if (!eth->npu)
++	if (!eth->npu && !airoha_is_7563(eth))
+ 		err = airoha_ppe_offload_setup(eth);
+ 	if (!err)
+ 		err = airoha_ppe_flow_offload_cmd(eth, type_data);
+@@ -1508,8 +2362,9 @@ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data)
+ 	return err;
+ }
+ 
+-void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+-			  u16 hash, bool rx_wlan)
++static void airoha_ppe_check_skb_common(struct airoha_ppe_dev *dev,
++					struct sk_buff *skb, u16 hash,
++					bool rx_wlan, u16 domain)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+ 	u32 ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+@@ -1524,7 +2379,20 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 		return;
+ 
+ 	ppe->foe_check_time[hash] = now;
+-	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan);
++	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan, domain);
++}
++
++void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
++			  u16 hash, bool rx_wlan)
++{
++	airoha_ppe_check_skb_common(dev, skb, hash, rx_wlan, 0);
++}
++
++static void airoha_ppe_check_skb_domain(struct airoha_ppe_dev *dev,
++					struct sk_buff *skb, u16 hash, u16 domain)
++{
++	if (domain && domain <= 2048)
++		airoha_ppe_check_skb_common(dev, skb, hash, true, domain);
+ }
+ 
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr)
+@@ -1602,6 +2470,43 @@ void airoha_ppe_put_dev(struct airoha_ppe_dev *dev)
+ }
+ EXPORT_SYMBOL_GPL(airoha_ppe_put_dev);
+ 
++static void airoha_ppe_an7563_init(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++
++	/* Keep table accesses quiescent until the host-owned table is ready. */
++	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0), 0);
++	airoha_ppe_hw_init(ppe);
++	airoha_fe_clear(eth, REG_PPE_TB_CFG(0), PPE_TB_CFG_FIN_FAST_RP_MASK);
++	airoha_fe_set(eth, REG_PPE_TB_CFG(0),
++		      PPE_TB_CFG_AGE_TCP_FIN_MASK | PPE_TB_CFG_AGE_UDP_MASK |
++		      PPE_TB_CFG_AGE_TCP_MASK | PPE_TB_CFG_AGE_UNBIND_MASK |
++		      PPE_TB_CFG_AGE_NON_L4_MASK);
++	airoha_fe_wr(eth, REG_PPE_UNBIND_AGE(0),
++		     FIELD_PREP(PPE_UNBIND_AGE_MIN_PACKETS_MASK, 1000) |
++		     FIELD_PREP(PPE_UNBIND_AGE_DELTA_MASK, 3));
++	/* Allow the hardware to create new flows on a table miss. */
++	airoha_fe_wr(eth, REG_PPE_BIND_LIMIT0(0),
++		     FIELD_PREP(PPE_BIND_LIMIT0_QUARTER_MASK, 4000) |
++		     FIELD_PREP(PPE_BIND_LIMIT0_HALF_MASK, 4000));
++	airoha_fe_wr(eth, REG_PPE_BIND_LIMIT1(0),
++		     FIELD_PREP(PPE_BIND_LIMIT1_FULL_MASK, 8000) |
++		     FIELD_PREP(PPE_BIND_LIMIT1_NON_L4_MASK, 1));
++	/* Include every supported input key; TLS must not suppress fields. */
++	airoha_fe_wr(eth, REG_PPE_L2B_CFG(0),
++		     PPE_L2B_DMAC_MASK | PPE_L2B_SMAC_MASK | PPE_L2B_VID_MASK |
++		     PPE_L2B_PBITS_MASK | PPE_L2B_SPORT_MASK | PPE_L2B_ETYPE_MASK |
++		     PPE_L2B_ETYPE_BLACKLIST_MASK | PPE_L2B_SECOND_VLAN_MASK);
++	airoha_fe_rmw(eth, REG_GDM_SRC_PORT_SET(AIROHA_GDM1_IDX),
++		      GDM_SPORT_OFF0_MASK | BIT(0),
++		      FIELD_PREP(GDM_SPORT_OFF0_MASK, 8) | BIT(0));
++	/* IP tuple keys cannot carry the private ingress domain. Keep routed
++	 * traffic in software instead of letting it bypass bridge isolation.
++	 */
++	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0), PPE_FLOW_CFG_L2_BRIDGE_MASK);
++	airoha_fe_set(eth, REG_PPE_GLO_CFG(0), PPE_GLO_CFG_EN_MASK);
++}
++
+ int airoha_ppe_init(struct airoha_eth *eth)
+ {
+ 	int foe_size, err, ppe_num_stats_entries;
+@@ -1612,8 +2517,11 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (!ppe)
+ 		return -ENOMEM;
+ 
++	ppe->dev.ops.flush_wdma = airoha_ppe_flush_wdma;
+ 	ppe->dev.ops.setup_tc_block_cb = airoha_ppe_setup_tc_block_cb;
+ 	ppe->dev.ops.check_skb = airoha_ppe_check_skb;
++	if (airoha_is_7563(eth))
++		ppe->dev.ops.check_skb_domain = airoha_ppe_check_skb_domain;
+ 	ppe->dev.priv = ppe;
+ 	ppe->eth = eth;
+ 	eth->ppe = ppe;
+@@ -1631,6 +2539,11 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (!ppe->foe_flow)
+ 		return -ENOMEM;
+ 
++	ppe->foe_owner = devm_kcalloc(eth->dev, ppe_num_entries,
++				      sizeof(*ppe->foe_owner), GFP_KERNEL);
++	if (!ppe->foe_owner)
++		return -ENOMEM;
++
+ 	ppe_num_stats_entries = airoha_ppe_get_total_num_stats_entries(ppe);
+ 	if (ppe_num_stats_entries > 0) {
+ 		foe_size = ppe_num_stats_entries * sizeof(*ppe->foe_stats);
+@@ -1663,6 +2576,17 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (err)
+ 		goto error_l2_flow_table_destroy;
+ 
++	ppe->netdevice_nb.notifier_call = airoha_ppe_netdevice_event;
++	err = register_netdevice_notifier(&ppe->netdevice_nb);
++	if (err) {
++		debugfs_remove(ppe->debugfs_dir);
++		goto error_l2_flow_table_destroy;
++	}
++	ppe->netdevice_registered = true;
++
++	if (airoha_is_7563(eth))
++		airoha_ppe_an7563_init(ppe);
++
+ 	return 0;
+ 
+ error_l2_flow_table_destroy:
+@@ -1673,6 +2597,17 @@ error_flow_table_destroy:
+ 	return err;
+ }
+ 
++static void airoha_ppe_free_flow(void *ptr, void *arg)
++{
++	struct airoha_flow_table_entry *e = ptr;
++	struct airoha_ppe *ppe = arg;
++
++	airoha_ppe_foe_flow_remove_entry(ppe, e);
++	dev_put(e->ingress_dev);
++	dev_put(e->wdma_dev);
++	kfree(e);
++}
++
+ void airoha_ppe_deinit(struct airoha_eth *eth)
+ {
+ 	struct airoha_npu *npu;
+@@ -1680,8 +2615,16 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ 	if (!eth->ppe)
+ 		return;
+ 
++	if (eth->ppe->netdevice_registered)
++		unregister_netdevice_notifier(&eth->ppe->netdevice_nb);
++
+ 	mutex_lock(&flow_offload_mutex);
+ 
++	if (airoha_is_7563(eth)) {
++		airoha_fe_clear(eth, REG_PPE_GLO_CFG(0), PPE_GLO_CFG_EN_MASK);
++		airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0), 0);
++	}
++
+ 	npu = rcu_replace_pointer(eth->npu, NULL,
+ 				  lockdep_is_held(&flow_offload_mutex));
+ 	if (npu) {
+@@ -1692,7 +2635,8 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ 
+ 	mutex_unlock(&flow_offload_mutex);
+ 
++	rhashtable_free_and_destroy(&eth->flow_table, airoha_ppe_free_flow,
++				    eth->ppe);
+ 	rhashtable_destroy(&eth->ppe->l2_flows);
+-	rhashtable_destroy(&eth->flow_table);
+ 	debugfs_remove(eth->ppe->debugfs_dir);
+ }
+diff --git b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+index e46a985..3711b77 100644
+--- b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -60,7 +60,7 @@ static int airoha_ppe_debugfs_foe_show(struct seq_file *m, void *private,
+ 		const char *state_str, *type_str = "UNKNOWN";
+ 		void *src_addr = NULL, *dest_addr = NULL;
+ 		u16 *src_port = NULL, *dest_port = NULL;
+-		struct airoha_foe_mac_info_common *l2;
++		struct airoha_foe_mac_info_common *l2, native_l2;
+ 		unsigned char h_source[ETH_ALEN] = {};
+ 		struct airoha_foe_stats64 stats = {};
+ 		unsigned char h_dest[ETH_ALEN];
+@@ -132,7 +132,22 @@ static int airoha_ppe_debugfs_foe_show(struct seq_file *m, void *private,
+ 			break;
+ 		}
+ 
+-		if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
++		if (airoha_is_7563(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
++			struct airoha_foe_bridge_an7563 *br = &hwe->bridge_an7563;
++
++			native_l2 = (struct airoha_foe_mac_info_common) {
++				.dest_mac_hi = br->key[0],
++				.dest_mac_lo = br->key[1] >> 16,
++				.src_mac_hi = br->key[3],
++				.etype = br->etype,
++				.vlan1 = br->vlan1,
++				.vlan2 = br->vlan2,
++			};
++			data = br->data;
++			ib2 = br->ib2;
++			l2 = &native_l2;
++			*((__be16 *)&h_source[4]) = cpu_to_be16(br->key[4] >> 16);
++		} else if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
+ 			data = hwe->ipv6.data;
+ 			ib2 = hwe->ipv6.ib2;
+ 			l2 = &hwe->ipv6.l2;
+diff --git b/drivers/net/ethernet/airoha/airoha_regs.h a/drivers/net/ethernet/airoha/airoha_regs.h
+index caa0b95..6a9abd9 100644
+--- b/drivers/net/ethernet/airoha/airoha_regs.h
++++ a/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -285,6 +285,7 @@
+ #define PPE_IP_PROTO_CHK_IPV6_MASK		GENMASK(15, 0)
+ 
+ #define REG_PPE_TB_CFG(_n)			(((_n) ? PPE2_BASE : PPE1_BASE) + 0x21c)
++#define PPE_TB_CFG_FIN_FAST_RP_MASK		BIT(27)
+ #define PPE_SRAM_TB_NUM_ENTRY_MASK		GENMASK(26, 24)
+ #define PPE_TB_CFG_KEEPALIVE_MASK		GENMASK(13, 12)
+ #define PPE_TB_CFG_AGE_TCP_FIN_MASK		BIT(11)
+@@ -340,6 +341,24 @@
+ #define PPE_SRAM_HASH0_MODE_MASK		GENMASK(7, 4)
+ #define PPE_SRAM_TABLE_EN_MASK			BIT(0)
+ 
++#define REG_PPE_L2B_CFG(_n)		(((_n) ? PPE2_BASE : PPE1_BASE) + 0x288)
++#define PPE_L2B_DMAC_MASK			BIT(0)
++#define PPE_L2B_SMAC_MASK			BIT(1)
++#define PPE_L2B_SPORT_MASK		BIT(4)
++#define PPE_L2B_ETYPE_MASK		BIT(5)
++#define PPE_L2B_ETYPE_BLACKLIST_MASK	BIT(16)
++#define PPE_L2B_VID_MASK			BIT(2)
++#define PPE_L2B_PBITS_MASK		BIT(3)
++#define PPE_L2B_SECOND_VLAN_MASK		BIT(20)
++#define PPE_FLOW_CFG_L2_BRIDGE_MASK	BIT(15)
++
++/* AN7552 native bridge key qualifiers, relative to key word 2. */
++#define AN7563_L2_KEY_SPORT		GENMASK(4, 0)
++#define AN7563_L2_KEY_CTAG		BIT(5)
++#define AN7563_L2_KEY_STAG		BIT(6)
++#define AN7563_L2_KEY_IPV4		(BIT(14) | BIT(10))
++#define AN7563_L2_KEY_IPV6		(BIT(14) | BIT(11))
++
+ #define REG_PPE_MTU_BASE(_n)			(((_n) ? PPE2_BASE : PPE1_BASE) + 0x304)
+ #define REG_PPE_MTU(_m, _n)			(REG_PPE_MTU_BASE(_m) + (((_n) / 2) << 2))
+ #define FP_EGRESS_MTU_MASK(_n)			GENMASK(13 + (((_n) % 2) << 4), ((_n) % 2) << 4)
+diff --git b/include/linux/soc/airoha/airoha_offload.h a/include/linux/soc/airoha/airoha_offload.h
+index 16a988a..5e7915b 100644
+--- b/include/linux/soc/airoha/airoha_offload.h
++++ a/include/linux/soc/airoha/airoha_offload.h
+@@ -21,6 +21,9 @@ struct airoha_ppe_dev {
+ 		void (*check_skb)(struct airoha_ppe_dev *dev,
+ 				  struct sk_buff *skb, u16 hash,
+ 				  bool rx_wlan);
++		void (*check_skb_domain)(struct airoha_ppe_dev *dev,
++					 struct sk_buff *skb, u16 hash, u16 domain);
++		int (*flush_wdma)(struct airoha_ppe_dev *dev, u16 wcid, u8 band);
+ 	} ops;
+ 
+ 	void *priv;
+@@ -36,6 +39,13 @@ static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+ 	return dev->ops.setup_tc_block_cb(dev, type_data);
+ }
+ 
++/* Revoke station paths before returning its WCID to the radio allocator. */
++static inline int airoha_ppe_dev_flush_wdma(struct airoha_ppe_dev *dev,
++					    u16 wcid, u8 band)
++{
++	return dev->ops.flush_wdma ? dev->ops.flush_wdma(dev, wcid, band) : 0;
++}
++
+ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
+ 					    struct sk_buff *skb,
+ 					    u16 hash, bool rx_wlan)
+@@ -58,6 +68,12 @@ static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int airoha_ppe_dev_flush_wdma(struct airoha_ppe_dev *dev,
++					    u16 wcid, u8 band)
++{
++	return 0;
++}
++
+ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
+ 					    struct sk_buff *skb, u16 hash,
+ 					    bool rx_wlan)
