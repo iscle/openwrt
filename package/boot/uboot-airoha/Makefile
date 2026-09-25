@@ -81,7 +81,15 @@ define U-Boot/en7523_rfb
   BL31_IMAGE:=en7523-bl31.bin
 endef
 
+define U-Boot/an7563_rfb
+  NAME:=AN7563 Reference Board
+  UBOOT_CONFIG:=an7563_evb
+  BUILD_DEVICES:=airoha_an7563-evb
+  BUILD_SUBTARGET:=an7563
+endef
+
 UBOOT_TARGETS := \
+	an7563_rfb \
 	an7581_gemtek_w1700k \
 	an7581_nokia_valyrian \
 	an7581_nokia_xg-040g-md \
@@ -115,6 +123,9 @@ endef
 
 define Build/InstallDev
 	$(INSTALL_DIR) $(STAGING_DIR_IMAGE)
+ifneq ($(filter an7563_%,$(BUILD_VARIANT)),)
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/u-boot.bin $(STAGING_DIR_IMAGE)/$(BUILD_VARIANT)-u-boot.bin
+endif
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/u-boot.$(if $(LZMA_COMPRESS),lzma,bin) \
 		$(STAGING_DIR_IMAGE)/$(BUILD_VARIANT)-u-boot.$(if $(LZMA_COMPRESS),lzma,bin)
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/u-boot.dtb \
