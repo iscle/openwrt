@@ -1,0 +1,44 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] dt-bindings: cpufreq: describe AN7563 MCU divider resource
+
+AN7563 needs its MCU clock divider for safe firmware clock handoffs.
+Require the register resource for the new compatible only.
+
+Signed-off-by: Iscle <albertiscle9@gmail.com>
+---
+--- a/Documentation/devicetree/bindings/cpufreq/airoha,en7581-cpufreq.yaml
++++ b/Documentation/devicetree/bindings/cpufreq/airoha,en7581-cpufreq.yaml
+@@ -25,7 +25,13 @@
+ 
+ properties:
+   compatible:
+-    const: airoha,en7581-cpufreq
++    enum:
++      - airoha,en7581-cpufreq
++      - airoha,an7563-cpufreq
++
++  reg:
++    maxItems: 1
++    description: AN7563 MCU CPU clock mux/divider register.
+ 
+   '#clock-cells':
+     const: 0
+@@ -41,6 +47,18 @@
+   - '#power-domain-cells'
+   - operating-points-v2
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          const: airoha,an7563-cpufreq
++    then:
++      required:
++        - reg
++    else:
++      properties:
++        reg: false
++
+ additionalProperties: false
+ 
+ examples:
