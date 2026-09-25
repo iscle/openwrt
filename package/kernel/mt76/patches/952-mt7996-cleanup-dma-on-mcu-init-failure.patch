@@ -1,0 +1,29 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] mt76: mt7996: release DMA resources on MCU initialization failure
+
+Unwind DMA initialization when MCU startup fails. The probe error path
+must release the resources allocated before the failed firmware request.
+
+Signed-off-by: Iscle <albertiscle9@gmail.com>
+---
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -1305,8 +1305,17 @@
+ 	set_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
+ 
+ 	ret = mt7996_mcu_init(dev);
+-	if (ret)
++	if (ret) {
++		clear_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
++		mt7996_irq_disable(dev, ~0);
++		tasklet_kill(&dev->mt76.irq_tasklet);
++		mt76_for_each_q_rx(&dev->mt76, idx) {
++			if (dev->mt76.napi[idx].poll_list.next)
++				napi_disable(&dev->mt76.napi[idx]);
++		}
++		mt7996_dma_cleanup(dev);
+ 		return ret;
++	}
+ 
+ 	ret = mt7996_wed_rro_init(dev);
+ 	if (ret)
