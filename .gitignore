@@ -35,3 +35,6 @@ git-src
 .cproject
 .ccache
 .vscode*
+
+# Python source-side regression tests
+__pycache__/
