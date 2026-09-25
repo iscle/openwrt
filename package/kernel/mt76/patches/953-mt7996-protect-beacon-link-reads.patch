@@ -1,0 +1,142 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] mt76: mt7996: protect beacon link state with RCU
+
+Protect link dereferences during descriptor construction. Snapshot beacon
+state under RCU before sending MCU commands, which may sleep.
+
+Signed-off-by: Iscle <albertiscle9@gmail.com>
+---
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -912,6 +912,7 @@
+ 	bool beacon = !!(changed & (BSS_CHANGED_BEACON |
+ 				    BSS_CHANGED_BEACON_ENABLED)) && (!inband_disc);
+ 
++	rcu_read_lock();
+ 	mvif = vif ? (struct mt7996_vif *)vif->drv_priv : NULL;
+ 	if (mvif) {
+ 		if (wcid->offchannel)
+@@ -1008,6 +1009,7 @@
+ 		txwi[6] |= cpu_to_le32(val);
+ 		txwi[3] |= cpu_to_le32(MT_TXD3_BA_DISABLE);
+ 	}
++	rcu_read_unlock();
+ }
+ 
+ static bool
+@@ -2213,6 +2215,7 @@
+ mt7996_update_vif_beacon(void *priv, u8 *mac, struct ieee80211_vif *vif)
+ {
+ 	struct ieee80211_bss_conf *link_conf;
++	struct mt7996_beacon_conf conf = {};
+ 	struct mt7996_phy *phy = priv;
+ 	struct mt7996_dev *dev = phy->dev;
+ 	unsigned int link_id;
+@@ -2227,9 +2230,27 @@
+ 		return;
+ 	}
+ 
+-	for_each_vif_active_link(vif, link_conf, link_id) {
++	for (link_id = 0; link_id < ARRAY_SIZE(vif->link_conf); link_id++) {
+ 		struct mt7996_vif_link *link;
+ 		struct mt7996_phy *link_phy;
++
++		/* Scan work holds the driver mutex, not the wiphy mutex.
++		 * Snapshot the beacon fields under RCU; the MCU command sleeps.
++		 */
++		rcu_read_lock();
++		link_conf = rcu_dereference(vif->link_conf[link_id]);
++		if (!link_conf || (vif->active_links &&
++				  !(vif->active_links & BIT(link_id)))) {
++			rcu_read_unlock();
++			continue;
++		}
++		conf.link_id = link_conf->link_id;
++		conf.enable_beacon = link_conf->enable_beacon;
++		conf.nontransmitted = link_conf->nontransmitted;
++		conf.bssid_indicator = link_conf->bssid_indicator;
++		conf.csa_active = link_conf->csa_active;
++		conf.color_change_active = link_conf->color_change_active;
++		rcu_read_unlock();
+ 
+ 		link = mt7996_vif_link(dev, vif, link_id);
+ 		if (!link)
+@@ -2239,8 +2260,8 @@
+ 		if (link_phy != phy)
+ 			continue;
+ 
+-		mt7996_mcu_add_beacon(dev->mt76.hw, vif, link_conf,
+-				      link_conf->enable_beacon);
++		mt7996_mcu_set_beacon(dev->mt76.hw, vif, &conf,
++				      conf.enable_beacon);
+ 	}
+ }
+ 
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -784,6 +784,18 @@
+ int mt7996_mcu_update_bss_color(struct mt7996_dev *dev,
+ 				struct mt76_vif_link *mlink,
+ 				struct cfg80211_he_bss_color *he_bss_color);
++/* Scalar beacon state can be snapshotted under RCU before sleeping. */
++struct mt7996_beacon_conf {
++	u8 link_id;
++	u8 bssid_indicator;
++	bool enable_beacon;
++	bool nontransmitted;
++	bool csa_active;
++	bool color_change_active;
++};
++
++int mt7996_mcu_set_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			  const struct mt7996_beacon_conf *link_conf, bool enabled);
+ int mt7996_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			  struct ieee80211_bss_conf *link_conf, bool enabled);
+ int mt7996_mcu_beacon_inband_discov(struct mt7996_dev *dev,
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -3332,7 +3332,7 @@
+ 
+ static void
+ mt7996_mcu_beacon_cont(struct mt7996_dev *dev,
+-		       struct ieee80211_bss_conf *link_conf,
++		       const struct mt7996_beacon_conf *link_conf,
+ 		       struct mt7996_vif_link *link,
+ 		       struct sk_buff *rskb, struct sk_buff *skb,
+ 		       struct bss_bcn_content_tlv *bcn,
+@@ -3365,11 +3365,11 @@
+ 	memcpy(buf + MT_TXD_SIZE, skb->data, skb->len);
+ }
+ 
+-int mt7996_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+-			  struct ieee80211_bss_conf *link_conf, bool enabled)
++int mt7996_mcu_set_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			  const struct mt7996_beacon_conf *link_conf, bool enabled)
+ {
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+-	struct mt7996_vif_link *link = mt7996_vif_conf_link(dev, vif, link_conf);
++	struct mt7996_vif_link *link = mt7996_vif_link(dev, vif, link_conf->link_id);
+ 	struct mt76_phy *mphy = link ? mt76_vif_link_phy(&link->mt76) : NULL;
+ 	struct mt76_vif_link *mlink = link ? &link->mt76 : NULL;
+ 	struct ieee80211_mutable_offsets offs;
+@@ -3428,6 +3428,20 @@
+ 	dev_kfree_skb(skb);
+ 	return mt76_mcu_skb_send_msg(&dev->mt76, rskb,
+ 				     MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE), true);
++}
++
++int mt7996_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			  struct ieee80211_bss_conf *link_conf, bool enabled)
++{
++	const struct mt7996_beacon_conf conf = {
++		.link_id = link_conf->link_id,
++		.bssid_indicator = link_conf->bssid_indicator,
++		.nontransmitted = link_conf->nontransmitted,
++		.csa_active = link_conf->csa_active,
++		.color_change_active = link_conf->color_change_active,
++	};
++
++	return mt7996_mcu_set_beacon(hw, vif, &conf, enabled);
+ }
+ 
+ int mt7996_mcu_beacon_inband_discov(struct mt7996_dev *dev,
