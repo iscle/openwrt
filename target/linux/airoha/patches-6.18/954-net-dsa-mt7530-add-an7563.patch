@@ -1,0 +1,118 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] net: dsa: mt7530: manage the AN7563 embedded switch
+
+Register the AN7563 embedded switch with DSA and expose its internal PHY
+ports. DSA owns forwarding, learning and VLAN configuration, while the
+MAC driver exchanges port tags through the frame-engine descriptors.
+
+Signed-off-by: Iscle <albertiscle9@gmail.com>
+---
+--- a/drivers/net/dsa/mt7530.h
++++ b/drivers/net/dsa/mt7530.h
+@@ -21,6 +21,7 @@
+ 	ID_MT7988 = 3,
+ 	ID_EN7581 = 4,
+ 	ID_AN7583 = 5,
++	ID_AN7563 = 6,
+ };
+ 
+ #define	NUM_TRGMII_CTRL			5
+--- a/drivers/net/dsa/mt7530-mmio.c
++++ b/drivers/net/dsa/mt7530-mmio.c
+@@ -11,6 +11,7 @@
+ #include "mt7530.h"
+ 
+ static const struct of_device_id mt7988_of_match[] = {
++	{ .compatible = "airoha,an7563-switch", .data = &mt753x_table[ID_AN7563], },
+ 	{ .compatible = "airoha,an7583-switch", .data = &mt753x_table[ID_AN7583], },
+ 	{ .compatible = "airoha,en7581-switch", .data = &mt753x_table[ID_EN7581], },
+ 	{ .compatible = "mediatek,mt7988-switch", .data = &mt753x_table[ID_MT7988], },
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -1287,7 +1287,8 @@
+ 	 * is affine to the inbound user port.
+ 	 */
+ 	if (priv->id == ID_MT7531 || priv->id == ID_MT7988 ||
+-	    priv->id == ID_EN7581 || priv->id == ID_AN7583)
++	    priv->id == ID_EN7581 || priv->id == ID_AN7583 ||
++	    priv->id == ID_AN7563)
+ 		mt7530_set(priv, MT7531_CFC, MT7531_CPU_PMAP(BIT(port)));
+ 
+ 	/* CPU port gets connected to all user ports of
+@@ -2607,7 +2608,8 @@
+ 	mt7530_set(priv, MT753X_AGC, LOCAL_EN);
+ 
+ 	/* Enable Special Tag for rx frames */
+-	if (priv->id == ID_EN7581 || priv->id == ID_AN7583)
++	if (priv->id == ID_EN7581 || priv->id == ID_AN7583 ||
++	    priv->id == ID_AN7563)
+ 		mt7530_write(priv, MT753X_CPORT_SPTAG_CFG,
+ 			     CPORT_SW2FE_STAG_EN | CPORT_FE2SW_STAG_EN);
+ 
+@@ -2813,6 +2815,28 @@
+ 	switch (port) {
+ 	/* Ports which are connected to switch PHYs. There is no MII pinout. */
+ 	case 0 ... 4:
++		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
++			  config->supported_interfaces);
++
++		config->mac_capabilities |= MAC_10 | MAC_100 | MAC_1000FD;
++		break;
++
++	/* Port 6 is connected to SoC's XGMII MAC. There is no MII pinout. */
++	case 6:
++		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
++			  config->supported_interfaces);
++
++		config->mac_capabilities |= MAC_10000FD;
++		break;
++	}
++}
++
++static void an7563_mac_port_get_caps(struct dsa_switch *ds, int port,
++				     struct phylink_config *config)
++{
++	switch (port) {
++	/* Ports which are connected to switch PHYs. There is no MII pinout. */
++	case 1 ... 4:
+ 		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
+ 			  config->supported_interfaces);
+ 
+@@ -3357,6 +3381,16 @@
+ 		.phy_write_c45 = mt7531_ind_c45_phy_write,
+ 		.mac_port_get_caps = en7581_mac_port_get_caps,
+ 	},
++	[ID_AN7563] = {
++		.id = ID_AN7563,
++		.pcs_ops = &mt7530_pcs_ops,
++		.sw_setup = mt7988_setup,
++		.phy_read_c22 = mt7531_ind_c22_phy_read,
++		.phy_write_c22 = mt7531_ind_c22_phy_write,
++		.phy_read_c45 = mt7531_ind_c45_phy_read,
++		.phy_write_c45 = mt7531_ind_c45_phy_write,
++		.mac_port_get_caps = an7563_mac_port_get_caps,
++	},
+ 	[ID_AN7583] = {
+ 		.id = ID_AN7583,
+ 		.pcs_ops = &mt7530_pcs_ops,
+--- a/Documentation/devicetree/bindings/net/dsa/mediatek,mt7530.yaml
++++ b/Documentation/devicetree/bindings/net/dsa/mediatek,mt7530.yaml
+@@ -91,6 +91,10 @@
+       - description:
+           Built-in switch of the MT7988 SoC
+         const: mediatek,mt7988-switch
++
++      - description:
++          Built-in switch of the Airoha AN7563 SoC
++        const: airoha,an7563-switch
+ 
+       - description:
+           Built-in switch of the Airoha EN7581 SoC
+@@ -316,6 +320,7 @@
+         compatible:
+           enum:
+             - mediatek,mt7988-switch
++            - airoha,an7563-switch
+             - airoha,en7581-switch
+             - airoha,an7583-switch
+     then:
