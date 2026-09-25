@@ -1,0 +1,87 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] net: airoha: add AN7563 external Ethernet support
+
+Add the fixed-rate PCS driver option. Route GDM2 traffic through
+the shared QDMA0 CPU path and enable channel zero for active Ethernet.
+
+Signed-off-by: Iscle <albertiscle9@gmail.com>
+---
+--- a/drivers/net/pcs/Kconfig
++++ b/drivers/net/pcs/Kconfig
+@@ -4,6 +4,18 @@
+ #
+ 
+ menu "PCS device drivers"
++
++config PCS_AN7563
++	bool "Airoha AN7563 2500BASE-X PCS"
++	depends on OF && (ARCH_AIROHA || COMPILE_TEST)
++	select FWNODE_PCS
++	select PHYLINK
++	select MFD_SYSCON
++	help
++	  Ethernet mode for the AN7563 PON SerDes.
++	  Configure the analog block and PCS for a fixed 2500BASE-X link
++	  between GDM2 and an external PHY. The copper-side link speed is
++	  negotiated by the PHY independently of the SerDes interface.
+ 
+ config FWNODE_PCS
+ 	bool "PCS Firmware Node"
+--- a/drivers/net/pcs/Makefile
++++ b/drivers/net/pcs/Makefile
+@@ -11,3 +11,5 @@
+ obj-$(CONFIG_PCS_MTK_USXGMII)	+= pcs-mtk-usxgmii.o
+ obj-$(CONFIG_PCS_RZN1_MIIC)	+= pcs-rzn1-miic.o
+ obj-$(CONFIG_PCS_AIROHA)	+= airoha/
++
++obj-$(CONFIG_PCS_AN7563) += pcs-an7563.o
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2326,6 +2327,17 @@
+ 		return err;
+ 	}
+ 
++	if (eth->soc->version == 0x7563 && port->id == AIROHA_GDM2_IDX) {
++		/* Active Ethernet uses channel zero on the PON MAC. */
++		airoha_fe_set(eth, REG_GDM_FWD_CFG(port->id),
++			      GDM_PAD_EN_MASK | GDM_STRIP_CRC_MASK | GDM_DROP_CRC_ERR_MASK);
++		airoha_fe_wr(eth, REG_GDM_TXCHN_EN(port->id), BIT(0));
++		airoha_fe_wr(eth, REG_GDM_RXCHN_EN(port->id), BIT(0));
++		airoha_fe_clear(eth, REG_GDM_LPBK_CFG(port->id), LPBK_EN_MASK);
++		airoha_fe_clear(eth, REG_FE_VIP_PORT_EN, BIT(port->id));
++		airoha_fe_clear(eth, REG_FE_IFC_PORT_EN, BIT(port->id));
++	}
++
+ 	phylink_start(dev->phylink);
+ 
+ 	netif_tx_start_all_queues(netdev);
+@@ -2543,7 +2555,8 @@
+ 	int ppe_id;
+ 
+ 	/* QDMA0 is used for lan ports while QDMA1 is used for WAN ports */
+-	qdma = &eth->qdma[!airoha_is_lan_gdm_dev(dev)];
++	qdma = &eth->qdma[eth->soc->version == 0x7563 ?
++			 0 : !airoha_is_lan_gdm_dev(dev)];
+ 	cur_qdma = airoha_qdma_deref(dev);
+ 	if (netif_running(netdev))
+ 		airoha_qdma_start(qdma);
+@@ -2571,6 +2584,9 @@
+ 
+ 	/* AN7563 uses QDMA directly without PPE/NPU acceleration. */
+ 	if (dev->eth->soc->version == 0x7563) {
++		/* GDM2 has separate MAC registers, but shares the CPU QDMA. */
++		if (port->id == AIROHA_GDM2_IDX)
++			dev->flags |= AIROHA_PRIV_F_WAN;
+ 		airoha_dev_set_qdma(dev);
+ 		return airoha_set_macaddr(dev, netdev->dev_addr);
+ 	}
+@@ -2773,7 +2789,8 @@
+ 	desc = &q->desc[q->head];
+ 	index = (q->head + 1) % q->ndesc;
+ 
+-	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, FE_PSE_PORT_GDM1) |
++	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK,
++			  ((struct airoha_gdm_dev *)netdev_priv(dev))->port->id) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
+ 
+ 	val = FIELD_PREP(QDMA_DESC_LEN_MASK, skb->len);
