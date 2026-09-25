@@ -1,0 +1,133 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] bridger: wait for command acknowledgements and propagate errors
+
+A filter query can return its data before the acknowledgement. Keep
+receiving until the ACK arrives so the next command does not consume a
+stale response. Propagate kernel errors instead of treating a rejected
+rule as installed, allowing the DSA conduit fallback to run.
+
+Use libnl error strings for libnl return values.
+
+Signed-off-by: Iscle <albertiscle9@gmail.com>
+---
+--- a/nl.c
++++ b/nl.c
+@@ -29,6 +29,33 @@
+ static bool ignore_errors;
+ static bool recv_idle;
+ 
++static int
++bridger_nl_ack_cb(struct nl_msg *msg, void *arg)
++{
++	bool *done = arg;
++
++	*done = true;
++	return NL_STOP;
++}
++
++static int
++bridger_nl_wait_for_ack(struct nl_sock *sock)
++{
++	struct nl_cb *cb = nl_cb_clone(nl_socket_get_cb(sock));
++	bool done = false;
++	int ret = 0;
++
++	if (!cb)
++		return -NLE_NOMEM;
++
++	nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, bridger_nl_ack_cb, &done);
++	while (!done && !ret)
++		ret = nl_recvmsgs(sock, cb);
++	nl_cb_put(cb);
++
++	return ret;
++}
++
+ static int offload_handle_cmp(const void *k1, const void *k2, void *ptr)
+ {
+ 	uint32_t v1 = (uint32_t)(uintptr_t)k1;
+@@ -546,7 +573,7 @@
+ 	nl_send_auto_complete(cmd_sock, msg);
+ 	nlmsg_free(msg);
+ 	ignore_errors = true;
+-	nl_wait_for_ack(cmd_sock);
++	bridger_nl_wait_for_ack(cmd_sock);
+ 	ignore_errors = false;
+ }
+ 
+@@ -595,7 +622,7 @@
+ 	nl_send_auto_complete(cmd_sock, msg);
+ 	nlmsg_free(msg);
+ 	ignore_errors = true;
+-	nl_wait_for_ack(cmd_sock);
++	bridger_nl_wait_for_ack(cmd_sock);
+ 	ignore_errors = false;
+ }
+ 
+@@ -748,7 +775,7 @@
+ 	nl_send_auto_complete(cmd_sock, msg);
+ 	nlmsg_free(msg);
+ 
+-	return nl_wait_for_ack(cmd_sock);
++	return bridger_nl_wait_for_ack(cmd_sock);
+ }
+ 
+ int bridger_nl_flow_offload_add(struct bridger_flow *flow)
+@@ -766,7 +793,7 @@
+ 	for (dev = flow->fdb_in->dev; dev; dev = dev->offload_dev) {
+ 		ifindex = device_ifindex(dev);
+ 		ret = __bridger_nl_flow_offload_add(flow, dev);
+-		D("Add flow on %s: %s\n", dev->ifname, ret ? strerror(-ret) : "Success");
++		D("Add flow on %s: %s\n", dev->ifname, ret ? nl_geterror(ret) : "Success");
+ 		if (!ret)
+ 			break;
+ 	}
+@@ -803,7 +830,7 @@
+ 	msg = bridger_nl_flow_offload_msg(flow, flow->offload_ifindex, RTM_GETTFILTER);
+ 	nl_send_auto_complete(cmd_sock, msg);
+ 	nlmsg_free(msg);
+-	nl_wait_for_ack(cmd_sock);
++	bridger_nl_wait_for_ack(cmd_sock);
+ }
+ 
+ void bridger_nl_flow_offload_del(struct bridger_flow *flow)
+@@ -825,7 +852,7 @@
+ 	nlmsg_free(msg);
+ 
+ 	ignore_errors = true;
+-	nl_wait_for_ack(cmd_sock);
++	bridger_nl_wait_for_ack(cmd_sock);
+ 	ignore_errors = false;
+ 
+ 	flow->offload_packets = 0;
+@@ -878,7 +905,7 @@
+ 
+ 	f->updated = true;
+ 
+-	ret = nl_wait_for_ack(cmd_sock);
++	ret = bridger_nl_wait_for_ack(cmd_sock);
+ 	if (ret)
+ 		D("Failed to refresh fdb entry %s vid=%d @%s ret=%d\n",
+ 		  format_macaddr(f->key.addr), f->key.vlan, f->dev->ifname, ret);
+@@ -898,10 +925,10 @@
+ 	const char *errstr = "(unknown)";
+ 
+ 	if (ignore_errors)
+-		return NL_SKIP;
++		return NL_STOP;
+ 
+ 	if (!(nlh->nlmsg_flags & NLM_F_ACK_TLVS))
+-		return NL_SKIP;
++		return NL_STOP;
+ 
+ 	if (!(nlh->nlmsg_flags & NLM_F_CAPPED))
+ 		ack_len += err->msg.nlmsg_len - sizeof(*nlh);
+@@ -915,7 +942,7 @@
+ 
+ 	D("Netlink error(%d): %s\n", err->error, errstr);
+ 
+-	return NL_SKIP;
++	return NL_STOP;
+ }
+ 
+ struct nl_sock *
