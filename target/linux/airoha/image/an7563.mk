@@ -21,7 +21,7 @@ define Device/xiaomi_be5000
   DEVICE_VENDOR := Xiaomi
   DEVICE_MODEL := BE5000
   DEVICE_DTS := an7563-xiaomi-be5000
-  DEVICE_PACKAGES := kmod-phy-airoha-en8811h \
+  DEVICE_PACKAGES := an7552-npu-firmware kmod-phy-airoha-en8811h \
 	kmod-mt7996e kmod-mt7992-23-firmware wpad-basic-mbedtls iw
   KERNEL_LOADADDR := 0x80088000
   ARTIFACT/u-boot.bin := an7563-uboot xiaomi_be5000

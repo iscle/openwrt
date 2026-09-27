@@ -1,9 +1,8 @@
 Subject: [PATCH] dt-bindings: net: airoha: describe AN7552 NPU
 
-Describe the two-core NPU and its receive buffer region.
+Describe its two cores, shared buffers and Ethernet frame-engine link.
 
 ---
-diff --git a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml b/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
 --- a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
 +++ b/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
 @@ -4,7 +4,7 @@
@@ -15,12 +14,16 @@ diff --git a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml b/Docu
  
  maintainers:
    - Lorenzo Bianconi <lorenzo@kernel.org>
-@@ -17,31 +17,21 @@
+@@ -17,45 +17,87 @@
  properties:
    compatible:
      enum:
 +      - airoha,an7552-npu
        - airoha,en7581-npu
++
++  airoha,eth:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: Ethernet frame engine providing the NPU TDMA queues.
  
    reg:
      maxItems: 1
@@ -47,13 +50,16 @@ diff --git a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml b/Docu
  
    memory-region:
      oneOf:
-+      - items:
-+          - description: NPU firmware binary region
-+          - description: NPU wlan offload RX buffers region
        - items:
            - description: NPU firmware binary region
++          - description: NPU shared packet and descriptor buffers region
        - items:
-@@ -51,11 +41,54 @@
+           - description: NPU firmware binary region
+-          - description: NPU wlan offload RX buffers region
++      - items:
++          - description: NPU firmware binary region
++          - description: NPU shared packet and descriptor buffers region
+           - description: NPU wlan offload TX buffers region
            - description: NPU wlan offload TX packet identifiers region
  
    memory-region-names:
@@ -70,6 +76,8 @@ diff --git a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml b/Docu
 +        compatible:
 +          const: airoha,an7552-npu
 +    then:
++      required:
++        - airoha,eth
 +      properties:
 +        interrupts:
 +          items:
@@ -83,11 +91,14 @@ diff --git a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml b/Docu
 +            - description: wlan irq line4
 +            - description: wlan irq line5
 +        memory-region:
++          minItems: 2
 +          maxItems: 2
 +        memory-region-names:
++          minItems: 2
 +          maxItems: 2
 +    else:
 +      properties:
++        airoha,eth: false
 +        interrupts:
 +          items:
 +            - description: mbox host irq line
