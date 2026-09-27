@@ -1,89 +1,67 @@
-# AN7552 Wi-Fi receive acceleration
+# AN7552 Wi-Fi acceleration
 
-The AN7552 integration uses the NPU for Wi-Fi receive buffering and hardware
-reordering, then submits eligible traffic to the host-managed PPE. With `bridger`,
-learned Wi-Fi-to-Ethernet bridge flows can bypass the Linux receive/forwarding
-path. Traffic addressed to the router and unsupported flows still reaches Linux.
+This branch builds new MIT-licensed firmware for both AN7552 RISC-V cores.
+It replaces the earlier Xiaomi receive-only firmware. No stock NPU extraction
+or additional files overlay is needed: the BE5000 device package builds and
+installs `an7552-npu-firmware`, including its bare-metal RISC-V host toolchain.
+The MT7992 radio and EN8811H Ethernet PHY still require their separate vendor
+firmware. This does not replace BL2 or BL31.
 
-Wi-Fi transmission remains on the normal mt76 path. The tested Xiaomi firmware
-has no functional NPU Wi-Fi transmit services. This implementation does not
-pretend that those commands succeeded, reserve transmit tokens, or redirect
-transmit queues to an inactive engine. This firmware limitation does not prove
-that a future independent implementation could not use the hardware differently.
-Ethernet-to-Wi-Fi transmission and Wi-Fi-to-Wi-Fi forwarding are not fully
-hardware accelerated. Per-flow hardware packet and byte statistics also remain
-unavailable; zero counters in the PPE debug files do not mean that a bound flow
-is idle.
+Core 0 submits Wi-Fi transmit descriptors and handles transmit completion.
+Core 1 handles receive reordering, replay checks and submission to the Ethernet
+PPE. Together with `bridger`, this accelerates supported Ethernet-to-Wi-Fi and
+Wi-Fi-to-Ethernet bridge flows. Traffic addressed to the router and unsupported
+flows still reaches Linux. See the [firmware README](../../../package/firmware/an7552-npu-firmware/src/README.md)
+for its versioned ABI, build instructions and host tests.
 
-## Firmware
+## Ownership and key lifecycle
 
-The tested firmware pair comes from Xiaomi BE5000 ROM 1.0.91. It is not
-interchangeable with the EN7581 or AN7583 NPU firmware. The source tree contains
-an extractor and driver support, not the proprietary firmware binaries.
+The Linux driver validates the image header and runtime ABI before enabling
+queues. Queue handshakes transfer DMA ownership; a separate park handshake
+stops both cores before shared memory is reinitialized. Reserved workspace and
+packet-buffer regions are declared in the device tree.
 
-Download the [original Xiaomi ROM](https://cdn.cnbj1.fds.api.mi-img.com/xiaoqiang/rom/rd18/miwifi_rd18_firmware_05f43_1.0.91.bin)
-and run the following from the repository root before building your local image:
+The receive fast path requires an authorized station, individually addressed
+CCMP data and supported IPv4/IPv6 TCP/UDP headers. Other layouts use Linux.
+Replay counters are tracked separately for each station and traffic identifier.
+Key changes revoke offload eligibility until the key installation succeeds.
+Recovery snapshots and revokes receive state rather than using stale host
+counters. The MT7992 driver saves hardware transmit packet numbers before a
+radio reset, restores them after key installation and checks the readback.
 
-```sh
-python3 scripts/extract-be5000-npu.py /path/to/miwifi_rd18_firmware_05f43_1.0.91.bin files/lib/firmware/airoha
-make -j"$(nproc)"
-```
+## Validation
 
-The extractor requires `unsquashfs`, or the build tree's `unsquashfs4`, and verifies
-both the complete ROM and the two extracted files before writing either output.
-It does not extract stock settings, boot firmware, MAC addresses or calibration.
-The files directory must contain only the intended build additions. Firmware
-redistribution rights must be established separately before publishing an image
-that contains these vendor blobs.
+The integrated RAM image passed checksum-verified transfers on one BE5000 and
+one client. Tests included:
 
-| File | SHA-256 |
-| --- | --- |
-| Xiaomi ROM 1.0.91 | `27968aaa3efa56e7a90a6ef7da7a51f392f612d49b1948d5de20a9304f3e417b` |
-| `an7552_npu_rv32.bin` | `04d14bea05c3f915813907ec516ae066967f0353ecd933cfefc65fb12f78ce4e` |
-| `an7552_npu_data.bin` | `c9f0421ca2ac36854ff45a50dbf34f83fff5d55340b531b3d1a0c2e61fbb8370` |
+* Simultaneous IPv4 transfers in both directions on each band.
+* Repeated pairwise and group key rotations during transfers: 512 MiB each way
+  on 2.4 GHz and 1 GiB each way on 5 GHz. Aggregate rates were approximately
+  210 and 605 Mbit/s, respectively; these are functional checks, not maxima.
+* IPv6 Wi-Fi-to-Ethernet delivery with matching SHA-256 and active offload.
+* Full driver reset on 5 GHz with the original client association preserved.
+* Actual radio firmware assertions on both bands followed by checksum-verified
+  accelerated delivery. The final tests retained the client association, but
+  other runs triggered client beacon-loss detection and reassociation.
+* Three successive Wi-Fi driver removal/reattachment cycles with the integrated
+  NPU backend, without a failed backend or firmware trap.
+* Rejection of malformed firmware headers before queue activation, and five
+  host tests for replay state, packet parsing, receive ownership, station frames
+  and transmit completion parsing.
 
-## Interface differences
+Installed-image results and exact artifact hashes belong in release notes.
+Private runtime configuration and calibration are never release artifacts.
 
-The driver accounts for two NPU cores, the packed watchdog control register,
-legacy mailbox command limits, the shared RRO CPU-index memory handshake and
-13-bit receive descriptor lengths. Unsupported modern transmit/version commands
-are not sent. Packet lengths are checked before constructing skbs, and all
-fragments must be complete before any buffer ownership transfers to the stack.
-Legacy replay, old-packet and duplicate indications are discarded.
+## Limits
 
-The firmware caches host receive-ring addresses for its lifetime. Those two
-rings are therefore owned by the NPU and reused across Wi-Fi driver reloads.
-Removal quiesces the receive workers and completes firmware cleanup before the
-Wi-Fi device releases its packet buffers. It does not restart the cores: doing
-so would reset the firmware's TDMA index without resetting the hardware index.
-Other queue allocations use the NPU's DMA addressing but are released with the
-Wi-Fi device; RRO allocations retain their existing explicit cleanup.
+Per-flow PPE packet and byte counters are unavailable; zero values in PPE debug
+files do not show whether a bound flow is idle. Verify delivery and aggregate
+NPU statistics instead. Unsupported packet layouts and ciphers intentionally
+use Linux. Hardware HTB/ETS queue offload remains unsupported.
 
-The legacy cleanup command includes at least 200 ms of firmware delays. It uses
-a sleepable mailbox wait with a one-second limit, while a protected busy flag
-prevents concurrent requests from overwriting its command buffer. Other mailbox
-operations retain their atomic wait. If quiescing fails, the driver halts the
-cores and prevents NPU reattachment until reboot; a subsequent radio probe uses
-the normal mt76 path.
-
-## Validation scope
-
-Initial RAM tests passed 32 MiB transfers in both directions with matching
-checksums on both radios. A bridged 30,152,712-byte HTTPS download matched the
-original ROM checksum. During the 5 GHz download the PPE contained a bound flow
-for the test station, while approximately 3,000 station transmissions produced
-96 packets in the host Wi-Fi receive path. This verifies receive offload rather
-than association alone.
-
-These measurements are functional checks on one router and client, not maximum
-throughput benchmarks. Sustained multi-client load, MLO and full regulatory
-certification are not established by them.
-
-Three consecutive driver removal/reattachment cycles, with checksum-verified
-32 MiB traffic in both directions between each cycle, passed without kernel
-warnings or loss of NPU attachment. The host descriptor-ring addresses remained
-unchanged and the TDMA producer/consumer indices stayed synchronized. Both
-radios passed again after the reload tests. The timeout failure path was also
-exercised: a subsequent probe fell back to normal mt76 and passed checksum
-transfers. Release artifacts carry the corresponding installed-image validation
-results.
+Sustained multi-client load, Wi-Fi-to-Wi-Fi offload, MLO, all cipher combinations,
+DFS compliance and regulatory certification are not established by these tests.
+Radio recovery has been exercised, but automatic recovery from an NPU firmware
+trap is not implemented. Fault paths stop acceleration and may require a reboot.
+The firmware and driver are AN7552-specific and are not drop-in replacements
+for EN7581 or AN7583 implementations.
