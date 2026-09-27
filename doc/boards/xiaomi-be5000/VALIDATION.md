@@ -192,5 +192,5 @@ IDs 0–7. OpenWrt's current NPU/Wi-Fi integration requires additional buffer,
 token and version commands. This binary is not a compatible replacement for
 the EN7581 firmware and is not redistributed in this tree. NPU compatibility
 required a separately validated legacy interface or suitable vendor firmware.
-The subsequent receive-only integration and its validation are described in
-[NPU.md](NPU.md).
+The subsequent source-built transmit/receive integration and its validation
+are described in [NPU.md](NPU.md).
