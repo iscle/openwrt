@@ -1,0 +1,29 @@
+From: Iscle <albertiscle9@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: skip RRO startup when disabled
+
+mt7996_register_device() calls mt7996_dma_rro_start() even when hardware
+receive reordering is disabled. In that case its queues have not been
+allocated, but startup still registers and enables their NAPI instances.
+The descriptor-based teardown loop skips these zero-length queues,
+leaving enabled NAPI instances behind when the dummy netdev is freed.
+
+Return before registering RRO NAPI or enabling RRO interrupts if the
+device has no active hardware receive reordering mode. This matches the
+condition used when allocating the RRO queues.
+
+On an MT7992 with RRO disabled, this prevents four NAPI deletion warnings
+and leaves no registered receive NAPI instances after DMA cleanup.
+
+---
+--- a/mt7996/dma.c
++++ b/mt7996/dma.c
+@@ -624,6 +624,9 @@ void mt7996_dma_rro_start(struct mt7996_de
+ {
+ 	u32 irq_mask;
+ 
++	if (!mt7996_has_hwrro(dev))
++		return;
++
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
+ 		irq_mask = dev->mt76.mmio.irqmask |
+ 			   MT_INT_TX_DONE_BAND2;
