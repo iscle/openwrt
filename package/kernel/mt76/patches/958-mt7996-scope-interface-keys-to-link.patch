@@ -1,0 +1,33 @@
+Subject: [PATCH] wifi: mt76: mt7996: scope interface keys to their link
+
+The interface key iterator visits all keys belonging to the VIF. Filter
+link-specific keys before programming a link so that a partner link's
+GTK or beacon key cannot overwrite the target link's key at the same
+index. Keys without a link ID retain the non-MLO behavior.
+
+Use DISABLE_KEY when tearing down a link instead of reinstalling its
+keys immediately before deleting the BSS and station records.
+
+Fixes: e995f6198d8b ("wifi: mt76: mt7996: fix key add/remove imbalance")
+
+---
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -283,7 +283,7 @@
+ {
+ 	struct mt7996_key_iter_data *it = data;
+ 
+-	if (sta)
++	if (sta || (key->link_id >= 0 && (unsigned int)key->link_id != it->link_id))
+ 		return;
+ 
+ 	WARN_ON(mt7996_set_hw_key(hw, it->cmd, vif, NULL, it->link_id, key));
+@@ -423,7 +423,7 @@
+ 	unsigned int link_id = msta_link->wcid.link_id;
+ 	struct mt76_vif_link *mlink = &link->mt76;
+ 	struct mt7996_key_iter_data it = {
+-		.cmd = SET_KEY,
++		.cmd = DISABLE_KEY,
+ 		.link_id = link_id,
+ 	};
+ 	struct mt7996_dev *dev = phy->dev;
