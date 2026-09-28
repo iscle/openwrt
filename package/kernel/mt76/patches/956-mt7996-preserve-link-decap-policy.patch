@@ -1,0 +1,42 @@
+Subject: [PATCH] wifi: mt76: mt7996: retain decapsulation policy for new links
+
+mac80211 reports decapsulation policy changes at station scope. Recreating
+an MLO link after a full reset allocates a fresh link WCID, but does not
+necessarily cause another sta_set_decap_offload callback. The new WCID
+therefore loses hardware header translation and receives data through the
+slow path.
+
+Keep the requested policy in the parent station and apply it when creating
+any link, before sending its initial station record to firmware. This also
+covers links added after the policy was originally enabled.
+
+---
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -315,6 +315,7 @@
+ 	struct mt7996_sta_link __rcu *link[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	u8 deflink_id;
+ 	u8 seclink_id;
++	bool decap_offload;
+ 	/* WCID plus one, reserved until the link is restored after reset. */
+ 	u16 reset_wcid[IEEE80211_MLD_MAX_NUM_LINKS];
+ 
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1180,6 +1180,8 @@
+ 	msta_link->wcid.link_id = link_id;
+ 	msta_link->wcid.link_valid = !!sta->valid_links;
+ 	msta_link->wcid.def_wcid = &msta->deflink.wcid;
++	assign_bit(MT_WCID_FLAG_HDR_TRANS, &msta_link->wcid.flags,
++		   msta->decap_offload);
+ 
+ 	if (link_sta->sta->tdls)
+ 		set_bit(MT_WCID_FLAG_TDLS_PEER, &msta_link->wcid.flags);
+@@ -2116,6 +2118,7 @@
+ 	unsigned int link_id;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
++	msta->decap_offload = enabled;
+ 
+ 	for_each_sta_active_link(vif, sta, link_sta, link_id) {
+ 		struct mt7996_sta_link *msta_link;
