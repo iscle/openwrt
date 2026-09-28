@@ -1,0 +1,27 @@
+Subject: [PATCH] wifi: mt76: mt7996: avoid returning a WCID for another RX band
+
+When a received frame reports a band different from the descriptor WCID,
+look up the peer link for that band. If the VIF no longer has such a link,
+return NULL instead of falling back to the original WCID. That fallback
+attributes the frame to the wrong link during link reconfiguration.
+
+Also handle a matching VIF link with no corresponding peer link explicitly.
+
+---
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -49,10 +49,10 @@
+ 			continue;
+ 
+ 		msta_link = mt7996_sta_link(msta, i);
+-		break;
+-	}
+-
+-	return &msta_link->wcid;
++		return msta_link ? &msta_link->wcid : NULL;
++	}
++
++	return NULL;
+ }
+ 
+ bool mt7996_mac_wtbl_update(struct mt7996_dev *dev, int idx, u32 mask)
