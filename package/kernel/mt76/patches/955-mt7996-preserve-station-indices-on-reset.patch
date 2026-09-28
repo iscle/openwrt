@@ -1,0 +1,104 @@
+Subject: [PATCH] wifi: mt76: mt7996: preserve station indices across full reset
+
+A full firmware reset restores existing mac80211 stations in a different
+order from their original association. Reallocating their WCIDs can leave
+hardware forwarding entries pointing at another station. Reserve each
+link's previous WCID across the reset and consume it when the link returns.
+Release unused reservations when a station or link is removed.
+
+Also release a newly allocated WCID if link allocation fails.
+
+---
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -315,6 +315,8 @@
+ 	struct mt7996_sta_link __rcu *link[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	u8 deflink_id;
+ 	u8 seclink_id;
++	/* WCID plus one, reserved until the link is restored after reset. */
++	u16 reset_wcid[IEEE80211_MLD_MAX_NUM_LINKS];
+ 
+ 	struct mt7996_vif *vif;
+ };
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1145,9 +1145,14 @@
+ 	if (!phy)
+ 		return -EINVAL;
+ 
+-	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7996_WTBL_STA);
+-	if (idx < 0)
+-		return -ENOSPC;
++	if (msta->reset_wcid[link_id]) {
++		idx = msta->reset_wcid[link_id] - 1;
++		msta->reset_wcid[link_id] = 0;
++	} else {
++		idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7996_WTBL_STA);
++		if (idx < 0)
++			return -ENOSPC;
++	}
+ 
+ 	if (msta->deflink_id == IEEE80211_LINK_UNSPECIFIED) {
+ 		msta_link = &msta->deflink;
+@@ -1156,8 +1161,10 @@
+ 		mt7996_sta_init_txq_wcid(sta, idx);
+ 	} else {
+ 		msta_link = kzalloc(sizeof(*msta_link), GFP_KERNEL);
+-		if (!msta_link)
++		if (!msta_link) {
++			mt76_wcid_mask_clear(dev->mt76.wcid_mask, idx);
+ 			return -ENOMEM;
++		}
+ 
+ 		if (msta->seclink_id == msta->deflink_id &&
+ 		    (sta->valid_links & ~BIT(msta->deflink_id)))
+@@ -1200,8 +1207,17 @@
+ 	struct mt7996_sta_link *msta_link;
+ 
+ 	msta_link = mt76_dereference(msta->link[link_id], &dev->mt76);
+-	if (!msta_link)
++	if (!msta_link) {
++		if (msta->reset_wcid[link_id]) {
++			mt76_wcid_mask_clear(dev->mt76.wcid_mask,
++					     msta->reset_wcid[link_id] - 1);
++			msta->reset_wcid[link_id] = 0;
++		}
+ 		return;
++	}
++
++	if (dev->recovery.hw_full_reset)
++		msta->reset_wcid[link_id] = msta_link->wcid.idx + 1;
+ 
+ 	spin_lock_bh(&dev->mt76.sta_poll_lock);
+ 	if (!list_empty(&msta_link->wcid.poll_list))
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2457,6 +2457,20 @@
+ 		mt7996_mac_sta_remove_link(dev, sta, i, true);
+ }
+ 
++/* Offloaded flows retain the station index while mac80211 restores links. */
++static void
++mt7996_mac_reserve_wcid_iter(void *data, struct ieee80211_sta *sta)
++{
++	struct mt7996_sta *msta = (void *)sta->drv_priv;
++	struct mt7996_dev *dev = data;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(msta->reset_wcid); i++)
++		if (msta->reset_wcid[i])
++			mt76_wcid_mask_set(dev->mt76.wcid_mask,
++					   msta->reset_wcid[i] - 1);
++}
++
+ static void
+ mt7996_mac_reset_vif_iter(void *data, u8 *mac, struct ieee80211_vif *vif)
+ {
+@@ -2515,6 +2529,7 @@
+ 
+ 	ieee80211_iterate_stations_atomic(hw, mt7996_mac_reset_sta_iter, dev);
+ 	mt76_reset_device(&dev->mt76);
++	ieee80211_iterate_stations_atomic(hw, mt7996_mac_reserve_wcid_iter, dev);
+ 	ieee80211_iterate_active_interfaces_atomic(hw,
+ 						   IEEE80211_IFACE_SKIP_SDATA_NOT_IN_DRIVER,
+ 						   mt7996_mac_reset_vif_iter, dev);
