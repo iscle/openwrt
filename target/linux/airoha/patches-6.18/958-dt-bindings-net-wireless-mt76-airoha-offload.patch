@@ -1,0 +1,27 @@
+Subject: [PATCH] dt-bindings: net: wireless: mt76: describe Airoha offload links
+
+Describe the NPU and Ethernet frame-engine phandles consumed by mt76 on
+Airoha platforms. This also covers the existing EN7581 board references.
+
+---
+--- a/Documentation/devicetree/bindings/net/wireless/mediatek,mt76.yaml
++++ b/Documentation/devicetree/bindings/net/wireless/mediatek,mt76.yaml
+@@ -72,6 +72,18 @@
+     description:
+       Phandle to the infrastructure bus fabric syscon node.
+       This property is MT7622 specific
++
++  airoha,npu:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      Airoha network processor providing transmit and receive queue offload
++      for this radio.
++
++  airoha,eth:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      Airoha Ethernet frame engine providing hardware flow forwarding for
++      this radio.
+ 
+   ieee80211-freq-limit: true
+ 

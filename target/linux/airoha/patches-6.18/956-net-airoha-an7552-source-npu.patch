@@ -1,0 +1,2212 @@
+Subject: [PATCH] net: airoha: add AN7552 source firmware transport
+
+Load the versioned two-core firmware and manage Wi-Fi DMA ownership,
+station authorization, replay state and PPE queue teardown.
+
+---
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -14,6 +14,16 @@
+ 	help
+ 	  This driver supports Airoha Network Processor (NPU) available
+ 	  on the Airoha Soc family.
++
++config NET_AIROHA_AN7552_NPU
++	tristate "Airoha AN7552 source NPU firmware support"
++	depends on NET_AIROHA && OF
++	select FW_LOADER
++	help
++	  Load source-built firmware for the two RISC-V cores in AN7552
++	  and provide MT7992 Wi-Fi DMA and replay-protection services.
++	  The firmware is supplied by the an7552-npu-firmware package.
++	  If built as a module, the module will be named an7552_npu.
+ 
+ config NET_AIROHA
+ 	tristate "Airoha SoC Gigabit Ethernet support"
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -7,3 +7,4 @@
+ airoha-eth-y := airoha_eth.o airoha_ppe.o
+ airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o
+ obj-$(CONFIG_NET_AIROHA_NPU) += airoha_npu.o
++obj-$(CONFIG_NET_AIROHA_AN7552_NPU) += an7552_npu.o
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/an7552_npu.c
+@@ -0,0 +1,1804 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* AN7552 source-firmware transport and MT7992 DMA ownership. */
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of_address.h>
++#include <linux/of_platform.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/seq_file.h>
++#include <linux/spinlock.h>
++#include <linux/soc/airoha/an7552_npu.h>
++#include <linux/unaligned.h>
++#include "an7552_npu_fw.h"
++
++#define CODE_BASE 0x84000000
++#define CODE_SIZE 0x400000
++#define PACKET_SIZE 0x1600000
++#define BOOT_TRIGGER 0x306000
++#define BOOT_CONFIG 0x306004
++#define BOOT_PC(core) (0x306020 + (core) * 4)
++#define PN_TABLE_HOST 0x84110000U
++#define PN_STAGING_HOST 0x841a0000U
++#define PN_CONTROL 0x700U
++#define PN_DOMAIN_HOST AN7552_PN_DOMAIN_HOST
++#define PN_RADIO_STATE_HOST AN7552_PN_RADIO_STATE_HOST
++#define PN_DOMAIN_INDEX_BITS AN7552_PN_DOMAIN_INDEX_BITS
++
++struct an7552_npu;
++struct an7552_npu_irq {
++	struct an7552_npu *npu;
++	u32 band;
++};
++
++struct an7552_npu {
++	struct device *dev;
++	void __iomem *regs, *ram, *fe, *pool, *timer;
++	/* Serializes attachment, boot and teardown of the radio consumer. */
++	struct mutex attach_lock;
++	/* Serializes station table updates with the two-core quiesce handshake. */
++	spinlock_t station_lock;
++	/* Protects the shared replay command mailbox and staging buffer. */
++	spinlock_t pn_lock;
++	bool attached, running, failed, stopping, pn_failed;
++	bool ppe_enabled, tdma_enabled;
++	bool faulted, fault_quiesced;
++	bool pn_domains_initialized;
++	u32 heartbeat[AN7552_CORES], fault_count, recovery_count;
++	u32 discarded_completions, interrupt_parks;
++	unsigned long heartbeat_seen[AN7552_CORES];
++	u32 pn_sequence;
++	int queue_error;
++	bool defer_queues, bridge_domains;
++	u32 tx_base[2], tx_count[2];
++	struct {
++		u32 base, count, regs;
++		void (*notify)(void *context);
++		void *context;
++	} txfree_config[2];
++	u32 ppe_saved[7];
++	u32 saved_ring[2][4], saved_global;
++	int txfree_irqs[2], rro_irq;
++
++	void (*txfree_notify[2])(void *);
++	void *txfree_context[2];
++	struct an7552_npu_irq txfree_bands[2];
++	void (*rro_notify)(void *context);
++	void *rro_context;
++	struct dentry *debugfs;
++};
++
++void an7552_npu_set_bridge(struct an7552_npu *ctx, bool enable)
++{
++	/* Called before radio queues start; recovery retains this capability. */
++	ctx->bridge_domains = enable;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_set_bridge);
++
++static void tdma_stop(struct an7552_npu *ctx);
++static int park_cores(struct an7552_npu *ctx);
++static bool station_ready(struct an7552_npu *ctx, u32 band, u32 bss, u32 wcid);
++static irqreturn_t txfree_interrupt(int irq, void *context);
++static void native_txfree_stop(struct an7552_npu *ctx);
++static int native_ppe_start(struct an7552_npu *ctx);
++static void native_ppe_stop(struct an7552_npu *ctx);
++static irqreturn_t rro_interrupt(int irq, void *context);
++static void native_rro_stop(struct an7552_npu *ctx);
++static int pn_request(struct an7552_npu *ctx, u32 operation, u32 wcid, u32 tid,
++		      u32 low, u32 high, u32 enable);
++
++int an7552_npu_station_set(struct an7552_npu *ctx, u32 wcid, u32 band, u32 bss,
++			   const u8 *address, bool authorized, bool mlo,
++			   bool encrypted)
++{
++	void __iomem *control, *entry;
++	unsigned long flags;
++	u32 value;
++	int ret;
++
++	if (!ctx || !ctx->running || ctx->stopping)
++		return 0;
++	if (ctx->faulted)
++		return -EIO;
++	if (wcid >= AN7552_STATION_COUNT || band > 1 || bss > 255 ||
++	    (authorized && !address))
++		return -EINVAL;
++	control = ctx->regs + 0x3000 + AN7552_STATION_CONTROL;
++	entry = ctx->ram + AN7552_STATION_HOST - CODE_BASE + wcid * 32;
++	spin_lock_irqsave(&ctx->station_lock, flags);
++	if (!authorized) {
++		writel(0, entry);
++		writel(0, entry + 28);
++		/* Revoke station eligibility before asking the firmware to quiesce. */
++		wmb();
++	}
++	writel(1, control);
++	ret = readl_poll_timeout_atomic(control + 4, value,
++					value == 1 && readl(control + 8) == 1,
++					1, 10000);
++	if (ret)
++		goto release;
++	writel(0, entry);
++	if (!authorized)
++		writel(0, ctx->ram + 0x110000 + wcid * 256);
++	/* A successfully installed data key supplies policy without a CPU packet. */
++	writel(authorized && encrypted ? 0x80 : 0, entry + 16);
++	if (authorized) {
++		writel(band | (bss << 8), entry + 4);
++		writel((u32)address[0] | ((u32)address[1] << 8) |
++			       ((u32)address[2] << 16) |
++			       ((u32)address[3] << 24),
++		       entry + 8);
++		writel((u32)address[4] | ((u32)address[5] << 8), entry + 12);
++		/* Publish station identity before granting forwarding eligibility. */
++		wmb();
++		writel(AN7552_STATION_AUTHORIZED |
++		       (mlo ? AN7552_STATION_MLO : 0), entry);
++	}
++release:
++	writel(0, control);
++	if (!ret)
++		ret = readl_poll_timeout_atomic(control + 4, value,
++						!value && !readl(control + 8),
++						1, 10000);
++	if (ret) {
++		/* Revoke the identity before releasing the lock on failure. */
++		writel(0, entry);
++		writel(0, entry + 28);
++		/* Publish revocation before allowing another station update. */
++		wmb();
++	}
++	spin_unlock_irqrestore(&ctx->station_lock, flags);
++	if (ret)
++		dev_err(ctx->dev, " station update handshake timed out\n");
++	return ret;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_station_set);
++
++/* Policy changes use the same quiesce protocol as station authorization. */
++static int an7552_npu_policy_write(struct an7552_npu *ctx, void __iomem *entry,
++				   const u32 *words, unsigned int count)
++{
++	void __iomem *control = ctx->regs + 0x3000 + AN7552_STATION_CONTROL;
++	unsigned long flags;
++	u32 value;
++	unsigned int i;
++	int ret;
++
++	spin_lock_irqsave(&ctx->station_lock, flags);
++	writel(0, entry + count * 4);
++	/* Revoke the old policy before requesting the two-core pause. */
++	wmb();
++	writel(1, control);
++	ret = readl_poll_timeout_atomic(control + 4, value,
++					value == 1 && readl(control + 8) == 1,
++					1, 10000);
++	if (!ret && words) {
++		for (i = 0; i < count; i++)
++			writel(words[i], entry + i * 4);
++		/* Publish the complete policy before making it eligible. */
++		wmb();
++		writel(1, entry + count * 4);
++	}
++	writel(0, control);
++	if (!ret)
++		ret = readl_poll_timeout_atomic(control + 4, value,
++						!value && !readl(control + 8),
++						1, 10000);
++	if (ret)
++		writel(0, entry + count * 4);
++	spin_unlock_irqrestore(&ctx->station_lock, flags);
++	return ret;
++}
++
++int an7552_npu_station_route(struct an7552_npu *ctx, u16 wcid,
++			     u16 primary, u16 secondary)
++{
++	u32 words[] = { primary + 1, secondary + 1 };
++	void __iomem *entry;
++
++	if (!ctx || !ctx->running || ctx->stopping)
++		return 0;
++	if (ctx->faulted)
++		return -EIO;
++	if (wcid >= AN7552_STATION_COUNT || primary >= AN7552_STATION_COUNT ||
++	    secondary >= AN7552_STATION_COUNT)
++		return -EINVAL;
++	entry = ctx->ram + AN7552_STATION_HOST - CODE_BASE;
++	/* Bind each WCID to its BSS/radio as well as its peer address. */
++	words[0] |= readl(entry + primary * 32 + 4) << 16;
++	words[1] |= readl(entry + secondary * 32 + 4) << 16;
++	entry += wcid * 32 + 20;
++	return an7552_npu_policy_write(ctx, entry, words, ARRAY_SIZE(words));
++}
++EXPORT_SYMBOL_GPL(an7552_npu_station_route);
++
++int an7552_npu_qos_map(struct an7552_npu *ctx, u8 bss, const u8 *map)
++{
++	u32 words[16];
++	unsigned int i;
++
++	if (!ctx || !ctx->running || ctx->stopping)
++		return 0;
++	if (ctx->faulted)
++		return -EIO;
++	if (!map)
++		return an7552_npu_policy_write(ctx,
++			ctx->ram + AN7552_QOS_HOST - CODE_BASE +
++			bss * AN7552_QOS_STRIDE, NULL, ARRAY_SIZE(words));
++	for (i = 0; i < 64; i++)
++		if (map[i] > 7)
++			return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(words); i++)
++		words[i] = (u32)map[i * 4] | (u32)map[i * 4 + 1] << 8 |
++			   (u32)map[i * 4 + 2] << 16 | (u32)map[i * 4 + 3] << 24;
++	return an7552_npu_policy_write(ctx,
++		ctx->ram + AN7552_QOS_HOST - CODE_BASE + bss * AN7552_QOS_STRIDE,
++		words, ARRAY_SIZE(words));
++}
++EXPORT_SYMBOL_GPL(an7552_npu_qos_map);
++
++static bool station_ready(struct an7552_npu *ctx, u32 band, u32 bss, u32 wcid)
++{
++	void __iomem *entry;
++
++	if (wcid >= AN7552_STATION_COUNT)
++		return false;
++	entry = ctx->ram + AN7552_STATION_HOST - CODE_BASE + wcid * 32;
++	return readl(entry) && readl(entry + 4) == (band | (bss << 8)) &&
++	       (readl(entry + 16) == 0x80 || readl(entry + 16) == 0x88);
++}
++
++static irqreturn_t txfree_interrupt(int irq, void *context)
++{
++	struct an7552_npu_irq *source = context;
++	struct an7552_npu *ctx = source->npu;
++	u32 band = source->band;
++	u32 mask = BIT(16 + band);
++
++	if (!(readl(ctx->regs + 0x30d030) & mask))
++		return IRQ_NONE;
++	writel(0, ctx->regs + 0x30d034 + band * 4);
++	writel(mask, ctx->regs + 0x30d030);
++	if (ctx->txfree_notify[band])
++		ctx->txfree_notify[band](ctx->txfree_context[band]);
++	return IRQ_HANDLED;
++}
++
++void an7552_npu_txfree_irq_enable(struct an7552_npu *ctx, u32 band)
++{
++	if (ctx->running && !ctx->stopping && band < 2)
++		writel(BIT(16 + band), ctx->regs + 0x30d034 + band * 4);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_txfree_irq_enable);
++
++static int native_txfree_setup(struct an7552_npu *ctx, u32 band, u32 base,
++			       u32 count, u32 regs, void (*notify)(void *),
++			       void *context)
++{
++	void __iomem *q, *ring, *hardware;
++	u32 value, start, physical;
++	int ret;
++
++	if (!ctx->running || ctx->stopping || band > 1 || !count ||
++	    count > 4096 || (base & 15) || base < 0x80000000 ||
++	    base > 0xa0000000 - count * 16 || regs < 0x200d4000 ||
++	    regs >= 0x200d9000 || (regs & 15))
++		return -EINVAL;
++	q = ctx->regs + 0x3000 + AN7552_TXFREE_CONTROL + band * 64;
++	writel(0, q + 16);
++	ret = readl_poll_timeout_atomic(q + 20, value, !value, 10, 100000);
++	if (ret)
++		return ret;
++	writel(0, ctx->regs + 0x30d034 + band * 4);
++	if (!ctx->txfree_irqs[band]) {
++		ret = platform_get_irq(to_platform_device(ctx->dev), 3 + band);
++		if (ret < 0)
++			return ret;
++		ctx->txfree_irqs[band] = ret;
++		ctx->txfree_bands[band].npu = ctx;
++		ctx->txfree_bands[band].band = band;
++		ret = request_irq(ctx->txfree_irqs[band], txfree_interrupt, 0,
++				  "an7552-txfree", &ctx->txfree_bands[band]);
++		if (ret) {
++			ctx->txfree_irqs[band] = 0;
++			return ret;
++		}
++	}
++	hardware = ioremap(regs, 16);
++	if (!hardware)
++		return -ENOMEM;
++	start = readl(hardware + 12);
++	if (start >= AN7552_TXFREE_COUNT) {
++		dev_err(ctx->dev, "TXFREE band%u invalid index %u regs=%08x\n",
++			band, start, regs);
++		iounmap(hardware);
++		return -EINVAL;
++	}
++	physical = AN7552_TXFREE_RING_HOST + band * 0x2000;
++	ring = ctx->ram + physical - CODE_BASE;
++	for (value = 0; value < AN7552_TXFREE_COUNT; value++) {
++		writel(AN7552_TXFREE_BUFFER_HOST + band * 0x100000 +
++			       value * 2048,
++		       ring + value * 16);
++		writel(2048U << 16, ring + value * 16 + 4);
++		writel(0, ring + value * 16 + 8);
++		writel(0, ring + value * 16 + 12);
++	}
++	memset_io(q, 0, 64);
++	writel(base, q);
++	writel(count, q + 4);
++	writel(regs, q + 12);
++	writel(start, q + 48);
++	writel(physical, hardware);
++	writel(AN7552_TXFREE_COUNT, hardware + 4);
++	writel((start + AN7552_TXFREE_COUNT - 1) % AN7552_TXFREE_COUNT,
++	       hardware + 8);
++	iounmap(hardware);
++	ctx->txfree_notify[band] = notify;
++	ctx->txfree_context[band] = context;
++	writel(0, ctx->regs + 0x30d188 + band * 16);
++	writel(BIT(16 + band), ctx->regs + 0x30d030);
++	/* Publish TXFREE ring and callback state before enabling the consumer. */
++	wmb();
++	writel(1, q + 16);
++	an7552_npu_txfree_irq_enable(ctx, band);
++	dev_dbg(ctx->dev,
++		" own TXFREE band%u host=%08x hardware=%08x regs=%08x start=%u\n",
++		band, base, physical, regs, start);
++	return 0;
++}
++
++int an7552_npu_txfree_setup(struct an7552_npu *ctx, u32 band, u32 base,
++			    u32 count, u32 regs, void (*notify)(void *),
++			    void *context)
++{
++	int ret;
++
++	if (ctx->defer_queues && band < 2) {
++		ctx->txfree_config[band].base = base;
++		ctx->txfree_config[band].count = count;
++		ctx->txfree_config[band].regs = regs;
++		ctx->txfree_config[band].notify = notify;
++		ctx->txfree_config[band].context = context;
++		memset_io(ctx->regs + 0x3000 + AN7552_TXFREE_CONTROL +
++				  band * 64,
++			  0, 64);
++		return 0;
++	}
++	ret = native_txfree_setup(ctx, band, base, count, regs, notify,
++				  context);
++
++	if (ret)
++		ctx->queue_error = ret;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_txfree_setup);
++
++void an7552_npu_txfree_write(struct an7552_npu *ctx, u32 band, u32 word,
++			     u32 value)
++{
++	if (ctx->running && band < 2 && word == 15)
++		writel(value, ctx->regs + 0x3000 + AN7552_TXFREE_CONTROL +
++				      band * 64 + word * 4);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_txfree_write);
++
++u32 an7552_npu_txfree_read(struct an7552_npu *ctx, u32 band, u32 word)
++{
++	if (!ctx->running || band > 1 || word > 15)
++		return 0;
++	return readl(ctx->regs + 0x3000 + AN7552_TXFREE_CONTROL + band * 64 +
++		     word * 4);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_txfree_read);
++
++static void native_txfree_stop(struct an7552_npu *ctx)
++{
++	u32 value;
++	unsigned int band;
++
++	for (band = 0; band < 2; band++) {
++		void __iomem *q =
++			ctx->regs + 0x3000 + AN7552_TXFREE_CONTROL + band * 64;
++
++		writel(0, ctx->regs + 0x30d034 + band * 4);
++		writel(0, q + 16);
++		if (readl_poll_timeout(q + 20, value, !value, 10, 100000)) {
++			ctx->failed = true;
++			dev_err(ctx->dev,
++				"TXFREE stop timeout; stopping NPU\n");
++			writel(0x300, ctx->regs + BOOT_CONFIG);
++			writel(2, ctx->regs + BOOT_TRIGGER);
++			usleep_range(1000, 2000);
++		}
++		if (ctx->txfree_irqs[band]) {
++			free_irq(ctx->txfree_irqs[band],
++				 &ctx->txfree_bands[band]);
++			ctx->txfree_irqs[band] = 0;
++		}
++		ctx->txfree_notify[band] = NULL;
++	}
++}
++
++static int native_ppe_start(struct an7552_npu *ctx)
++{
++	void __iomem *q = ctx->regs + 0x36c0, *ring = ctx->ram + 0x2f0000;
++	unsigned int i;
++	u32 start;
++
++	if (ctx->ppe_enabled)
++		return 0;
++	if (!ctx->bridge_domains)
++		return -EOPNOTSUPP;
++	if (readl(ctx->fe + 0x800) || (readl(ctx->fe + 0xa04) & 3) ||
++	    (readl(ctx->fe + 0xfe4) & 65535))
++		goto busy;
++	start = readl(ctx->fe + 0x80c);
++	if (start >= 64)
++		goto busy;
++	for (i = 0; i < 4; i++)
++		ctx->ppe_saved[i] = readl(ctx->fe + 0x800 + i * 4);
++	ctx->ppe_saved[4] = readl(ctx->fe + 0xa04);
++	ctx->ppe_saved[5] = readl(ctx->fe + 0xa28);
++	ctx->ppe_saved[6] = readl(ctx->fe + 0xa2c);
++	memset_io(q, 0, 64);
++	memset_io(ring, 0, 64 * 32);
++	for (i = 0; i < 64; i++) {
++		writel(BIT(31), ring + i * 32 + 4);
++		writel(0x7f4087ff, ring + i * 32 + 20);
++	}
++	writel(start, q + 40);
++	/* Make every descriptor visible before installing the hardware ring. */
++	wmb();
++	writel(0x042f0000, ctx->fe + 0x800);
++	writel(64, ctx->fe + 0x804);
++	writel(start, ctx->fe + 0x808);
++	writel(0x01010101, ctx->fe + 0xa2c);
++	writel(1, ctx->fe + 0xa28);
++	writel(ctx->ppe_saved[4] | 0x71, ctx->fe + 0xa04);
++	/* Enable the DMA engine before handing work to the firmware. */
++	wmb();
++	writel(AN7552_PPE_MODE_BRIDGE, q);
++	ctx->ppe_enabled = true;
++	return 0;
++busy:
++	return -EBUSY;
++}
++
++static void native_ppe_stop(struct an7552_npu *ctx)
++{
++	void __iomem *q = ctx->regs + 0x36c0;
++	u32 value;
++	unsigned int i;
++
++	if (!ctx->ppe_enabled)
++		return;
++	writel(AN7552_PPE_MODE_DRAIN, q);
++	if (readl_poll_timeout(q + 48, value, !value, 10, 100000))
++		dev_warn(ctx->dev,
++			 " PPE drain timed out; reserved buffers retained\n");
++	writel(readl(ctx->fe + 0xa04) & ~BIT(0), ctx->fe + 0xa04);
++	if (readl_poll_timeout(ctx->fe + 0xa04, value, !(value & BIT(1)), 10,
++			       100000)) {
++		dev_err(ctx->dev, " PPE TX remains busy; retaining ring\n");
++	} else {
++		for (i = 0; i < 3; i++)
++			writel(ctx->ppe_saved[i], ctx->fe + 0x800 + i * 4);
++		writel(ctx->ppe_saved[5], ctx->fe + 0xa28);
++		writel(ctx->ppe_saved[6], ctx->fe + 0xa2c);
++		writel(readl(ctx->fe + 0xa04) & ~BIT(0), ctx->fe + 0xa04);
++	}
++	writel(0, q);
++	readl_poll_timeout(q + 52, value, !value, 10, 100000);
++	ctx->ppe_enabled = false;
++}
++
++static irqreturn_t rro_interrupt(int irq, void *context)
++{
++	struct an7552_npu *ctx = context;
++
++	if (!(readl(ctx->regs + 0x30d030) & BIT(18)))
++		return IRQ_NONE;
++	writel(0, ctx->regs + 0x30d03c);
++	writel(BIT(18), ctx->regs + 0x30d030);
++	if (ctx->rro_notify)
++		ctx->rro_notify(ctx->rro_context);
++	return IRQ_HANDLED;
++}
++
++bool an7552_npu_rro_active(struct an7552_npu *ctx)
++{
++	return ctx && ctx->running && !ctx->stopping &&
++	       readl(ctx->regs + 0x3000 + AN7552_RRO_CONTROL + 16);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_rro_active);
++
++void an7552_npu_rro_irq_enable(struct an7552_npu *ctx)
++{
++	if (an7552_npu_rro_active(ctx))
++		writel(BIT(18), ctx->regs + 0x30d03c);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_rro_irq_enable);
++
++int an7552_npu_rro_setup(struct an7552_npu *ctx, u32 base, u32 count, u32 data0,
++			 u32 data1, u32 regs0, u32 regs1, u32 emi,
++			 u32 capacity0, u32 capacity1, void (*notify)(void *),
++			 void *context)
++{
++	void __iomem *q = ctx->regs + 0x3000 + AN7552_RRO_CONTROL;
++	void __iomem *radio, *data_regs[2] = {};
++	u32 bases[2] = { data0, data1 }, regs[2] = { regs0, regs1 };
++	u32 capacity[2] = { capacity0, capacity1 }, token = 0, value;
++	unsigned int band, i;
++	int ret = -EINVAL;
++
++	if (!ctx->running || ctx->stopping || count != AN7552_RX_RING_COUNT ||
++	    (base & 15) || base < 0x80000000 ||
++	    base > 0xa0000000 - count * 16 || (emi & 15) || emi < 0x80000000 ||
++	    emi > 0x9fffffc0)
++		return -EINVAL;
++	writel(0, q + 16);
++	ret = readl_poll_timeout(q + 20, value, !value, 10, 100000);
++	if (ret)
++		return ret;
++	radio = ioremap(0x2000a600, 0x100);
++	if (!radio)
++		return -ENOMEM;
++	ret = -EINVAL;
++	if (readl(radio + 0x5c))
++		goto release;
++	for (band = 0; band < 2; band++) {
++		if ((bases[band] & 15) || bases[band] < 0x80000000 ||
++		    bases[band] > 0xa0000000 - count * 16 ||
++		    (regs[band] & 15) || regs[band] < 0x200d4000 ||
++		    regs[band] >= 0x200d9000)
++			goto release;
++		data_regs[band] = ioremap(regs[band], 16);
++		if (!data_regs[band]) {
++			ret = -ENOMEM;
++			goto release;
++		}
++		if (readl(data_regs[band] + 12) || capacity[band] < 1536 ||
++		    capacity[band] > 2048)
++			goto release;
++	}
++	writel(0, ctx->regs + 0x30d03c);
++	if (!ctx->rro_irq) {
++		ret = platform_get_irq(to_platform_device(ctx->dev), 5);
++		if (ret < 0)
++			goto release;
++		ctx->rro_irq = ret;
++		ret = request_irq(ctx->rro_irq, rro_interrupt, 0, "an7552-rx",
++				  ctx);
++		if (ret) {
++			ctx->rro_irq = 0;
++			goto release;
++		}
++	}
++	memset_io(q, 0, 128);
++	memset_io(ctx->ram + AN7552_PPE_DOMAIN_HOST - CODE_BASE, 0,
++		  AN7552_RX_BUFFER_COUNT * AN7552_PPE_DOMAIN_STRIDE);
++	memset_io(ctx->ram + AN7552_RX_STATE_HOST - CODE_BASE, 0,
++		  AN7552_RX_BUFFER_COUNT * 4);
++	for (i = 0; i < AN7552_RX_BUFFER_COUNT; i++)
++		writel(i, ctx->ram + AN7552_RX_FREE_HOST - CODE_BASE + i * 4);
++	for (band = 0; band < 2; band++) {
++		void __iomem *control =
++			ctx->regs + 0x3000 + AN7552_RX_DATA_CONTROL + band * 64;
++		void __iomem *ring = ctx->ram + AN7552_RX_DATA_RING_HOST -
++				     CODE_BASE + band * 0x8000;
++
++		memset_io(control, 0, 64);
++		memset_io(ring, 0, count * 16);
++		for (i = 0; i < count - 1; i++, token++) {
++			writel(AN7552_RX_BUFFER_HOST + token * 2048,
++			       ring + i * 16);
++			writel((capacity[band] << 16) | BIT(8),
++			       ring + i * 16 + 4);
++			writel((AN7552_RX_TOKEN_BASE + token) << 16,
++			       ring + i * 16 + 8);
++			writel(1 | (band << 8), ctx->ram +
++							AN7552_RX_STATE_HOST -
++							CODE_BASE + token * 4);
++		}
++		writel(bases[band], control);
++		writel(count, control + 4);
++		writel(regs[band], control + 16);
++		writel(count - 2, control + 20);
++		writel(count - 1, control + 24);
++		writel(capacity[band], control + 44);
++		writel(AN7552_RX_DATA_RING_HOST + band * 0x8000,
++		       data_regs[band]);
++		writel((readl(data_regs[band] + 4) & ~0xfffU) | count,
++		       data_regs[band] + 4);
++		writel(count - 2, data_regs[band] + 8);
++	}
++	for (i = 0; i < count; i++) {
++		void __iomem *desc =
++			ctx->ram + AN7552_RX_COMPLETE_HOST - CODE_BASE + i * 16;
++
++		writel(0, desc);
++		writel(0, desc + 4);
++		writel(0, desc + 8);
++		writel(15U << 28, desc + 12);
++	}
++	memset_io(ctx->ram + AN7552_RX_EMI_HOST - CODE_BASE, 0, 128);
++	writel(count - 2, ctx->ram + AN7552_RX_EMI_HOST - CODE_BASE);
++	writel(base, q);
++	writel(count, q + 4);
++	writel(emi, q + 72);
++	writel(token, q + 80);
++	writel(0, q + 84);
++	writel(AN7552_RX_BUFFER_COUNT - token, q + 88);
++	writel(AN7552_RX_COMPLETE_HOST, radio + 0x50);
++	writel(count, radio + 0x54);
++	writel(count - 2, radio + 0x58);
++	writel(AN7552_RX_EMI_HOST >> 4, radio + 0xf0);
++	writel((AN7552_RX_EMI_HOST + 64) >> 4, radio + 0xf4);
++	ctx->rro_notify = notify;
++	ctx->rro_context = context;
++	writel(0, ctx->regs + 0x30d1a8);
++	writel(BIT(18), ctx->regs + 0x30d030);
++	/* Publish receive rings before allowing the firmware to consume them. */
++	wmb();
++	if (native_ppe_start(ctx))
++		dev_warn(ctx->dev,
++			 " PPE setup failed, keeping CPU receive path\n");
++	writel(1, q + 16);
++	an7552_npu_rro_irq_enable(ctx);
++	dev_dbg(ctx->dev,
++		" own RRO buffers=%u token-base=%u capacity=%u/%u IRQ=%d\n",
++		AN7552_RX_BUFFER_COUNT, AN7552_RX_TOKEN_BASE, capacity[0],
++		capacity[1], ctx->rro_irq);
++	ret = 0;
++release:
++	for (band = 0; band < 2; band++) {
++		if (data_regs[band])
++			iounmap(data_regs[band]);
++	}
++	iounmap(radio);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_rro_setup);
++
++u32 an7552_npu_rro_index(struct an7552_npu *ctx)
++{
++	return readl(ctx->regs + 0x3000 + AN7552_RRO_CONTROL + 8);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_rro_index);
++
++u32 an7552_npu_rx_read(struct an7552_npu *ctx, u32 band)
++{
++	return band > 1 ? 0 :
++			  readl(ctx->regs + 0x3000 + AN7552_RX_DATA_CONTROL +
++				band * 64 + 8);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_rx_read);
++
++void an7552_npu_rx_write(struct an7552_npu *ctx, u32 band, u32 value)
++{
++	if (band < 2)
++		writel(value, ctx->regs + 0x3000 + AN7552_RX_DATA_CONTROL +
++				      band * 64 + 20);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_rx_write);
++
++static void native_rro_stop(struct an7552_npu *ctx)
++{
++	void __iomem *q = ctx->regs + 0x3000 + AN7552_RRO_CONTROL;
++	u32 value;
++
++	writel(0, ctx->regs + 0x30d03c);
++	writel(0, q + 16);
++	if (readl_poll_timeout(q + 20, value, !value, 10, 100000)) {
++		ctx->failed = true;
++		dev_err(ctx->dev, "RRO stop timeout; stopping NPU\n");
++		writel(0x300, ctx->regs + BOOT_CONFIG);
++		writel(2, ctx->regs + BOOT_TRIGGER);
++		usleep_range(1000, 2000);
++	}
++	native_ppe_stop(ctx);
++	if (ctx->rro_irq) {
++		free_irq(ctx->rro_irq, ctx);
++		ctx->rro_irq = 0;
++	}
++	ctx->rro_notify = NULL;
++}
++
++u32 an7552_npu_rx_security(struct an7552_npu *ctx, u32 index)
++{
++	void __iomem *sidecar, *entry;
++	u32 flags, generation, wcid;
++
++	if (!an7552_npu_rro_active(ctx) || index >= AN7552_RX_RING_COUNT)
++		return 0;
++	sidecar = ctx->ram + 0x2f9000 + index * 16;
++	flags = readl(sidecar);
++	generation = readl(sidecar + 4);
++	if (!flags)
++		return 0;
++	wcid = flags >> 4;
++	if (wcid >= AN7552_STATION_COUNT)
++		return BIT(30);
++	entry = ctx->ram + 0x110000 + wcid * 256;
++	if ((flags & 15) != 1 || !readl(entry) ||
++	    readl(entry + 4) != generation)
++		return BIT(30);
++	return BIT(31) | (readl(sidecar + 8) & (BIT(29) | GENMASK(20, 0)));
++}
++EXPORT_SYMBOL_GPL(an7552_npu_rx_security);
++
++static int pn_request(struct an7552_npu *ctx, u32 operation, u32 wcid, u32 tid,
++		      u32 low, u32 high, u32 enable)
++{
++	void __iomem *q = ctx->regs + 0x3000 + PN_CONTROL;
++	u32 value;
++	int ret;
++
++	if (ctx->pn_failed || ctx->faulted)
++		return -EIO;
++	if (!++ctx->pn_sequence)
++		++ctx->pn_sequence;
++	writel(operation, q + 4);
++	writel(wcid, q + 8);
++	writel(tid, q + 12);
++	writel(low, q + 16);
++	writel(high, q + 20);
++	writel(enable, q + 24);
++	/* Publish all command arguments before the request sequence. */
++	wmb();
++	writel(ctx->pn_sequence, q);
++	ret = readl_poll_timeout_atomic(q + 32, value,
++					value == ctx->pn_sequence, 1, 10000);
++	if (ret) {
++		ctx->pn_failed = true;
++		writel(1, q + 36);
++		return ret;
++	}
++	switch (readl(q + 28)) {
++	case 1:
++		return 0;
++	case 0:
++		return -EACCES;
++	case 2:
++		return -EOPNOTSUPP;
++	default:
++		return -EINVAL;
++	}
++}
++
++int an7552_npu_pn_check(struct an7552_npu *ctx, u32 wcid, u32 tid, const u8 *pn)
++{
++	unsigned long flags;
++	int ret;
++
++	if (!ctx)
++		return -EOPNOTSUPP;
++	if (!ctx->running || ctx->stopping)
++		return -EIO;
++	spin_lock_irqsave(&ctx->pn_lock, flags);
++	ret = pn_request(ctx, 1, wcid, tid,
++			 (u32)pn[5] | (u32)pn[4] << 8 | (u32)pn[3] << 16 |
++				 (u32)pn[2] << 24,
++			 (u32)pn[1] | (u32)pn[0] << 8, 0);
++	spin_unlock_irqrestore(&ctx->pn_lock, flags);
++	return ret == -EOPNOTSUPP ? -EKEYREJECTED : ret;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_pn_check);
++
++/* Called with pn_lock held, or while the firmware cores are parked. */
++static void __iomem *pn_domain_entry(struct an7552_npu *ctx, u32 handle, u32 key)
++{
++	void __iomem *domain;
++	u32 generation = handle >> PN_DOMAIN_INDEX_BITS;
++
++	if (!generation || key > 3)
++		return NULL;
++	domain = ctx->ram + PN_DOMAIN_HOST - CODE_BASE +
++		 (handle & (AN7552_STATION_COUNT - 1)) * 256;
++	if (!readl(domain) || readl(domain + 4) != generation ||
++	    readl(domain + 8) != key)
++		return NULL;
++	return domain;
++}
++
++u32 an7552_npu_pn_domain(struct an7552_npu *ctx, u32 wcid, u32 key)
++{
++	void __iomem *entry;
++	unsigned long flags;
++	u32 handle = 0, state;
++
++	if (!ctx || !ctx->running || ctx->stopping || ctx->failed ||
++	    ctx->pn_failed || ctx->faulted || wcid >= AN7552_STATION_COUNT || key > 3)
++		return 0;
++	spin_lock_irqsave(&ctx->pn_lock, flags);
++	entry = ctx->ram + PN_TABLE_HOST - CODE_BASE + wcid * 256;
++	state = 1 | (key << 8);
++	if (readl(entry) == state || readl(entry + 60 * 4) == state) {
++		handle = readl(entry + 8);
++		if (!pn_domain_entry(ctx, handle, key))
++			handle = 0;
++	}
++	spin_unlock_irqrestore(&ctx->pn_lock, flags);
++	return handle;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_pn_domain);
++
++int an7552_npu_pn_commit(struct an7552_npu *ctx, const u16 *wcids,
++			 unsigned int count, u32 key)
++{
++	void __iomem *staging;
++	unsigned long flags;
++	unsigned int i;
++	int ret;
++
++	if (!ctx)
++		return 0;
++	if (!ctx->running || ctx->stopping || ctx->failed || ctx->pn_failed)
++		return -EIO;
++	if (!wcids || !count || count > 16 || key > 3)
++		return -EINVAL;
++	for (i = 0; i < count; i++)
++		if (wcids[i] >= AN7552_STATION_COUNT)
++			return -EINVAL;
++	staging = ctx->ram + PN_STAGING_HOST - CODE_BASE;
++	spin_lock_irqsave(&ctx->pn_lock, flags);
++	for (i = 0; i < count; i++)
++		writel(wcids[i], staging + i * 4);
++	ret = pn_request(ctx, 4, count, 0, 0, 0, key);
++	spin_unlock_irqrestore(&ctx->pn_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_pn_commit);
++
++/* Core 1 serializes snapshots with both packet and host replay checks. */
++int an7552_npu_pn_get(struct an7552_npu *ctx, u32 wcid, u32 key, u8 *pn)
++{
++	void __iomem *initial;
++	unsigned long flags;
++	unsigned int i;
++	int ret;
++
++	if (!ctx || !ctx->running || ctx->failed)
++		return -EIO;
++	if (wcid >= AN7552_STATION_COUNT || key > 3 || !pn)
++		return -EINVAL;
++
++	initial = ctx->ram + PN_STAGING_HOST - CODE_BASE;
++	spin_lock_irqsave(&ctx->pn_lock, flags);
++	if (ctx->faulted) {
++		void __iomem *entry = ctx->ram + PN_TABLE_HOST - CODE_BASE + wcid * 256;
++		void __iomem *domain;
++
++		ret = -EIO;
++		domain = ctx->fault_quiesced ?
++			pn_domain_entry(ctx, readl(entry + 8), key) : NULL;
++		if (domain && readl(entry) == (1 | (key << 8))) {
++			initial = domain + 16;
++			writel(0, entry);
++			ret = 0;
++		}
++	} else {
++		ret = pn_request(ctx, 3, wcid, 0, 0, 0, key);
++	}
++	if (!ret) {
++		for (i = 0; i < 17; i++) {
++			u32 low = readl(initial + i * 8);
++			u32 high = readl(initial + i * 8 + 4);
++			u8 *p = pn + i * 6;
++
++			p[0] = high >> 8;
++			p[1] = high;
++			p[2] = low >> 24;
++			p[3] = low >> 16;
++			p[4] = low >> 8;
++			p[5] = low;
++		}
++	}
++	spin_unlock_irqrestore(&ctx->pn_lock, flags);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_pn_get);
++
++int an7552_npu_pn_key(struct an7552_npu *ctx, u32 wcid, u32 key, const u8 *pn,
++		      bool enable, u32 domain, bool prepare)
++{
++	unsigned long flags;
++	unsigned int i;
++	int ret;
++	void __iomem *initial;
++
++	if (!ctx)
++		return 0;
++	if (!ctx->running || ctx->stopping || ctx->failed || ctx->pn_failed)
++		return -EIO;
++	if (wcid >= AN7552_STATION_COUNT || key > 3 || (enable && !pn))
++		return -EINVAL;
++	initial = ctx->ram + PN_STAGING_HOST - CODE_BASE;
++	spin_lock_irqsave(&ctx->pn_lock, flags);
++	/* Revoke eligibility immediately, including if the command later times out. */
++	writel(0, ctx->ram + PN_TABLE_HOST - CODE_BASE + wcid * 256);
++	for (i = 0; i < 17; i++) {
++		const u8 *p = enable ? pn + i * 6 : NULL;
++
++		writel(enable ? ((u32)p[5] | (u32)p[4] << 8 | (u32)p[3] << 16 |
++				 (u32)p[2] << 24) :
++				0,
++		       initial + i * 8);
++		writel(enable ? ((u32)p[1] | (u32)p[0] << 8) : 0,
++		       initial + i * 8 + 4);
++	}
++	ret = pn_request(ctx, 2, wcid, domain, 0, 0,
++			 enable ? (1 | (prepare ? 2 : 0) | (key << 8)) : 0);
++	spin_unlock_irqrestore(&ctx->pn_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_pn_key);
++
++bool an7552_npu_active(struct an7552_npu *ctx)
++{
++	return ctx && ctx->running;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_active);
++
++u32 an7552_npu_tx_read(struct an7552_npu *ctx, unsigned int band, u32 offset)
++{
++	if (band > 1 || offset >= 16 || (offset & 3))
++		return 0;
++	return readl(ctx->regs + 0x3000 + AN7552_NATIVE_CONTROL + band * 64 +
++		     offset);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_tx_read);
++
++void an7552_npu_tx_write(struct an7552_npu *ctx, unsigned int band, u32 offset,
++			 u32 value)
++{
++	if (band > 1 || offset >= 16 || (offset & 3))
++		return;
++	writel(value,
++	       ctx->regs + 0x3000 + AN7552_NATIVE_CONTROL + band * 64 + offset);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_tx_write);
++
++void an7552_npu_tx_setup(struct an7552_npu *ctx, unsigned int band, u32 base,
++			 u32 count)
++{
++	void __iomem *control, *registers, *ring;
++	u32 start, value, physical;
++	unsigned int i;
++	int ret = -EINVAL;
++
++	if (band > 1 || ctx->stopping || !count || count > 4096 ||
++	    (base & 15) || base < 0x80000000 || base > 0xa0000000 - count * 208)
++		goto error;
++	control = ctx->regs + 0x3000 + AN7552_NATIVE_CONTROL + band * 64;
++	if (ctx->defer_queues) {
++		ctx->tx_base[band] = base;
++		ctx->tx_count[band] = count;
++		memset_io(control, 0, 64);
++		return;
++	}
++	writel(0, control + 20);
++	if (readl_poll_timeout(control + 24, value, !value, 10, 100000)) {
++		dev_err(ctx->dev, "native queue %u did not stop\n", band);
++		ret = -ETIMEDOUT;
++		goto error;
++	}
++	physical = AN7552_NATIVE_RING_HOST + band * 0x8000;
++	ring = ctx->ram + physical - CODE_BASE;
++	registers = ioremap(band ? 0x200d8450 : 0x200d4420, 16);
++	if (!registers) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	start = readl(registers + 12);
++	if (start >= AN7552_NATIVE_RING_COUNT) {
++		dev_err(ctx->dev, " invalid native hardware index %u\n", start);
++		iounmap(registers);
++		goto error;
++	}
++	memset_io(ring, 0, 0x8000);
++	for (i = 0; i < AN7552_NATIVE_RING_COUNT; i++)
++		writel(BIT(31), ring + i * 16 + 4);
++	memset_io(control, 0, 64);
++	writel(base, control);
++	writel(count, control + 4);
++	writel(start, control + 16);
++	writel(physical, registers);
++	writel(AN7552_NATIVE_RING_COUNT, registers + 4);
++	writel(start, registers + 8);
++	/* Publish the transmit ring before enabling its firmware consumer. */
++	wmb();
++	writel(1, control + 20);
++	iounmap(registers);
++	dev_dbg(ctx->dev,
++		" native queue %u host=%08x count=%u hardware=%08x start=%u\n",
++		band, base, count, physical, start);
++
++	return;
++error:
++	ctx->queue_error = ret;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_tx_setup);
++
++/* The consumer serializes health checks with reset and device teardown. */
++bool an7552_npu_healthy(struct an7552_npu *ctx)
++{
++	unsigned int i;
++
++	if (!ctx || !ctx->running || ctx->stopping)
++		return true;
++	if (ctx->faulted)
++		return false;
++	for (i = 0; i < AN7552_CORES; i++) {
++		void __iomem *state = ctx->regs + 0x3000 + i * AN7552_STRIDE;
++		u32 magic = readl(state), heartbeat = readl(state + 4);
++
++		if (magic == AN7552_MAGIC && heartbeat != ctx->heartbeat[i]) {
++			ctx->heartbeat[i] = heartbeat;
++			ctx->heartbeat_seen[i] = jiffies;
++			continue;
++		}
++		if (magic == AN7552_MAGIC &&
++		    time_before(jiffies, ctx->heartbeat_seen[i] + 3 * HZ))
++			continue;
++		ctx->faulted = true;
++		ctx->fault_count++;
++		dev_err(ctx->dev,
++			"core %u fault: magic=%08x cause=%08x pc=%08x heartbeat=%u\n",
++			i, magic, readl(state + 8), readl(state + 12), heartbeat);
++		return false;
++	}
++	return true;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_healthy);
++
++bool an7552_npu_recovery_ready(struct an7552_npu *ctx)
++{
++	return !ctx || (!ctx->failed && (!ctx->faulted || ctx->fault_quiesced));
++}
++EXPORT_SYMBOL_GPL(an7552_npu_recovery_ready);
++
++/* No firmware mailbox can be trusted after a trap. Park both writers and
++ * stop TDMA before the consumer resets radio DMA. All packet storage remains
++ * reserved until that reset completes; only then may prepare() reuse it.
++ */
++static int fault_drain_ppe(struct an7552_npu *ctx)
++{
++	unsigned long deadline = jiffies + msecs_to_jiffies(100);
++
++	/* TX DMA is stopped and both software producers are parked. Consume
++	 * old completion tokens before the receive pool can be reinitialized.
++	 * Wait for the shared PPE pipeline as well as its completion FIFO.
++	 */
++	do {
++		if (readl(ctx->fe + 0xfe4) & 0xffff) {
++			u32 status = readl(ctx->fe + 0xfe0);
++
++			if (!(status & BIT(31)))
++				return -EIO;
++			readl(ctx->fe + 0xfdc);
++			writel(BIT(31), ctx->fe + 0xfe0);
++			ctx->discarded_completions++;
++		} else if (!(readl(ctx->fe + 0xe00) & BIT(31))) {
++			return 0;
++		}
++		usleep_range(10, 20);
++	} while (time_before(jiffies, deadline));
++	return -ETIMEDOUT;
++}
++
++static int fault_stop(struct an7552_npu *ctx)
++{
++	unsigned int i, band;
++	u32 value;
++	int ret;
++
++	ret = park_cores(ctx);
++	if (ret)
++		return ret;
++	writel(readl(ctx->fe + 0xa04) & ~(BIT(0) | BIT(2)), ctx->fe + 0xa04);
++	ret = readl_poll_timeout(ctx->fe + 0xa04, value,
++				 !(value & (BIT(1) | BIT(3))), 10, 100000);
++	if (ret)
++		return ret;
++	ret = fault_drain_ppe(ctx);
++	if (ret)
++		return ret;
++	for (band = 0; band < 2; band++) {
++		writel(0, ctx->regs + 0x30d034 + band * 4);
++		if (ctx->txfree_irqs[band]) {
++			free_irq(ctx->txfree_irqs[band], &ctx->txfree_bands[band]);
++			ctx->txfree_irqs[band] = 0;
++		}
++		ctx->txfree_notify[band] = NULL;
++		for (i = 0; i < 3; i++)
++			writel(ctx->saved_ring[band][i],
++			       ctx->fe + 0x900 + band * 16 + i * 4);
++	}
++	writel(0, ctx->regs + 0x30d03c);
++	if (ctx->rro_irq) {
++		free_irq(ctx->rro_irq, ctx);
++		ctx->rro_irq = 0;
++	}
++	ctx->rro_notify = NULL;
++	if (ctx->ppe_enabled) {
++		for (i = 0; i < 3; i++)
++			writel(ctx->ppe_saved[i], ctx->fe + 0x800 + i * 4);
++		writel(ctx->ppe_saved[5], ctx->fe + 0xa28);
++		writel(ctx->ppe_saved[6], ctx->fe + 0xa2c);
++	}
++	ctx->ppe_enabled = false;
++	ctx->tdma_enabled = false;
++	ctx->fault_quiesced = true;
++	return 0;
++}
++
++void an7552_npu_stop(struct an7552_npu *ctx)
++{
++	unsigned int i;
++	u32 value;
++
++	if (!ctx || !ctx->running || ctx->stopping)
++		return;
++	/* Teardown may precede the periodic health check after a trap. */
++	an7552_npu_healthy(ctx);
++	ctx->stopping = true;
++	if (ctx->faulted) {
++		if (fault_stop(ctx)) {
++			ctx->failed = true;
++			dev_err(ctx->dev, "fault shutdown failed; DMA buffers retained\n");
++		}
++		return;
++	}
++	native_rro_stop(ctx);
++	tdma_stop(ctx);
++	native_txfree_stop(ctx);
++	for (i = 0; i < 2; i++) {
++		void __iomem *control =
++			ctx->regs + 0x3000 + AN7552_NATIVE_CONTROL + i * 64;
++
++		writel(0, control + 20);
++		if (readl_poll_timeout(control + 24, value, !value, 10,
++				       100000)) {
++			ctx->failed = true;
++			dev_err(ctx->dev, "native queue stop timed out\n");
++			writel(0x300, ctx->regs + BOOT_CONFIG);
++			writel(2, ctx->regs + BOOT_TRIGGER);
++			usleep_range(1000, 2000);
++		}
++	}
++}
++EXPORT_SYMBOL_GPL(an7552_npu_stop);
++
++static int an7552_npu_forward_setup(struct an7552_npu *ctx, u32 band, u32 bss,
++				    u32 wcid, u32 flags, u32 start,
++				    u32 start_second)
++{
++	void __iomem *control = ctx->regs + 0x3000 + AN7552_FORWARD_CONTROL;
++
++	if (!ctx->running || ctx->stopping || band > 2 || bss > 255 ||
++	    wcid > 2047 || !wcid || start >= AN7552_TDMA_COUNT ||
++	    start_second >= AN7552_TDMA_COUNT ||
++	    (flags != 0x80 && flags != 0x88))
++		return -EINVAL;
++	if (readl(control + 56) || readl(control + 32) != readl(control + 36))
++		return -EBUSY;
++	memset_io(ctx->ram + AN7552_FORWARD_WORK_HOST - CODE_BASE, 0,
++		  AN7552_DIRECT_TOKENS * 16);
++	memset_io(control, 0, 64);
++	writel(band, control + 4);
++	writel(bss, control + 8);
++	writel(wcid, control + 12);
++	writel(flags, control + 16);
++	writel(start, control + 24);
++	writel(start_second, control + 28);
++	/* Publish forwarding parameters before enabling the datapath. */
++	wmb();
++	writel(1, control);
++	return 0;
++}
++
++static int an7552_npu_forward_stop(struct an7552_npu *ctx)
++{
++	void __iomem *control = ctx->regs + 0x3000 + AN7552_FORWARD_CONTROL;
++	u32 completed;
++	int ret;
++
++	if (!ctx->running)
++		return -ENODEV;
++	ret = readl_poll_timeout(control + 36, completed,
++				 completed == readl(control + 32), 100, 500000);
++	if (ret) {
++		dev_err(ctx->dev,
++			" direct packets still owned by radio; preserve reserved buffers until reset\n");
++		return ret;
++	}
++	writel(0, control);
++	return readl_poll_timeout(control + 56, completed, !completed, 100,
++				  100000);
++}
++
++bool an7552_npu_forward_path(struct an7552_npu *ctx, u32 band, u32 bss,
++			     u32 wcid)
++{
++	void __iomem *control;
++
++	if (!ctx)
++		return false;
++	control = ctx->regs + 0x3000 + AN7552_FORWARD_CONTROL;
++	return ctx->running && !ctx->stopping && !ctx->faulted &&
++	       station_ready(ctx, band, bss, wcid) && readl(control) &&
++	       (readl(control + 4) == 2 ||
++		(readl(control + 4) == band && readl(control + 8) == bss &&
++		 readl(control + 12) == wcid)) &&
++	       readl(ctx->regs + 0x3000 + AN7552_TDMA_CONTROL);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_forward_path);
++
++static u32 recovery_timer_stop(struct an7552_npu *ctx)
++{
++	u32 control = readl(ctx->timer) & 0x1e0001ee;
++
++	/* Preserve other timers' enables, and acknowledge only timer 0. */
++	writel(control | BIT(16), ctx->timer);
++	readl(ctx->timer);
++	return control;
++}
++
++static int wait_parked(struct an7552_npu *ctx)
++{
++	unsigned int i;
++	u32 value;
++	int ret;
++
++	for (i = 0; i < AN7552_CORES; i++) {
++		void __iomem *ack = ctx->regs + 0x3000 + AN7552_PARK_ACK + i * 4;
++
++		ret = readl_poll_timeout(ack, value, value == AN7552_PARK_MAGIC,
++					 100, 100000);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int park_cores(struct an7552_npu *ctx)
++{
++	unsigned int i;
++	u32 control;
++	int ret;
++
++	writel(1, ctx->regs + 0x3000 + AN7552_PARK_CONTROL);
++	ret = wait_parked(ctx);
++	if (!ret)
++		return 0;
++	for (i = 0; i < AN7552_CORES; i++)
++		if (readl(ctx->regs + 0x3000 + AN7552_FW_RECOVERY_READY + i * 4) != 1)
++			goto failed;
++
++	/* Interrupt a busy loop, then require the same fenced acknowledgment.
++	 * A blocked bus transaction may still fail; never reuse its buffers.
++	 */
++	control = recovery_timer_stop(ctx);
++	writel(25000, ctx->timer + 4);
++	writel(control | BIT(0), ctx->timer);
++	readl(ctx->timer);
++	ret = wait_parked(ctx);
++	recovery_timer_stop(ctx);
++	if (!ret) {
++		ctx->interrupt_parks++;
++		return 0;
++	}
++failed:
++	dev_err(ctx->dev, "cores did not acknowledge shutdown\n");
++	return ret;
++}
++
++static int halt_cores(struct an7552_npu *ctx)
++{
++	int ret = 0;
++
++	if (ctx->running) {
++		ret = park_cores(ctx);
++		if (ret)
++			ctx->failed = true;
++	}
++	writel(0x300, ctx->regs + BOOT_CONFIG);
++	writel(2, ctx->regs + BOOT_TRIGGER);
++	usleep_range(1000, 2000);
++	return ret;
++}
++
++static int boot_firmware(struct an7552_npu *ctx)
++{
++	const struct firmware *fw;
++	u32 value, heartbeat[2], entry;
++	unsigned int i;
++	int ret;
++
++	ret = request_firmware(&fw, "airoha/an7552.bin", ctx->dev);
++	if (ret)
++		return ret;
++	if (fw->size < AN7552_FW_HEADER_SIZE || fw->size > AN7552_FW_MAX_SIZE ||
++	    get_unaligned_le32(fw->data) != AN7552_FW_MAGIC ||
++	    get_unaligned_le32(fw->data + AN7552_FW_FORMAT_OFFSET) !=
++		    AN7552_FW_FORMAT_VERSION ||
++	    get_unaligned_le32(fw->data + AN7552_FW_ABI_OFFSET) !=
++		    AN7552_FW_ABI_VERSION ||
++	    get_unaligned_le32(fw->data + AN7552_FW_HEADER_SIZE_OFFSET) !=
++		    AN7552_FW_HEADER_SIZE ||
++	    get_unaligned_le32(fw->data + AN7552_FW_IMAGE_SIZE_OFFSET) !=
++		    fw->size ||
++	    get_unaligned_le32(fw->data + AN7552_FW_CORES_OFFSET) !=
++		    AN7552_CORES ||
++	    get_unaligned_le32(fw->data + AN7552_FW_RESERVED_OFFSET)) {
++		dev_err(ctx->dev, "invalid or incompatible firmware header\n");
++		ret = -EINVAL;
++		goto release;
++	}
++	entry = get_unaligned_le32(fw->data + AN7552_FW_ENTRY_OFFSET);
++	if (entry < AN7552_FW_HEADER_SIZE || entry >= fw->size || entry & 3) {
++		ret = -EINVAL;
++		goto release;
++	}
++	ret = halt_cores(ctx);
++	if (ret)
++		goto release;
++	recovery_timer_stop(ctx);
++	memcpy_toio(ctx->ram, fw->data, fw->size);
++	memset_io(ctx->regs + 0x3000, 0, 0x800);
++	memset_io(ctx->ram + PN_TABLE_HOST - CODE_BASE, 0,
++		  AN7552_STATION_COUNT * 256);
++	/* Preserve slot generations across firmware recovery so stale host
++	 * handles cannot alias a newly allocated replay domain.
++	 */
++	if (!ctx->pn_domains_initialized) {
++		memset_io(ctx->ram + PN_DOMAIN_HOST - CODE_BASE, 0,
++			  AN7552_STATION_COUNT * 256);
++		ctx->pn_domains_initialized = true;
++	} else {
++		unsigned int index;
++
++		for (index = 0; index < AN7552_STATION_COUNT; index++)
++			writel(0, ctx->ram + PN_DOMAIN_HOST - CODE_BASE + index * 256);
++	}
++	memset_io(ctx->ram + PN_RADIO_STATE_HOST - CODE_BASE, 0,
++		  AN7552_STATION_COUNT * 256);
++	memset_io(ctx->ram + AN7552_STATION_HOST - CODE_BASE, 0,
++		  AN7552_STATION_COUNT * 32);
++	memset_io(ctx->ram + AN7552_QOS_HOST - CODE_BASE, 0,
++		  AN7552_QOS_COUNT * AN7552_QOS_STRIDE);
++	/* Initialize shared memory before releasing either RISC-V core. */
++	wmb();
++	for (i = 0; i < AN7552_CORES; i++)
++		writel(CODE_BASE + entry, ctx->regs + BOOT_PC(i));
++	writel(3, ctx->regs + BOOT_CONFIG);
++	writel(1, ctx->regs + BOOT_TRIGGER);
++	for (i = 0; i < AN7552_CORES; i++) {
++		ret = readl_poll_timeout(ctx->regs + 0x3000 + i * AN7552_STRIDE,
++					 value, value == AN7552_MAGIC, 100,
++					 100000);
++		if (ret)
++			goto halt;
++		if (readl(ctx->regs + 0x3000 + AN7552_FW_RUNTIME_ABI + i * 4) !=
++		    AN7552_FW_ABI_VERSION) {
++			ret = -EPROTO;
++			goto halt;
++		}
++		heartbeat[i] = readl(ctx->regs + 0x3004 + i * AN7552_STRIDE);
++	}
++	usleep_range(1000, 2000);
++	for (i = 0; i < AN7552_CORES; i++) {
++		if (readl(ctx->regs + 0x3004 + i * AN7552_STRIDE) ==
++		    heartbeat[i]) {
++			ret = -ETIMEDOUT;
++			goto halt;
++		}
++	}
++	ctx->failed = false;
++	ctx->faulted = false;
++	ctx->fault_quiesced = false;
++	for (i = 0; i < AN7552_CORES; i++) {
++		ctx->heartbeat[i] = heartbeat[i];
++		ctx->heartbeat_seen[i] = jiffies;
++	}
++	ctx->stopping = false;
++	ctx->pn_failed = false;
++	ctx->pn_sequence = 0;
++	ctx->queue_error = 0;
++	ctx->running = true;
++	goto release;
++halt:
++	halt_cores(ctx);
++release:
++	release_firmware(fw);
++	return ret;
++}
++
++static int tdma_start(struct an7552_npu *ctx)
++{
++	void __iomem *control = ctx->regs + 0x3000;
++	u32 value;
++	unsigned int i, q;
++	int ret;
++
++	if (readl(ctx->fe + 0x900) || readl(ctx->fe + 0x910) ||
++	    (readl(ctx->fe + 0xa04) & (BIT(2) | BIT(3))))
++		return -EBUSY;
++	for (q = 0; q < 2; q++) {
++		for (i = 0; i < 4; i++)
++			ctx->saved_ring[q][i] =
++				readl(ctx->fe + 0x900 + q * 16 + i * 4);
++		if (ctx->saved_ring[q][3] >= AN7552_TDMA_COUNT)
++			return -EINVAL;
++	}
++	ctx->saved_global = readl(ctx->fe + 0xa04);
++	memset_io(ctx->pool, 0, 0x420000);
++	for (i = 0; i < AN7552_DIRECT_TOKENS; i++) {
++		writel(AN7552_TDMA_BUFFER_SIZE, ctx->pool + i * 32 + 4);
++		writel(AN7552_TDMA_BUFFER_HOST + i * AN7552_TDMA_BUFFER_SIZE,
++		       ctx->pool + i * 32 + 8);
++	}
++	ret = an7552_npu_forward_setup(ctx, 2, 0, 1, 0x80,
++				       ctx->saved_ring[0][3],
++				       ctx->saved_ring[1][3]);
++	if (ret)
++		return ret;
++	writel(1, control + AN7552_TDMA_CONTROL);
++	ret = readl_poll_timeout(control + AN7552_STRIDE + 48, value,
++				 value == 3, 100, 100000);
++	if (ret) {
++		writel(0, control + AN7552_TDMA_CONTROL);
++		return ret;
++	}
++	for (q = 0; q < 2; q++) {
++		u32 offset = 0x900 + q * 16;
++
++		writel((AN7552_TDMA_RING_HOST + q * AN7552_TDMA_COUNT * 32) &
++			       0x1fffffff,
++		       ctx->fe + offset);
++		writel(AN7552_TDMA_COUNT, ctx->fe + offset + 4);
++		writel((ctx->saved_ring[q][3] + AN7552_TDMA_COUNT - 1) %
++			       AN7552_TDMA_COUNT,
++		       ctx->fe + offset + 8);
++	}
++	/* Publish receive descriptors before enabling TDMA. */
++	wmb();
++	writel(readl(ctx->fe + 0xa04) | BIT(2), ctx->fe + 0xa04);
++	ctx->tdma_enabled = true;
++	return 0;
++}
++
++static void tdma_stop(struct an7552_npu *ctx)
++{
++	void __iomem *control = ctx->regs + 0x3000;
++	u32 value;
++	unsigned int q, i;
++	int ret;
++
++	if (!ctx->tdma_enabled)
++		return;
++	writel(readl(ctx->fe + 0xa04) & ~BIT(2), ctx->fe + 0xa04);
++	ret = readl_poll_timeout(ctx->fe + 0xa04, value, !(value & BIT(3)), 100,
++				 100000);
++	if (!ret) {
++		for (q = 0; q < 2; q++) {
++			void __iomem *consumer = control + AN7552_TDMA_CONTROL + 4 + q * 4;
++
++			ret = readl_poll_timeout(consumer, value,
++						 value == readl(ctx->fe + 0x90c + q * 16),
++						 100, 500000);
++			if (ret)
++				break;
++		}
++	}
++	if (!ret)
++		ret = an7552_npu_forward_stop(ctx);
++	writel(0, control + AN7552_TDMA_CONTROL);
++	if (readl_poll_timeout(control + AN7552_STRIDE + 48, value, !value, 100,
++			       100000))
++		ret = -ETIMEDOUT;
++	if (ret) {
++		ctx->failed = true;
++		dev_err(ctx->dev,
++			"TDMA drain failed; reserved buffers retained\n");
++		return;
++	}
++	for (q = 0; q < 2; q++)
++		for (i = 0; i < 3; i++)
++			writel(ctx->saved_ring[q][i],
++			       ctx->fe + 0x900 + q * 16 + i * 4);
++	ctx->tdma_enabled = false;
++}
++
++static struct platform_driver an7552_npu_driver;
++struct an7552_npu *an7552_npu_get(struct device *consumer);
++
++struct an7552_npu *an7552_npu_get(struct device *consumer)
++{
++	struct device_node *node;
++	struct platform_device *pdev;
++	struct an7552_npu *ctx;
++	int ret;
++
++	node = of_parse_phandle(consumer->of_node, "airoha,npu", 0);
++	if (!node)
++		return ERR_PTR(-ENODEV);
++	if (!of_device_is_compatible(node, "airoha,an7552-npu")) {
++		of_node_put(node);
++		return ERR_PTR(-EOPNOTSUPP);
++	}
++	pdev = of_find_device_by_node(node);
++	of_node_put(node);
++	if (!pdev)
++		return ERR_PTR(-EPROBE_DEFER);
++	device_lock(&pdev->dev);
++	ctx = platform_get_drvdata(pdev);
++	if (pdev->dev.driver != &an7552_npu_driver.driver || !ctx) {
++		ret = -EPROBE_DEFER;
++		goto unlock;
++	}
++	mutex_lock(&ctx->attach_lock);
++	if (ctx->attached) {
++		ret = -EBUSY;
++		goto unlock_attach;
++	}
++	if (ctx->failed) {
++		ret = -EIO;
++		goto unlock_attach;
++	}
++	if (!try_module_get(THIS_MODULE)) {
++		ret = -ENODEV;
++		goto unlock_attach;
++	}
++	if (!device_link_add(consumer, &pdev->dev,
++			     DL_FLAG_AUTOREMOVE_CONSUMER)) {
++		ret = -ENOMEM;
++		goto release_module;
++	}
++	dev_dbg(ctx->dev, "starting source firmware\n");
++	ret = boot_firmware(ctx);
++	if (ret)
++		goto release_module;
++	dev_dbg(ctx->dev, "firmware ready, starting TDMA\n");
++	ret = tdma_start(ctx);
++	if (ret) {
++		halt_cores(ctx);
++		ctx->running = false;
++		goto release_module;
++	}
++	dev_dbg(ctx->dev, "TDMA ready\n");
++	ctx->attached = true;
++	mutex_unlock(&ctx->attach_lock);
++	device_unlock(&pdev->dev);
++	return ctx;
++release_module:
++	module_put(THIS_MODULE);
++unlock_attach:
++	mutex_unlock(&ctx->attach_lock);
++unlock:
++	device_unlock(&pdev->dev);
++	platform_device_put(pdev);
++	return ERR_PTR(ret);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_get);
++
++void an7552_npu_put(struct an7552_npu *ctx)
++{
++	if (!ctx)
++		return;
++	mutex_lock(&ctx->attach_lock);
++	an7552_npu_stop(ctx);
++	halt_cores(ctx);
++	ctx->running = false;
++	ctx->attached = false;
++	mutex_unlock(&ctx->attach_lock);
++	put_device(ctx->dev);
++	module_put(THIS_MODULE);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_put);
++
++/* Queue memory belongs to mt76 and may only be replaced while quiesced.
++ * Keep station identities and replay counters across a radio DMA reset.
++ */
++int an7552_npu_prepare(struct an7552_npu *ctx, bool full)
++{
++	int ret;
++
++	if (!ctx)
++		return 0;
++	if (ctx->faulted) {
++		if (!full || !ctx->fault_quiesced || ctx->failed)
++			return -EIO;
++		ret = boot_firmware(ctx);
++		if (ret)
++			return ret;
++		ret = tdma_start(ctx);
++		if (ret)
++			return ret;
++		ctx->recovery_count++;
++		dev_info(ctx->dev, "source firmware recovered after core fault\n");
++	}
++	if (!ctx->running || ctx->failed || ctx->pn_failed)
++		return -EIO;
++	ctx->queue_error = 0;
++	ctx->defer_queues = true;
++	memset_io(ctx->regs + 0x3000 + AN7552_RX_DATA_CONTROL, 0, 128);
++	memset_io(ctx->regs + 0x3000 + AN7552_RRO_CONTROL, 0, 128);
++	if (full)
++		memset_io(ctx->ram + AN7552_STATION_HOST - CODE_BASE, 0,
++			  AN7552_STATION_COUNT * 32);
++	ctx->stopping = false;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_prepare);
++
++int an7552_npu_queues_start(struct an7552_npu *ctx)
++{
++	unsigned int band;
++	int ret;
++
++	if (!ctx || !ctx->defer_queues)
++		return 0;
++	if (ctx->failed || ctx->stopping)
++		return -EIO;
++	ctx->defer_queues = false;
++	for (band = 0; band < 2; band++) {
++		if (ctx->tx_count[band])
++			an7552_npu_tx_setup(ctx, band, ctx->tx_base[band],
++					    ctx->tx_count[band]);
++		if (!ctx->txfree_config[band].count)
++			continue;
++		ret = an7552_npu_txfree_setup(ctx, band,
++					      ctx->txfree_config[band].base,
++					      ctx->txfree_config[band].count,
++					      ctx->txfree_config[band].regs,
++					      ctx->txfree_config[band].notify,
++					      ctx->txfree_config[band].context);
++		if (ret)
++			return ret;
++	}
++	return ctx->queue_error;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_queues_start);
++
++int an7552_npu_start(struct an7552_npu *ctx)
++{
++	if (!ctx)
++		return 0;
++	if (!ctx->running || ctx->failed || ctx->stopping || ctx->pn_failed)
++		return -EIO;
++	if (ctx->queue_error)
++		return ctx->queue_error;
++	return ctx->tdma_enabled ? 0 : tdma_start(ctx);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_start);
++
++static int an7552_npu_debug_show(struct seq_file *seq, void *unused)
++{
++	struct an7552_npu *ctx = seq->private;
++	void __iomem *ppe = ctx->regs + 0x36c0;
++	unsigned int i;
++
++	seq_printf(seq, "running=%u attached=%u failed=%u stopping=%u\n",
++		   ctx->running, ctx->attached, ctx->failed, ctx->stopping);
++	seq_printf(seq, "faulted=%u quiesced=%u faults=%u recoveries=%u\n",
++		   ctx->faulted, ctx->fault_quiesced, ctx->fault_count, ctx->recovery_count);
++	seq_printf(seq, "ppe=%u tdma=%u discarded_completions=%u interrupt_parks=%u\n",
++		   ctx->ppe_enabled, ctx->tdma_enabled, ctx->discarded_completions,
++		   ctx->interrupt_parks);
++	if (!ctx->running)
++		return 0;
++	for (i = 0; i < 2; i++) {
++		void __iomem *q = ctx->regs + 0x3000 + i * 64;
++
++		seq_printf(seq, "core%u magic=%08x heartbeat=%u cause=%08x pc=%08x\n",
++			   i, readl(q), readl(q + 4), readl(q + 8), readl(q + 12));
++	}
++
++	seq_printf(seq, "ppe_mode=%u error=%u submitted=%u completed=%u inflight=%u\n",
++		   readl(ppe), readl(ppe + 12), readl(ppe + 4),
++		   readl(ppe + 8), readl(ppe + 48));
++	seq_printf(seq, "ppe_forwarded=%u cpu_delivered=%u\n",
++		   readl(ppe + 56), readl(ppe + 60));
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(an7552_npu_debug);
++
++static int an7552_npu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *eth_node;
++	struct resource resource;
++	struct an7552_npu *ctx;
++	int ret;
++
++	ctx = devm_kzalloc(dev, sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->dev = dev;
++	mutex_init(&ctx->attach_lock);
++	spin_lock_init(&ctx->station_lock);
++	spin_lock_init(&ctx->pn_lock);
++	ctx->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(ctx->regs))
++		return PTR_ERR(ctx->regs);
++	/* Timer 0 is inside the NPU register aperture. */
++	ctx->timer = ctx->regs + 0x310100;
++	ret = of_reserved_mem_region_to_resource(dev->of_node, 0, &resource);
++	if (ret)
++		return ret;
++	if (resource.start != CODE_BASE || resource_size(&resource) < CODE_SIZE)
++		return dev_err_probe(dev, -EINVAL,
++				     "invalid firmware workspace\n");
++	ctx->ram = devm_ioremap(dev, resource.start, CODE_SIZE);
++	if (!ctx->ram)
++		return -ENOMEM;
++	ret = of_reserved_mem_region_to_resource(dev->of_node, 1, &resource);
++	if (ret)
++		return ret;
++	if (resource.start != AN7552_TDMA_RING_HOST ||
++	    resource_size(&resource) < PACKET_SIZE)
++		return dev_err_probe(dev, -EINVAL,
++				     "invalid packet workspace\n");
++	ctx->pool = devm_ioremap(dev, resource.start, 0x420000);
++	if (!ctx->pool)
++		return -ENOMEM;
++	eth_node = of_parse_phandle(dev->of_node, "airoha,eth", 0);
++	if (!eth_node)
++		return -EINVAL;
++	ret = of_address_to_resource(eth_node, 0, &resource);
++	of_node_put(eth_node);
++	if (ret)
++		return ret;
++	/* TDMA shares the frame engine aperture; Ethernet owns the other ports. */
++	if (resource.start != 0x1fb50000 || resource_size(&resource) < 0x1000)
++		return -EINVAL;
++	ctx->fe = devm_ioremap(dev, resource.start, 0x1000);
++	if (!ctx->fe)
++		return -ENOMEM;
++	platform_set_drvdata(pdev, ctx);
++	ctx->debugfs = debugfs_create_dir(dev_name(dev), NULL);
++	debugfs_create_file("status", 0400, ctx->debugfs, ctx,
++			    &an7552_npu_debug_fops);
++	return 0;
++}
++
++static void an7552_npu_remove(struct platform_device *pdev)
++{
++	struct an7552_npu *ctx = platform_get_drvdata(pdev);
++
++	debugfs_remove_recursive(ctx->debugfs);
++	an7552_npu_stop(ctx);
++	if (ctx->running)
++		halt_cores(ctx);
++}
++
++static const struct of_device_id an7552_npu_match[] = {
++	{ .compatible = "airoha,an7552-npu" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, an7552_npu_match);
++
++static struct platform_driver an7552_npu_driver = {
++	.probe = an7552_npu_probe,
++	.remove = an7552_npu_remove,
++	.driver = {
++		.name = "an7552-npu",
++		.of_match_table = an7552_npu_match,
++	},
++};
++module_platform_driver(an7552_npu_driver);
++MODULE_FIRMWARE("airoha/an7552.bin");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("AN7552 source-built NPU acceleration");
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/an7552_npu_fw.h
+@@ -0,0 +1,130 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef AN7552_PROTOCOL_H
++#define AN7552_PROTOCOL_H
++
++#define AN7552_MAGIC 0x7552d001U
++#define AN7552_HOST_BASE 0x1e903000U
++#define AN7552_NPU_BASE 0x3e903000U
++#define AN7552_STRIDE 64U
++#define AN7552_CORES 2U
++
++/* Host-reserved shared memory and packet buffers. */
++#define AN7552_TDMA_CONTROL 0x180U
++#define AN7552_STATION_HOST 0x842a0000U
++#define AN7552_STATION_NPU 0x442a0000U
++#define AN7552_STATION_COUNT 2048U
++#define AN7552_STATION_AUTHORIZED 1U
++#define AN7552_STATION_MLO 2U
++#define AN7552_STATION_CONTROL 0x380U
++#define AN7552_QOS_HOST 0x84290000U
++#define AN7552_QOS_NPU 0x44290000U
++#define AN7552_QOS_COUNT 256U
++#define AN7552_QOS_STRIDE 128U
++/* ABI 4: shared MLD counters and second-radio aggregate continuation. */
++#define AN7552_PN_DOMAIN_HOST 0x84300000U
++#define AN7552_PN_DOMAIN_NPU 0x44300000U
++#define AN7552_PN_RADIO_STATE_HOST 0x84380000U
++#define AN7552_PN_RADIO_STATE_NPU 0x44380000U
++#define AN7552_PN_DOMAIN_INDEX_BITS 11U
++#define AN7552_PN_ENTRY_SIZE 256U
++#define AN7552_TXFREE_RING_HOST 0x842b0000U
++#define AN7552_TXFREE_BUFFER_HOST 0x84c00000U
++#define AN7552_TXFREE_COUNT 512U
++#define AN7552_RX_DATA_RING_HOST 0x842c0000U
++#define AN7552_RX_COMPLETE_HOST 0x842d0000U
++#define AN7552_RX_EMI_HOST 0x842d8000U
++#define AN7552_RX_FREE_HOST 0x842e0000U
++#define AN7552_RX_STATE_HOST 0x842e6000U
++#define AN7552_PPE_DOMAIN_HOST 0x841e0000U
++#define AN7552_PPE_DOMAIN_STRIDE 32U
++#define AN7552_PPE_MODE_DRAIN 3U
++#define AN7552_PPE_MODE_BRIDGE 4U
++#define AN7552_RX_BUFFER_HOST 0x84e00000U
++#define AN7552_RX_BUFFER_COUNT 6144U
++#define AN7552_RX_RING_COUNT 1536U
++#define AN7552_RX_TOKEN_BASE 32768U
++#define AN7552_RX_DATA_CONTROL 0x600U
++#define AN7552_RRO_CONTROL 0x500U
++#define AN7552_TXFREE_CONTROL 0x400U
++#define AN7552_FORWARD_CONTROL 0x300U
++#define AN7552_FORWARD_WORK_HOST 0x84280000U
++#define AN7552_FORWARD_WORK_NPU 0x44280000U
++#define AN7552_NATIVE_CONTROL 0x200U
++#define AN7552_NATIVE_RING_HOST 0x84240000U
++#define AN7552_NATIVE_RING_COUNT 2048U
++#define AN7552_TXWI_HOST 0x84a00000U
++#define AN7552_TXWI_NPU 0x44a00000U
++#define AN7552_TXWI_TOKENS 16384U
++#define AN7552_PARK_CONTROL 0x1e0U
++#define AN7552_PARK_ACK 0x1e4U
++#define AN7552_PARK_MAGIC 0x7552a11dU
++#define AN7552_TDMA_RING_HOST 0x84400000U
++#define AN7552_TDMA_RING_NPU 0x44400000U
++#define AN7552_TDMA_BUFFER_HOST 0x84410000U
++#define AN7552_TDMA_BUFFER_NPU 0x44410000U
++#define AN7552_TDMA_COUNT 1024U
++#define AN7552_TDMA_BANDS 2U
++#define AN7552_DIRECT_TOKENS (AN7552_TDMA_COUNT * AN7552_TDMA_BANDS)
++#define AN7552_TDMA_BUFFER_SIZE 2048U
++
++#if AN7552_FORWARD_WORK_HOST + AN7552_DIRECT_TOKENS * 16 > AN7552_QOS_HOST
++#error "QoS policy overlaps forwarding work"
++#endif
++#if AN7552_PPE_DOMAIN_HOST +                                        \
++		AN7552_RX_BUFFER_COUNT * AN7552_PPE_DOMAIN_STRIDE > \
++	AN7552_NATIVE_RING_HOST
++#error "Bridge domain state overlaps native rings"
++#endif
++
++#if AN7552_QOS_HOST + AN7552_QOS_COUNT * AN7552_QOS_STRIDE > AN7552_STATION_HOST
++#error "QoS policy overlaps station state"
++#endif
++
++#if (1U << AN7552_PN_DOMAIN_INDEX_BITS) != AN7552_STATION_COUNT
++#error "Replay domain handle index does not cover the station table"
++#endif
++#if AN7552_PN_DOMAIN_HOST + AN7552_STATION_COUNT * AN7552_PN_ENTRY_SIZE > \
++	AN7552_PN_RADIO_STATE_HOST
++#error "Replay domains overlap radio continuation state"
++#endif
++#if AN7552_PN_RADIO_STATE_HOST + AN7552_STATION_COUNT * AN7552_PN_ENTRY_SIZE > \
++	AN7552_TDMA_RING_HOST
++#error "Radio continuation state overlaps TDMA memory"
++#endif
++
++#endif
++
++#ifndef AN7552_FIRMWARE_ABI_H
++#define AN7552_FIRMWARE_ABI_H
++
++/* All on-disk fields are little-endian 32-bit words. */
++#define AN7552_FW_MAGIC 0x3255504e
++#define AN7552_FW_FORMAT_VERSION 1
++#define AN7552_FW_ABI_VERSION 5
++#define AN7552_FW_HEADER_SIZE 32
++#define AN7552_FW_CORES 2
++#define AN7552_FW_MAX_SIZE 0x10000
++
++/* Runtime ABI announcement, one word per core in shared SRAM. */
++#define AN7552_FW_RUNTIME_ABI 0x1f0
++
++/* One word per core, published after enabling the recovery interrupt. */
++#define AN7552_FW_RECOVERY_READY 0x1d0
++
++/* Trap handlers drain stores and acknowledge parking before sleeping. */
++#define AN7552_FW_PARK_ACK 0x1e4
++#define AN7552_FW_PARK_MAGIC 0x7552a11d
++#define AN7552_FW_TRAP_MAGIC 0xdead7552
++
++/* Header: magic, format, ABI, header size, image size, entry offset,
++ * core count, reserved (must be zero).
++ */
++#define AN7552_FW_FORMAT_OFFSET 4
++#define AN7552_FW_ABI_OFFSET 8
++#define AN7552_FW_HEADER_SIZE_OFFSET 12
++#define AN7552_FW_IMAGE_SIZE_OFFSET 16
++#define AN7552_FW_ENTRY_OFFSET 20
++#define AN7552_FW_CORES_OFFSET 24
++#define AN7552_FW_RESERVED_OFFSET 28
++
++#endif
+--- a/include/linux/soc/airoha/an7552_npu.h
++++ b/include/linux/soc/airoha/an7552_npu.h
+@@ -0,0 +1,237 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_SOC_AIROHA_AN7552_NPU_H
++#define _LINUX_SOC_AIROHA_AN7552_NPU_H
++#include <linux/types.h>
++#include <linux/err.h>
++struct device;
++struct an7552_npu;
++#if IS_REACHABLE(CONFIG_NET_AIROHA_AN7552_NPU)
++void an7552_npu_set_bridge(struct an7552_npu *ctx, bool enable);
++struct an7552_npu *an7552_npu_get(struct device *consumer);
++int an7552_npu_station_route(struct an7552_npu *ctx, u16 wcid,
++			     u16 primary, u16 secondary);
++int an7552_npu_qos_map(struct an7552_npu *ctx, u8 bss, const u8 *map);
++void an7552_npu_put(struct an7552_npu *ctx);
++int an7552_npu_station_set(struct an7552_npu *ctx, u32 wcid, u32 band, u32 bss,
++			   const u8 *address, bool authorized, bool mlo,
++			   bool encrypted);
++void an7552_npu_txfree_irq_enable(struct an7552_npu *ctx, u32 band);
++int an7552_npu_txfree_setup(struct an7552_npu *ctx, u32 band, u32 base,
++			    u32 count, u32 regs, void (*notify)(void *),
++			    void *context);
++void an7552_npu_txfree_write(struct an7552_npu *ctx, u32 band, u32 word,
++			     u32 value);
++u32 an7552_npu_txfree_read(struct an7552_npu *ctx, u32 band, u32 word);
++bool an7552_npu_rro_active(struct an7552_npu *ctx);
++void an7552_npu_rro_irq_enable(struct an7552_npu *ctx);
++int an7552_npu_rro_setup(struct an7552_npu *ctx, u32 base, u32 count, u32 data0,
++			 u32 data1, u32 regs0, u32 regs1, u32 emi,
++			 u32 capacity0, u32 capacity1, void (*notify)(void *),
++			 void *context);
++u32 an7552_npu_rro_index(struct an7552_npu *ctx);
++u32 an7552_npu_rx_read(struct an7552_npu *ctx, u32 band);
++void an7552_npu_rx_write(struct an7552_npu *ctx, u32 band, u32 value);
++u32 an7552_npu_rx_security(struct an7552_npu *ctx, u32 index);
++int an7552_npu_pn_check(struct an7552_npu *ctx, u32 wcid, u32 tid,
++			const u8 *pn);
++int an7552_npu_pn_get(struct an7552_npu *ctx, u32 wcid, u32 key, u8 *pn);
++int an7552_npu_pn_key(struct an7552_npu *ctx, u32 wcid, u32 key, const u8 *pn,
++		      bool enable, u32 domain, bool prepare);
++u32 an7552_npu_pn_domain(struct an7552_npu *ctx, u32 wcid, u32 key);
++int an7552_npu_pn_commit(struct an7552_npu *ctx, const u16 *wcids,
++			 unsigned int count, u32 key);
++bool an7552_npu_healthy(struct an7552_npu *ctx);
++bool an7552_npu_recovery_ready(struct an7552_npu *ctx);
++bool an7552_npu_active(struct an7552_npu *ctx);
++u32 an7552_npu_tx_read(struct an7552_npu *ctx, unsigned int band, u32 offset);
++void an7552_npu_tx_write(struct an7552_npu *ctx, unsigned int band, u32 offset,
++			 u32 value);
++void an7552_npu_tx_setup(struct an7552_npu *ctx, unsigned int band, u32 base,
++			 u32 count);
++void an7552_npu_stop(struct an7552_npu *ctx);
++int an7552_npu_prepare(struct an7552_npu *ctx, bool full);
++int an7552_npu_queues_start(struct an7552_npu *ctx);
++int an7552_npu_start(struct an7552_npu *ctx);
++bool an7552_npu_forward_path(struct an7552_npu *ctx, u32 band, u32 bss,
++			     u32 wcid);
++#else
++static inline void an7552_npu_set_bridge(struct an7552_npu *ctx, bool enable)
++{
++}
++
++static inline int an7552_npu_station_route(struct an7552_npu *ctx, u16 wcid,
++					   u16 primary, u16 secondary)
++{
++	return 0;
++}
++
++static inline int an7552_npu_qos_map(struct an7552_npu *ctx, u8 bss,
++				     const u8 *map)
++{
++	return 0;
++}
++
++static inline int an7552_npu_pn_get(struct an7552_npu *ctx, u32 wcid, u32 key,
++				    u8 *pn)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int an7552_npu_queues_start(struct an7552_npu *ctx)
++{
++	return 0;
++}
++
++static inline int an7552_npu_prepare(struct an7552_npu *ctx, bool full)
++{
++	return 0;
++}
++
++static inline int an7552_npu_start(struct an7552_npu *ctx)
++{
++	return 0;
++}
++
++static inline struct an7552_npu *an7552_npu_get(struct device *consumer)
++{
++	return ERR_PTR(-ENODEV);
++}
++
++static inline void an7552_npu_put(struct an7552_npu *ctx)
++{
++}
++
++static inline int an7552_npu_station_set(struct an7552_npu *ctx, u32 wcid,
++					 u32 band, u32 bss, const u8 *address,
++					 bool authorized, bool mlo, bool encrypted)
++{
++	return 0;
++}
++
++static inline void an7552_npu_txfree_irq_enable(struct an7552_npu *ctx,
++						u32 band)
++{
++}
++
++static inline int an7552_npu_txfree_setup(struct an7552_npu *ctx, u32 band,
++					  u32 base, u32 count, u32 regs,
++					  void (*notify)(void *), void *context)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void an7552_npu_txfree_write(struct an7552_npu *ctx, u32 band,
++					   u32 word, u32 value)
++{
++}
++
++static inline u32 an7552_npu_txfree_read(struct an7552_npu *ctx, u32 band,
++					 u32 word)
++{
++	return 0;
++}
++
++static inline bool an7552_npu_rro_active(struct an7552_npu *ctx)
++{
++	return false;
++}
++
++static inline void an7552_npu_rro_irq_enable(struct an7552_npu *ctx)
++{
++}
++
++static inline int an7552_npu_rro_setup(struct an7552_npu *ctx, u32 base,
++				       u32 count, u32 data0, u32 data1,
++				       u32 regs0, u32 regs1, u32 emi,
++				       u32 capacity0, u32 capacity1,
++				       void (*notify)(void *), void *context)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline u32 an7552_npu_rro_index(struct an7552_npu *ctx)
++{
++	return 0;
++}
++
++static inline u32 an7552_npu_rx_read(struct an7552_npu *ctx, u32 band)
++{
++	return 0;
++}
++
++static inline void an7552_npu_rx_write(struct an7552_npu *ctx, u32 band,
++				       u32 value)
++{
++}
++
++static inline u32 an7552_npu_rx_security(struct an7552_npu *ctx, u32 index)
++{
++	return 0;
++}
++
++static inline int an7552_npu_pn_check(struct an7552_npu *ctx, u32 wcid, u32 tid,
++				      const u8 *pn)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int an7552_npu_pn_key(struct an7552_npu *ctx, u32 wcid, u32 key,
++				    const u8 *pn, bool enable, u32 domain,
++				    bool prepare)
++{
++	return 0;
++}
++
++static inline u32 an7552_npu_pn_domain(struct an7552_npu *ctx, u32 wcid, u32 key)
++{
++	return 0;
++}
++
++static inline int an7552_npu_pn_commit(struct an7552_npu *ctx, const u16 *wcids,
++				       unsigned int count, u32 key)
++{
++	return 0;
++}
++
++static inline bool an7552_npu_healthy(struct an7552_npu *ctx)
++{
++	return true;
++}
++
++static inline bool an7552_npu_recovery_ready(struct an7552_npu *ctx)
++{
++	return true;
++}
++
++static inline bool an7552_npu_active(struct an7552_npu *ctx)
++{
++	return false;
++}
++
++static inline u32 an7552_npu_tx_read(struct an7552_npu *ctx, unsigned int band,
++				     u32 offset)
++{
++	return 0;
++}
++
++static inline void an7552_npu_tx_write(struct an7552_npu *ctx,
++				       unsigned int band, u32 offset, u32 value)
++{
++}
++
++static inline void an7552_npu_tx_setup(struct an7552_npu *ctx,
++				       unsigned int band, u32 base, u32 count)
++{
++}
++
++static inline void an7552_npu_stop(struct an7552_npu *ctx)
++{
++}
++
++static inline bool an7552_npu_forward_path(struct an7552_npu *ctx, u32 band,
++					   u32 bss, u32 wcid)
++{
++	return false;
++}
++#endif
++#endif
