@@ -16,12 +16,14 @@ CFLAGS := $(COMPILER_FLAGS) -march=rv32imc_zicsr_zifencei \
 	-ffile-prefix-map=$(CURDIR)=. -Os -g \
 	-Wall -Wextra -Werror -ffunction-sections -fdata-sections
 
+CFLAGS += $(EXTRA_CFLAGS)
+
 all: build/an7552.bin
 
 build:
 	mkdir -p $@
 
-build/%.o: %.c protocol.h firmware-abi.h native-tx.c.inc station.c.inc txfree.c.inc rro.c.inc ppe.c.inc pn.c.inc rx-security.c.inc rx-parse.h | build
+build/%.o: %.c protocol.h firmware-abi.h native-tx.c.inc station.c.inc txfree.c.inc rro.c.inc ppe.c.inc pn.c.inc pn-domain.c.inc rx-security.c.inc rx-parse.h tx-priority.h ppe-domain.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 build/start.o: start.S firmware-abi.h | build
@@ -37,7 +39,7 @@ build/an7552.bin: build/an7552.elf
 .PHONY: all
 
 HOSTCC ?= cc
-TESTS := pn rx-ownership rx-parse station-frame txfree
+TESTS := ppe-domain forward-drain mlo-forward pn pn-domain pn-mlo rx-ownership rx-parse station-frame txfree tx-priority
 
 build/test-%: tests/%.c $(wildcard *.h *.c.inc) | build
 	$(HOSTCC) -O2 -Wall -Wextra -Werror $< -o $@

@@ -4,6 +4,70 @@ Connect MT7992 data queues, receive reordering and station lifecycle
 to the AN7552 firmware, and preserve encryption counters on recovery.
 
 ---
+--- a/airoha_offload.h
++++ b/airoha_offload.h
+@@ -21,6 +21,9 @@
+ 		void (*check_skb)(struct airoha_ppe_dev *dev,
+ 				  struct sk_buff *skb, u16 hash,
+ 				  bool rx_wlan);
++		void (*check_skb_domain)(struct airoha_ppe_dev *dev,
++					 struct sk_buff *skb, u16 hash, u16 domain);
++		int (*flush_wdma)(struct airoha_ppe_dev *dev, u16 wcid, u8 band);
+ 	} ops;
+ 
+ 	void *priv;
+@@ -36,6 +39,13 @@
+ 	return dev->ops.setup_tc_block_cb(dev, type_data);
+ }
+ 
++/* Revoke station paths before returning its WCID to the radio allocator. */
++static inline int airoha_ppe_dev_flush_wdma(struct airoha_ppe_dev *dev,
++					    u16 wcid, u8 band)
++{
++	return dev->ops.flush_wdma ? dev->ops.flush_wdma(dev, wcid, band) : 0;
++}
++
+ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
+ 					    struct sk_buff *skb,
+ 					    u16 hash, bool rx_wlan)
+@@ -52,10 +62,16 @@
+ {
+ }
+ 
+-static inline int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+-					       void *type_data)
++static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
++						   void *type_data)
+ {
+ 	return -EOPNOTSUPP;
++}
++
++static inline int airoha_ppe_dev_flush_wdma(struct airoha_ppe_dev *dev,
++					    u16 wcid, u8 band)
++{
++	return 0;
+ }
+ 
+ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
+@@ -76,7 +92,7 @@
+ #define NPU_RX_DMA_DESC_CUR_LEN_MASK	GENMASK(14, 1)
+ #define NPU_RX_DMA_DESC_DONE_MASK	BIT(0)
+ /* INFO */
+-#define NPU_RX_DMA_PKT_COUNT_MASK	GENMASK(31, 28)
++#define NPU_RX_DMA_PKT_COUNT_MASK	GENMASK(31, 29)
+ #define NPU_RX_DMA_PKT_ID_MASK		GENMASK(28, 26)
+ #define NPU_RX_DMA_SRC_PORT_MASK	GENMASK(25, 21)
+ #define NPU_RX_DMA_CRSN_MASK		GENMASK(20, 16)
+@@ -173,6 +189,9 @@
+ 		/* protect concurrent npu memory accesses */
+ 		spinlock_t lock;
+ 		struct work_struct wdt_work;
++		/* Coherent bounce buffer for mailbox cmd/rsp */
++		void *buf;
++		dma_addr_t addr;
+ 	} cores[NPU_NUM_CORES];
+ 
+ 	int irqs[NPU_NUM_IRQ];
 --- a/dma.c
 +++ b/dma.c
 @@ -7,6 +7,48 @@
@@ -28,7 +92,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +}
 +
 +void *mt76_dma_alloc_coherent(struct mt76_dev *dev, size_t size,
-+			     dma_addr_t *dma_addr, gfp_t gfp)
++			      dma_addr_t *dma_addr, gfp_t gfp)
 +{
 +	struct mt76_dma_allocation *allocation;
 +
@@ -46,7 +110,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +	allocation->dma_addr = *dma_addr;
 +	allocation->size = size;
 +	if (devm_add_action_or_reset(dev->dev, mt76_dma_release_coherent,
-+				    allocation))
++				     allocation))
 +		return NULL;
 +
 +	return allocation->addr;
@@ -55,13 +119,10 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  static struct mt76_txwi_cache *
  mt76_alloc_txwi(struct mt76_dev *dev)
-@@ -198,9 +240,27 @@
+@@ -198,9 +240,24 @@
  	return idx < q->ndesc ? idx : fallback;
  }
  
-+
-+
-+
 +static void native_txfree_notify(void *context)
 +{
 +	struct napi_struct *napi = context;
@@ -74,7 +135,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  {
 +	if (mt76_queue_is_npu_tx(q) && an7552_npu_active(dev->mmio.an7552)) {
 +		an7552_npu_tx_setup(dev->mmio.an7552, FIELD_GET(MT_QFLAG_WED_RING, q->flags),
-+					 q->desc_dma, q->ndesc);
++				    q->desc_dma, q->ndesc);
 +		q->head = mt76_dma_read_dma_idx(q, 0);
 +		q->tail = q->head;
 +		return;
@@ -83,7 +144,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	if ((q->flags & MT_QFLAG_WED_RRO_EN) &&
  	    (!is_mt7992(dev) || !mt76_npu_device_active(dev)))
  		Q_WRITE(q, ring_size, MT_DMA_RRO_EN | q->ndesc);
-@@ -216,6 +276,17 @@
+@@ -216,6 +273,18 @@
  
  	q->head = mt76_dma_read_dma_idx(q, 0);
  	q->tail = q->head;
@@ -96,24 +157,14 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +		if (ret)
 +			dev_err(dev->dev, "NPU TXFREE queue %ld setup failed: %d\n",
 +				(long)(q - dev->q_rx), ret);
-+		q->head = q->tail = 0;
++		q->head = 0;
++		q->tail = 0;
 +	}
  }
  
  void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
-@@ -318,6 +389,7 @@
+@@ -462,17 +531,20 @@
  
- 	return idx;
- }
-+
- 
- static int
- mt76_dma_add_buf(struct mt76_dev *dev, struct mt76_queue *q,
-@@ -460,19 +532,23 @@
- 		wake_up(&dev->tx_wait);
- }
- 
-+
  static void *
  mt76_dma_get_rxdmad_c_buf(struct mt76_dev *dev, struct mt76_queue *q,
 -			  int idx, int *len, bool *more)
@@ -134,7 +185,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	rx_token_id = FIELD_GET(RRO_RXDMAD_DATA2_RX_TOKEN_ID_MASK, data2);
  	t = mt76_rx_token_release(dev, rx_token_id);
  	if (!t)
-@@ -490,7 +566,7 @@
+@@ -490,7 +562,7 @@
  
  	buf = t->ptr;
  	ind_reason = FIELD_GET(RRO_RXDMAD_DATA2_IND_REASON_MASK, data2);
@@ -143,7 +194,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	    ind_reason == MT_DMA_WED_IND_REASON_OLDPKT) {
  		mt76_put_page_pool_buf(buf, false);
  		buf = ERR_PTR(-EAGAIN);
-@@ -513,7 +589,7 @@
+@@ -513,7 +585,7 @@
  	void *buf = e->buf;
  
  	if (mt76_queue_is_wed_rro_rxdmad_c(q) && !flush)
@@ -152,7 +203,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	if (mt76_queue_is_wed_rro(q))
  		goto done;
-@@ -686,7 +762,7 @@
+@@ -686,7 +758,7 @@
  		goto free_skb;
  
  	/* TODO: Take into account unlinear skbs */
@@ -161,7 +212,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		goto free_skb;
  
  	t = mt76_get_txwi(dev);
-@@ -738,7 +814,7 @@
+@@ -738,7 +810,7 @@
  	if (ret < 0)
  		goto unmap;
  
@@ -170,14 +221,14 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		return mt76_npu_dma_add_buf(phy, q, skb, &tx_info.buf[1], txwi);
  
  	return mt76_dma_add_buf(dev, q, tx_info.buf, tx_info.nbuf,
-@@ -850,8 +926,13 @@
+@@ -850,8 +922,13 @@
  	else
  		size = sizeof(struct mt76_desc);
  
 -	q->desc = dmam_alloc_coherent(dev->dma_dev, q->ndesc * size,
 -				      &q->desc_dma, GFP_KERNEL);
 +	q->desc = mt76_dma_alloc_coherent(dev, q->ndesc * size,
-+					&q->desc_dma, GFP_KERNEL);
++					  &q->desc_dma, GFP_KERNEL);
 +	if (IS_ERR(q->desc)) {
 +		ret = PTR_ERR(q->desc);
 +		q->desc = NULL;
@@ -186,7 +237,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	if (!q->desc)
  		return -ENOMEM;
  
-@@ -906,12 +987,8 @@
+@@ -906,12 +983,8 @@
  		if (!buf)
  			break;
  
@@ -201,7 +252,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  			continue;
  
  		if (!mt76_queue_is_wed_rro_rxdmad_c(q) &&
-@@ -1016,9 +1093,15 @@
+@@ -1016,9 +1089,15 @@
  	}
  
  	while (done < budget) {
@@ -217,20 +268,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		if (check_ddone) {
  			if (q->tail == dma_idx)
  				dma_idx = mt76_dma_read_dma_idx(q, q->tail);
-@@ -1192,9 +1275,12 @@
- }
- EXPORT_SYMBOL_GPL(mt76_dma_attach);
- 
-+
- void mt76_dma_cleanup(struct mt76_dev *dev)
- {
- 	int i;
-+
-+
- 
- 	mt76_worker_disable(&dev->tx_worker);
- 	napi_disable(&dev->tx_napi);
-@@ -1231,6 +1317,7 @@
+@@ -1231,6 +1310,7 @@
  
  	mt76_free_pending_txwi(dev);
  	mt76_free_pending_rxwi(dev);
@@ -240,13 +278,10 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  }
 --- a/dma.h
 +++ b/dma.h
-@@ -48,9 +48,49 @@
+@@ -48,9 +48,46 @@
  #define MT_FCE_INFO_LEN			4
  #define MT_RX_RXWI_LEN			32
  
-+
-+
-+
 +static inline int native_rx_band(struct mt76_queue *q)
 +{
 +	if (!q->dev || !an7552_npu_active(q->dev->mmio.an7552) ||
@@ -290,19 +325,19 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  #if IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED)
  	if (q->flags & MT_QFLAG_WED) {
  		*val = mtk_wed_device_reg_read(q->wed, q->wed_regs + offset);
-@@ -62,6 +102,11 @@
+@@ -62,6 +99,11 @@
  	if (q->flags & MT_QFLAG_NPU) {
  		struct airoha_npu *npu;
  
 +		if (mt76_chip(q->dev) == 0x7992 && an7552_npu_active(q->dev->mmio.an7552)) {
 +			*val = an7552_npu_tx_read(q->dev->mmio.an7552,
-+				FIELD_GET(MT_QFLAG_WED_RING, q->flags), offset);
++						  FIELD_GET(MT_QFLAG_WED_RING, q->flags), offset);
 +			return true;
 +		}
  		*val = 0;
  		rcu_read_lock();
  		npu = rcu_dereference(q->dev->mmio.npu);
-@@ -79,6 +124,18 @@
+@@ -79,6 +121,18 @@
  static inline bool
  mt76_dma_handle_write(struct mt76_queue *q, u32 offset, u32 val)
  {
@@ -321,13 +356,13 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  #if IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED)
  	if (q->flags & MT_QFLAG_WED) {
  		mtk_wed_device_reg_write(q->wed, q->wed_regs + offset, val);
-@@ -90,6 +147,11 @@
+@@ -90,6 +144,11 @@
  	if (q->flags & MT_QFLAG_NPU) {
  		struct airoha_npu *npu;
  
 +		if (mt76_chip(q->dev) == 0x7992 && an7552_npu_active(q->dev->mmio.an7552)) {
 +			an7552_npu_tx_write(q->dev->mmio.an7552,
-+				FIELD_GET(MT_QFLAG_WED_RING, q->flags), offset, val);
++					    FIELD_GET(MT_QFLAG_WED_RING, q->flags), offset, val);
 +			return true;
 +		}
  		rcu_read_lock();
@@ -361,37 +396,35 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	WARN_ON(mt76_worker_setup(hw, &dev->tx_worker, NULL, "tx"));
  	set_bit(MT76_STATE_REGISTERED, &phy->state);
-@@ -1194,19 +1200,23 @@
+@@ -1194,19 +1200,18 @@
  }
  EXPORT_SYMBOL_GPL(mt76_get_survey);
  
 -void mt76_wcid_key_setup(struct mt76_dev *dev, struct mt76_wcid *wcid,
 -			 struct ieee80211_key_conf *key)
-+
 +int mt76_wcid_key_setup_pn(struct mt76_dev *dev, struct mt76_wcid *wcid,
-+			   struct ieee80211_key_conf *key, const u8 *pn)
++			   struct ieee80211_key_conf *key, const u8 *pn,
++			   u32 domain, bool prepare)
  {
  	struct ieee80211_key_seq seq;
 -	int i;
--
 +	int i, ret;
-+
-+	ret = an7552_npu_pn_key(dev->mmio.an7552, wcid->idx, 0, NULL, false);
+ 
  	wcid->rx_check_pn = false;
-+	if (ret && ret != -EOPNOTSUPP)
-+		return ret;
- 
- 	if (!key)
+-
+-	if (!key)
 -		return;
-+		return 0;
- 
- 	if (key->cipher != WLAN_CIPHER_SUITE_CCMP)
+-
+-	if (key->cipher != WLAN_CIPHER_SUITE_CCMP)
 -		return;
-+		return 0;
++	if (!key || (key->cipher != WLAN_CIPHER_SUITE_CCMP &&
++		     (!dev->mmio.an7552 || !mt76_npu_cipher_supported(key->cipher))))
++		return an7552_npu_pn_key(dev->mmio.an7552, wcid->idx,
++					  0, NULL, false, 0, false);
  
  	wcid->rx_check_pn = true;
  
-@@ -1219,7 +1229,22 @@
+@@ -1219,7 +1224,22 @@
  	/* robust management frame */
  	ieee80211_get_key_rx_seq(key, -1, &seq);
  	memcpy(wcid->rx_key_pn[i], seq.ccmp.pn, sizeof(seq.ccmp.pn));
@@ -403,7 +436,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +				memcpy(wcid->rx_key_pn[i], pn + i * 6, 6);
 +	}
 +	ret = an7552_npu_pn_key(dev->mmio.an7552, wcid->idx, key->keyidx,
-+				&wcid->rx_key_pn[0][0], true);
++				&wcid->rx_key_pn[0][0], true, domain, prepare);
 +	return ret == -EOPNOTSUPP ? 0 : ret;
 +}
 +EXPORT_SYMBOL(mt76_wcid_key_setup_pn);
@@ -411,11 +444,11 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +void mt76_wcid_key_setup(struct mt76_dev *dev, struct mt76_wcid *wcid,
 +			 struct ieee80211_key_conf *key)
 +{
-+	mt76_wcid_key_setup_pn(dev, wcid, key, NULL);
++	mt76_wcid_key_setup_pn(dev, wcid, key, NULL, 0, false);
  }
  EXPORT_SYMBOL(mt76_wcid_key_setup);
  
-@@ -1311,7 +1336,7 @@
+@@ -1311,7 +1331,7 @@
  }
  
  static void
@@ -424,7 +457,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  {
  	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
  	struct mt76_wcid *wcid = status->wcid;
-@@ -1327,6 +1352,11 @@
+@@ -1327,6 +1347,11 @@
  
  	if (!wcid || !wcid->rx_check_pn)
  		return;
@@ -436,7 +469,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	security_idx = status->qos_ctl & IEEE80211_QOS_CTL_TID_MASK;
  	if (status->flag & RX_FLAG_8023)
-@@ -1355,8 +1385,11 @@
+@@ -1355,8 +1380,11 @@
  
  skip_hdr_check:
  	BUILD_BUG_ON(sizeof(status->iv) != sizeof(wcid->rx_key_pn[0]));
@@ -450,7 +483,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	if (ret <= 0) {
  		status->flag |= RX_FLAG_ONLY_MONITOR;
  		return;
-@@ -1539,7 +1572,7 @@
+@@ -1539,7 +1567,7 @@
  	while ((skb = __skb_dequeue(frames)) != NULL) {
  		struct sk_buff *nskb = skb_shinfo(skb)->frag_list;
  
@@ -459,7 +492,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		skb_shinfo(skb)->frag_list = NULL;
  		mt76_rx_convert(dev, skb, &hw, &sta);
  		ieee80211_rx_list(hw, sta, skb, &list);
-@@ -1578,7 +1611,8 @@
+@@ -1578,7 +1606,8 @@
  	while ((skb = __skb_dequeue(&dev->rx_skb[q])) != NULL) {
  		mt76_check_sta(dev, skb);
  		if (mtk_wed_device_active(&dev->mmio.wed) ||
@@ -469,6 +502,16 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  			__skb_queue_tail(&frames, skb);
  		else
  			mt76_rx_aggr_reorder(skb, &frames);
+@@ -1741,6 +1770,9 @@
+ 	struct ieee80211_hw *hw;
+ 	struct sk_buff_head list;
+ 	struct sk_buff *skb;
++
++	/* Revoke and release this link's replay-domain reference before reuse. */
++	mt76_wcid_key_setup_pn(dev, wcid, NULL, NULL, 0, false);
+ 
+ 	mt76_tx_status_lock(dev, &list);
+ 	mt76_tx_status_skb_get(dev, wcid, -1, &list);
 --- a/mt76.h
 +++ b/mt76.h
 @@ -7,6 +7,7 @@
@@ -495,25 +538,68 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	u8 qos_ctl;
  	u16 seqno;
  
-@@ -1327,6 +1330,8 @@
+@@ -1209,7 +1212,6 @@
+ #define mt76_wr_rp(dev, ...)	(dev)->mt76.bus->wr_rp(&((dev)->mt76), __VA_ARGS__)
+ #define mt76_rd_rp(dev, ...)	(dev)->mt76.bus->rd_rp(&((dev)->mt76), __VA_ARGS__)
+ 
+-
+ #define mt76_mcu_restart(dev, ...)	(dev)->mt76.mcu_ops->mcu_restart(&((dev)->mt76))
+ 
+ #define mt76_set(dev, offset, val)	mt76_rmw(dev, offset, 0, val)
+@@ -1298,7 +1300,6 @@
+ 	for (i = 0; i < ARRAY_SIZE((dev)->q_rx); i++)	\
+ 		if ((dev)->q_rx[i].ndesc)
+ 
+-
+ #define mt76_dereference(p, dev) \
+ 	rcu_dereference_protected(p, lockdep_is_held(&(dev)->mutex))
+ 
+@@ -1327,6 +1328,8 @@
  int mt76_register_device(struct mt76_dev *dev, bool vht,
  			 struct ieee80211_rate *rates, int n_rates);
  void mt76_unregister_device(struct mt76_dev *dev);
 +void *mt76_dma_alloc_coherent(struct mt76_dev *dev, size_t size,
-+			     dma_addr_t *dma_addr, gfp_t gfp);
++			      dma_addr_t *dma_addr, gfp_t gfp);
  void mt76_free_device(struct mt76_dev *dev);
  void mt76_reset_device(struct mt76_dev *dev);
  void mt76_unregister_phy(struct mt76_phy *phy);
-@@ -1575,6 +1580,8 @@
+@@ -1573,8 +1576,24 @@
+ 		       u16 ssn, u16 size);
+ void mt76_rx_aggr_stop(struct mt76_dev *dev, struct mt76_wcid *wcid, u8 tid);
  
++static inline bool mt76_npu_cipher_supported(u32 cipher)
++{
++	switch (cipher) {
++	case WLAN_CIPHER_SUITE_CCMP:
++	case WLAN_CIPHER_SUITE_CCMP_256:
++	case WLAN_CIPHER_SUITE_GCMP:
++	case WLAN_CIPHER_SUITE_GCMP_256:
++		return true;
++	default:
++		return false;
++	}
++}
++
  void mt76_wcid_key_setup(struct mt76_dev *dev, struct mt76_wcid *wcid,
  			 struct ieee80211_key_conf *key);
 +int mt76_wcid_key_setup_pn(struct mt76_dev *dev, struct mt76_wcid *wcid,
-+			   struct ieee80211_key_conf *key, const u8 *pn);
++			   struct ieee80211_key_conf *key, const u8 *pn,
++			   u32 domain, bool prepare);
  
  void mt76_tx_status_lock(struct mt76_dev *dev, struct sk_buff_head *list)
  			 __acquires(&dev->status_lock);
-@@ -1681,6 +1688,7 @@
+@@ -1671,8 +1690,9 @@
+ int mt76_testmode_alloc_skb(struct mt76_phy *phy, u32 len);
+ 
+ #ifdef CONFIG_MT76_NPU
++void mt76_npu_flush_station(struct mt76_dev *dev, u16 wcid, u8 band);
+ void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
+-			u32 info);
++			u32 info, u16 domain);
+ int mt76_npu_dma_add_buf(struct mt76_phy *phy, struct mt76_queue *q,
+ 			 struct sk_buff *skb, struct mt76_queue_buf *buf,
+ 			 void *txwi_ptr);
+@@ -1681,6 +1701,7 @@
  void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q);
  void mt76_npu_disable_irqs(struct mt76_dev *dev);
  int mt76_npu_init(struct mt76_dev *dev, phys_addr_t phy_addr, int type);
@@ -521,12 +607,24 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  void mt76_npu_deinit(struct mt76_dev *dev);
  void mt76_npu_queue_setup(struct mt76_dev *dev, struct mt76_queue *q);
  void mt76_npu_txdesc_cleanup(struct mt76_queue *q, int index);
-@@ -1726,6 +1734,12 @@
+@@ -1691,8 +1712,12 @@
+ 			    u32 direction, u32 i_count_addr,
+ 			    u32 o_status_addr, u32 o_count_addr);
+ #else
++static inline void mt76_npu_flush_station(struct mt76_dev *dev, u16 wcid, u8 band)
++{
++}
++
+ static inline void mt76_npu_check_ppe(struct mt76_dev *dev,
+-				      struct sk_buff *skb, u32 info)
++				      struct sk_buff *skb, u32 info, u16 domain)
+ {
+ }
+ 
+@@ -1726,6 +1751,10 @@
  	return 0;
  }
  
-+static inline }
-+
 +static inline void mt76_npu_stop(struct mt76_dev *dev)
 +{
 +}
@@ -534,12 +632,11 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  static inline void mt76_npu_deinit(struct mt76_dev *dev)
  {
  }
-@@ -1760,6 +1774,13 @@
+@@ -1760,6 +1789,12 @@
  static inline bool mt76_npu_device_active(struct mt76_dev *dev)
  {
  	return mt76_is_mmio(dev) && !!rcu_access_pointer(dev->mmio.npu);
 +}
-+
 +
 +static inline bool mt76_npu_tx_active(struct mt76_dev *dev)
 +{
@@ -548,6 +645,16 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  }
  
  static inline bool mt76_ppe_device_active(struct mt76_dev *dev)
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1310,6 +1310,7 @@
+ 	MCU_EXT_CMD_GROUP_PRE_CAL_INFO = 0xab,
+ 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
+ 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
++	MCU_EXT_CMD_SET_QOS_MAP = 0xb4,
+ 	MCU_EXT_CMD_WF_RF_PIN_CTRL = 0xbd,
+ };
+ 
 --- a/mt7996/dma.c
 +++ b/mt7996/dma.c
 @@ -23,7 +23,7 @@
@@ -575,7 +682,6 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  }
  
 -void mt7996_dma_rro_start(struct mt7996_dev *dev)
-+
 +static void native_rro_notify(void *context)
 +{
 +	struct mt76_dev *dev = context;
@@ -598,9 +704,9 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +	 */
 +	if (an7552_npu_active(dev->mt76.mmio.an7552)) {
 +		an7552_npu_txfree_write(dev->mt76.mmio.an7552, 0, 15,
-+			dev->mt76.q_rx[MT_RXQ_MAIN_WA].head);
++					dev->mt76.q_rx[MT_RXQ_MAIN_WA].head);
 +		an7552_npu_txfree_write(dev->mt76.mmio.an7552, 1, 15,
-+			dev->mt76.q_rx[MT_RXQ_BAND1_WA].head);
++					dev->mt76.q_rx[MT_RXQ_BAND1_WA].head);
 +	}
 +
 +	if (an7552_npu_active(dev->mt76.mmio.an7552) &&
@@ -608,15 +714,16 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +		struct mt76_queue *q = &dev->mt76.q_rx[MT_RXQ_RRO_RXDMAD_C];
 +		struct mt76_queue *data0 = &dev->mt76.q_rx[MT_RXQ_RRO_BAND0];
 +		struct mt76_queue *data1 = &dev->mt76.q_rx[MT_RXQ_RRO_BAND1];
++		u32 regs0 = 0x20000000 + ((void __iomem *)data0->regs - dev->mt76.mmio.regs);
++		u32 regs1 = 0x20000000 + ((void __iomem *)data1->regs - dev->mt76.mmio.regs);
 +
 +		ret = an7552_npu_rro_setup(dev->mt76.mmio.an7552, q->desc_dma, q->ndesc,
-+			data0->desc_dma, data1->desc_dma,
-+			0x20000000 + ((void __iomem *)data0->regs - dev->mt76.mmio.regs),
-+			0x20000000 + ((void __iomem *)data1->regs - dev->mt76.mmio.regs),
-+			dev->wed_rro.emi_rings_cpu.phy_addr,
-+			(le32_to_cpu(data0->desc[0].ctrl) >> 16) & 16383,
-+			(le32_to_cpu(data1->desc[0].ctrl) >> 16) & 16383,
-+			native_rro_notify, &dev->mt76);
++					   data0->desc_dma, data1->desc_dma,
++					   regs0, regs1,
++					   dev->wed_rro.emi_rings_cpu.phy_addr,
++					   (le32_to_cpu(data0->desc[0].ctrl) >> 16) & 16383,
++					   (le32_to_cpu(data1->desc[0].ctrl) >> 16) & 16383,
++					   native_rro_notify, &dev->mt76);
 +		if (ret)
 +			return ret;
 +	}
@@ -671,7 +778,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		dev->mt76.q_rx[MT_RXQ_MAIN_WA].flags = MT_NPU_Q_TXFREE(0);
  	}
  
-@@ -960,12 +1020,18 @@
+@@ -960,12 +1020,20 @@
  	return 0;
  }
  
@@ -685,6 +792,8 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +	int i, ret;
 +
 +	an7552_npu_stop(dev->mt76.mmio.an7552);
++	if (!an7552_npu_recovery_ready(dev->mt76.mmio.an7552))
++		return -EIO;
 +	if (force) {
 +		mt7996_mac_save_key_pn(dev);
 +		mt7996_npu_save_pn(dev);
@@ -692,7 +801,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	mt76_clear(dev, MT_WFDMA0_GLO_CFG,
  		   MT_WFDMA0_GLO_CFG_TX_DMA_EN |
-@@ -1011,6 +1077,10 @@
+@@ -1011,6 +1079,10 @@
  	mt76_npu_disable_irqs(&dev->mt76);
  	mt7996_dma_disable(dev, force);
  	mt76_wed_dma_reset(&dev->mt76);
@@ -703,7 +812,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	/* reset hw queues */
  	for (i = 0; i < __MT_TXQ_MAX; i++) {
-@@ -1027,6 +1097,11 @@
+@@ -1027,6 +1099,11 @@
  	mt76_for_each_q_rx(&dev->mt76, i) {
  		struct mt76_queue *q = &dev->mt76.q_rx[i];
  
@@ -715,7 +824,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
  			if (mt76_queue_is_wed_rro(q) ||
  			    mt76_queue_is_wed_tx_free(q)) {
-@@ -1041,6 +1116,9 @@
+@@ -1041,6 +1118,9 @@
  	mt76_tx_status_check(&dev->mt76, true);
  
  	mt76_for_each_q_rx(&dev->mt76, i) {
@@ -725,14 +834,12 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		if (mtk_wed_device_active(&dev->mt76.mmio.wed) && force &&
  		    (mt76_queue_is_wed_rro_ind(&dev->mt76.q_rx[i]) ||
  		     mt76_queue_is_wed_rro_msdu_pg(&dev->mt76.q_rx[i])))
-@@ -1050,11 +1128,19 @@
+@@ -1050,11 +1130,18 @@
  	}
  
  	mt7996_dma_enable(dev, !force);
--}
 +	return 0;
-+}
-+
+ }
  
  void mt7996_dma_cleanup(struct mt7996_dev *dev)
  {
@@ -841,15 +948,15 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  }
 --- a/mt7996/mac.c
 +++ b/mt7996/mac.c
-@@ -10,6 +10,105 @@
+@@ -10,6 +10,104 @@
  #include "../dma.h"
  #include "mac.h"
  #include "mcu.h"
 +
 +static void mt7996_sync_key_pn(struct ieee80211_hw *hw,
-+			      struct ieee80211_vif *vif,
-+			      struct ieee80211_sta *sta,
-+			      struct ieee80211_key_conf *key, void *data)
++			       struct ieee80211_vif *vif,
++			       struct ieee80211_sta *sta,
++			       struct ieee80211_key_conf *key, void *data)
 +{
 +	struct mt7996_dev *dev = data;
 +	struct mt7996_sta *msta = sta ? (void *)sta->drv_priv : NULL;
@@ -899,7 +1006,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +		pn = (u64)(high & 0xffff) << 32 | low;
 +		saved = max(saved, pn);
 +		dev_dbg(dev->mt76.dev, "TX replay snapshot WCID %u PN %llu\n",
-+			 wcid->idx, pn);
++			wcid->idx, pn);
 +	}
 +
 +	atomic64_set(&key->tx_pn, saved);
@@ -922,7 +1029,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +	mt76_wr(dev, MT_UWTBL_WDUCR, selector);
 +	restored = (u64)(high & 0xffff) << 32 | low;
 +	dev_dbg(dev->mt76.dev, "TX replay restored WCID %u PN %llu readback %llu\n",
-+		 wcid->idx, pn, restored);
++		wcid->idx, pn, restored);
 +
 +	return restored >= pn ? 0 : -EIO;
 +}
@@ -943,11 +1050,10 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +	ieee80211_iter_keys_rcu(mt76_hw(dev), NULL, mt7996_sync_key_pn, dev);
 +	rcu_read_unlock();
 +}
-+
  
  #define to_rssi(field, rcpi)	((FIELD_GET(field, rcpi) - 220) / 2)
  
-@@ -115,48 +214,53 @@
+@@ -115,48 +213,53 @@
  		spin_unlock_bh(&dev->mt76.sta_poll_lock);
  
  		idx = wcid->idx;
@@ -1038,7 +1144,55 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		}
  
  		/* get signal strength of resp frames (CTS/BA/ACK) */
-@@ -454,6 +558,7 @@
+@@ -385,26 +488,38 @@
+ }
+ 
+ static void
+-mt7996_wed_check_ppe(struct mt7996_dev *dev, struct mt76_queue *q,
+-		     struct mt7996_sta *msta, struct sk_buff *skb,
+-		     u32 info)
++mt7996_check_ppe(struct mt7996_dev *dev, struct mt76_queue *q,
++		 struct mt7996_sta *msta, struct sk_buff *skb, u32 info, u16 domain)
+ {
+ 	struct ieee80211_vif *vif;
+ 	struct wireless_dev *wdev;
+ 
+ 	if (!msta || !msta->vif)
+-		return;
+-
+-	if (!mt76_queue_is_wed_rx(q))
+-		return;
+-
+-	if (!(info & MT_DMA_INFO_PPE_VLD))
+ 		return;
+ 
+ 	vif = container_of((void *)msta->vif, struct ieee80211_vif,
+ 			   drv_priv);
+ 	wdev = ieee80211_vif_to_wdev(vif);
++	if (!wdev || !wdev->netdev)
++		return;
++	if (dev->mt76.mmio.an7552) {
++		struct mt7996_sta_link *link;
++		struct mt76_wcid *wcid;
++
++		if (!domain || domain > ARRAY_SIZE(dev->mt76.wcid))
++			return;
++		wcid = rcu_dereference(dev->mt76.wcid[domain - 1]);
++		if (!wcid || !wcid->sta)
++			return;
++		link = container_of(wcid, struct mt7996_sta_link, wcid);
++		if (link->sta != msta || !READ_ONCE(link->npu_authorized))
++			return;
++	}
+ 	skb->dev = wdev->netdev;
++
++	mt76_npu_check_ppe(&dev->mt76, skb, info, domain);
++	if (!mt76_queue_is_wed_rx(q) || !(info & MT_DMA_INFO_PPE_VLD))
++		return;
+ 
+ 	mtk_wed_device_ppe_check(&dev->mt76.mmio.wed, skb,
+ 				 FIELD_GET(MT_DMA_PPE_CPU_REASON, info),
+@@ -454,6 +569,7 @@
  
  	phy = mphy->priv;
  	status->phy_idx = mphy->band_idx;
@@ -1046,30 +1200,34 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	if (!test_bit(MT76_STATE_RUNNING, &mphy->state))
  		return -EINVAL;
-@@ -707,6 +812,14 @@
- 		}
+@@ -689,9 +805,8 @@
+ 		skb_set_mac_header(skb, (unsigned char *)hdr - skb->data);
+ 	} else {
+ 		status->flag |= RX_FLAG_8023;
+-		mt7996_wed_check_ppe(dev, &dev->mt76.q_rx[q], msta, skb,
+-				     *info);
+-		mt76_npu_check_ppe(&dev->mt76, skb, *info);
++		mt7996_check_ppe(dev, &dev->mt76.q_rx[q], msta, skb, *info,
++				  FIELD_GET(MT_RXD1_NORMAL_WLAN_IDX, rxd1) + 1);
  	}
  
+ 	if (rxv && !(status->flag & RX_FLAG_8023)) {
+@@ -705,6 +820,14 @@
+ 		default:
+ 			break;
+ 		}
++	}
++
 +	/* Source RRO validates aggregate boundaries/PN before splitting delivery. */
 +	if (status->source_pn && hdr_trans && status->amsdu) {
 +		status->amsdu = false;
 +		status->first_amsdu = false;
 +		status->last_amsdu = false;
 +		status->flag |= RX_FLAG_DUP_VALIDATED;
-+	}
-+
+ 	}
+ 
  	if (!status->wcid || !ieee80211_is_data_qos(fc) || hw_aggr)
- 		return 0;
- 
-@@ -1347,6 +1460,7 @@
- 	mt76_put_txwi(mdev, t);
- }
- 
-+
- static void
- mt7996_mac_tx_free(struct mt7996_dev *dev, void *data, int len)
- {
-@@ -1453,6 +1567,10 @@
+@@ -1453,6 +1576,10 @@
  				continue;
  
  			count++;
@@ -1080,7 +1238,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  			txwi = mt76_token_release(mdev, msdu, &wake);
  			if (!txwi)
  				continue;
-@@ -1510,7 +1628,8 @@
+@@ -1510,7 +1637,8 @@
  		}
  	}
  
@@ -1090,7 +1248,15 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		struct ieee80211_sta *sta;
  		u8 tid;
  
-@@ -2313,6 +2432,8 @@
+@@ -2220,7 +2348,6 @@
+ 	struct mt7996_dev *dev = phy->dev;
+ 	unsigned int link_id;
+ 
+-
+ 	switch (vif->type) {
+ 	case NL80211_IFTYPE_MESH_POINT:
+ 	case NL80211_IFTYPE_ADHOC:
+@@ -2313,6 +2440,8 @@
  {
  	struct mt76_dev *mdev = &dev->mt76;
  	struct mt7996_phy *phy;
@@ -1099,13 +1265,15 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	int i, ret;
  
  	if (dev->hif2) {
-@@ -2347,15 +2468,17 @@
+@@ -2347,15 +2476,19 @@
  	}
  	napi_disable(&dev->mt76.tx_napi);
  
 -	/* token reinit */
 +	/* Quiesce every DMA owner before releasing host TX mappings. */
 +	ret = mt7996_dma_reset(dev, true);
++	if (ret && !an7552_npu_recovery_ready(mdev->mmio.an7552))
++		return ret;
  	mt7996_tx_token_put(dev);
  	idr_init(&dev->mt76.token);
 -
@@ -1120,7 +1288,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  			continue;
  
  		if (mdev->q_rx[i].ndesc) {
-@@ -2380,6 +2503,9 @@
+@@ -2380,6 +2513,9 @@
  			mt76_wr(dev, MT_PCIE1_MAC_INT_ENABLE, 0xff);
  	}
  
@@ -1130,7 +1298,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	/* load firmware */
  	ret = mt7996_mcu_init_firmware(dev);
  	if (ret)
-@@ -2409,6 +2535,20 @@
+@@ -2409,6 +2545,20 @@
  			MT_INT_TX_RX_DONE_EXT);
  		mtk_wed_device_start(&dev->mt76.mmio.wed_hif2,
  				     MT_INT_TX_RX_DONE_EXT);
@@ -1151,7 +1319,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	}
  
  	/* set the necessary init items */
-@@ -2433,6 +2573,14 @@
+@@ -2433,6 +2583,14 @@
  	}
  
  out:
@@ -1166,7 +1334,19 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	/* reset done */
  	mt7996_for_each_phy(dev, phy)
  		clear_bit(MT76_RESET, &phy->mt76->state);
-@@ -2551,7 +2699,7 @@
+@@ -2527,6 +2685,11 @@
+ 	for (i = 0; i < 10; i++) {
+ 		if (!mt7996_mac_restart(dev))
+ 			break;
++		if (!an7552_npu_recovery_ready(dev->mt76.mmio.an7552)) {
++			dev_err(dev->mt76.dev, "NPU DMA still owned; radio remains stopped\n");
++			mutex_unlock(&dev->mt76.mutex);
++			return;
++		}
+ 	}
+ 
+ 	if (i == 10)
+@@ -2576,10 +2739,14 @@
  	struct ieee80211_hw *hw;
  	struct mt7996_dev *dev;
  	struct mt7996_phy *phy;
@@ -1175,7 +1355,23 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	dev = container_of(work, struct mt7996_dev, reset_work);
  	hw = mt76_hw(dev);
-@@ -2593,6 +2741,7 @@
++
++	/* A failed ownership handshake deliberately leaves workers parked. */
++	if (dev->recovery.hw_full_reset)
++		return;
+ 
+ 	/* chip full reset */
+ 	if (dev->recovery.restart) {
+@@ -2593,6 +2760,8 @@
+ 			dev->recovery.wm_reset_count++;
+ 
+ 		mt7996_mac_full_reset(dev);
++		if (dev->recovery.hw_full_reset)
++			return;
+ 
+ 		/* enable mcu irq */
+ 		mt7996_irq_enable(dev, MT_INT_MCU_CMD);
+@@ -2618,6 +2787,7 @@
  	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
  		mtk_wed_device_stop(&dev->mt76.mmio.wed);
  
@@ -1183,7 +1379,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	mt7996_npu_hw_stop(dev);
  	ieee80211_stop_queues(mt76_hw(dev));
  
-@@ -2630,7 +2779,7 @@
+@@ -2655,7 +2825,7 @@
  	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
  
  	if (mt7996_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE)) {
@@ -1192,7 +1388,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  		mt7996_tx_token_put(dev);
  		idr_init(&dev->mt76.token);
-@@ -2666,6 +2815,14 @@
+@@ -2691,6 +2861,14 @@
  	}
  
  	__mt7996_npu_hw_init(dev);
@@ -1207,7 +1403,23 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
  	mt7996_for_each_phy(dev, phy)
-@@ -3014,7 +3171,10 @@
+@@ -3032,6 +3210,15 @@
+ 
+ 	mutex_lock(&mphy->dev->mutex);
+ 
++	if (!an7552_npu_healthy(mphy->dev->mmio.an7552)) {
++		if (!phy->dev->recovery.restart) {
++			phy->dev->recovery.restart = true;
++			queue_work(mphy->dev->wq, &phy->dev->reset_work);
++		}
++		mutex_unlock(&mphy->dev->mutex);
++		return;
++	}
++
+ 	mt76_update_survey(mphy);
+ 	if (++mphy->mac_work_count == 5) {
+ 		mphy->mac_work_count = 0;
+@@ -3039,7 +3226,10 @@
  		mt7996_mac_update_stats(phy);
  
  		mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_RATE);
@@ -1221,7 +1433,15 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		}
 --- a/mt7996/main.c
 +++ b/mt7996/main.c
-@@ -182,6 +182,34 @@
+@@ -3,6 +3,7 @@
+  * Copyright (C) 2022 MediaTek Inc.
+  */
+ 
++#include <linux/ip.h>
+ #include "mt7996.h"
+ #include "mcu.h"
+ #include "mac.h"
+@@ -182,6 +183,189 @@
  	}
  }
  
@@ -1238,11 +1458,11 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +		if (!link || !key || key->saved)
 +			continue;
 +		key->error = an7552_npu_pn_get(dev->mt76.mmio.an7552,
-+					     link->wcid.idx, key->keyidx,
-+					     &key->pn[0][0]);
++					       link->wcid.idx, key->keyidx,
++					       &key->pn[0][0]);
 +		key->saved = true;
 +		dev_dbg(dev->mt76.dev, "NPU replay snapshot WCID %u status %d\n",
-+			 link->wcid.idx, key->error);
++			link->wcid.idx, key->error);
 +	}
 +}
 +
@@ -1250,13 +1470,168 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +{
 +	if (dev->mt76.mmio.an7552)
 +		ieee80211_iterate_stations_atomic(mt76_hw(dev),
-+						 mt7996_npu_save_pn_iter, dev);
++						  mt7996_npu_save_pn_iter, dev);
++}
++
++/* Prepare replay snapshots before any link loses its old key state. */
++static int mt7996_npu_prepare_key(struct mt7996_dev *dev,
++				  struct ieee80211_sta *sta, unsigned int link_id,
++				  enum set_key_cmd cmd,
++				  struct ieee80211_key_conf *key)
++{
++	struct mt7996_sta *msta = (void *)sta->drv_priv;
++	struct mt7996_sta_link *msta_link;
++	struct mt7996_npu_key *npu_key;
++	int err;
++
++	msta_link = mt7996_sta_link_protected(dev, msta, link_id);
++	if (!msta_link)
++		return -ENOENT;
++	if (cmd == DISABLE_KEY || !mt76_npu_cipher_supported(key->cipher)) {
++		kfree_sensitive(msta->npu_key[link_id]);
++		msta->npu_key[link_id] = NULL;
++	} else {
++		if (key->keylen > sizeof(npu_key->key))
++			return -EINVAL;
++		npu_key = msta->npu_key[link_id];
++		if (!npu_key) {
++			npu_key = kzalloc(sizeof(*npu_key), GFP_KERNEL);
++			if (!npu_key)
++				return -ENOMEM;
++			msta->npu_key[link_id] = npu_key;
++		} else if (npu_key->keyidx == key->keyidx &&
++			   npu_key->cipher == key->cipher &&
++			   npu_key->keylen == key->keylen &&
++			   !memcmp(npu_key->key, key->key,
++				   key->keylen)) {
++			if (!npu_key->saved) {
++				err = an7552_npu_pn_get(dev->mt76.mmio.an7552,
++							msta_link->wcid.idx, key->keyidx,
++							&npu_key->pn[0][0]);
++				npu_key->error = err;
++				npu_key->saved = true;
++			}
++			if (npu_key->error)
++				return npu_key->error;
++		} else {
++			npu_key->saved = false;
++			npu_key->error = 0;
++		}
++		memzero_explicit(npu_key->key, sizeof(npu_key->key));
++		memcpy(npu_key->key, key->key, key->keylen);
++		npu_key->cipher = key->cipher;
++		npu_key->keylen = key->keylen;
++		npu_key->keyidx = key->keyidx;
++	}
++	return 0;
++}
++
++static int mt7996_npu_key_links(struct mt7996_dev *dev,
++				struct ieee80211_vif *vif,
++				struct ieee80211_sta *sta, unsigned long links,
++				struct ieee80211_key_conf *key, bool enable)
++{
++	struct mt7996_sta *msta = (void *)sta->drv_priv;
++	unsigned int id;
++	int err = 0;
++
++	for_each_set_bit(id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		struct mt7996_sta_link *sl;
++		struct mt7996_vif_link *vl;
++		int ret;
++
++		sl = mt7996_sta_link_protected(dev, msta, id);
++		if (!sl)
++			continue;
++		if (enable) {
++			if (!sl->npu_authorized)
++				continue;
++			vl = mt7996_vif_link(dev, vif, id);
++			if (!vl || !link_sta_dereference_protected(sta, id)) {
++				err = -ENOENT;
++				break;
++			}
++			ret = an7552_npu_station_set(dev->mt76.mmio.an7552,
++						     sl->wcid.idx, vl->mt76.band_idx,
++						     vl->mt76.idx, sta->addr, true,
++						     sta->mlo,
++						     mt76_npu_cipher_supported(key->cipher));
++		} else {
++			ret = an7552_npu_station_set(dev->mt76.mmio.an7552,
++						     sl->wcid.idx, sl->wcid.phy_idx,
++						     0, NULL, false, false, false);
++		}
++		if (ret && !err)
++			err = ret;
++		/* Revocation must visit every link even if a handshake fails. */
++		if (ret && enable)
++			break;
++	}
++	return err;
++}
++
++/* Only a peer's identical installed key may share its replay domain. */
++static u32 mt7996_npu_key_domain(struct mt7996_dev *dev,
++				struct ieee80211_sta *sta, unsigned int link_id,
++				struct ieee80211_key_conf *key)
++{
++	struct mt7996_sta *msta;
++	unsigned int id;
++
++	if (!sta || !dev->mt76.mmio.an7552 ||
++	    !(key->flags & IEEE80211_KEY_FLAG_PAIRWISE))
++		return 0;
++	msta = (void *)sta->drv_priv;
++	for (id = 0; id < IEEE80211_MLD_MAX_NUM_LINKS; id++) {
++		struct mt7996_sta_link *link;
++		struct ieee80211_key_conf *installed;
++		u32 domain;
++
++		if (id == link_id)
++			continue;
++		link = mt7996_sta_link_protected(dev, msta, id);
++		if (!link || !link->wcid.sta)
++			continue;
++		installed = link->data_key;
++		if (!installed || installed->cipher != key->cipher ||
++		    installed->keyidx != key->keyidx ||
++		    installed->keylen != key->keylen ||
++		    memcmp(installed->key, key->key, key->keylen))
++			continue;
++		domain = an7552_npu_pn_domain(dev->mt76.mmio.an7552,
++					      link->wcid.idx, key->keyidx);
++		if (domain)
++			return domain;
++	}
++	return 0;
++}
++
++static int mt7996_npu_commit_key(struct mt7996_dev *dev,
++				 struct ieee80211_sta *sta, unsigned long changed,
++				 struct ieee80211_key_conf *key)
++{
++	struct mt7996_sta *msta = (void *)sta->drv_priv;
++	u16 wcids[IEEE80211_MLD_MAX_NUM_LINKS];
++	unsigned int id, count = 0;
++
++	if (!changed || !mt76_npu_cipher_supported(key->cipher))
++		return 0;
++	for_each_set_bit(id, &changed, IEEE80211_MLD_MAX_NUM_LINKS) {
++		struct mt7996_sta_link *link;
++
++		link = mt7996_sta_link_protected(dev, msta, id);
++		if (!link || link->data_key != key)
++			return -ENOENT;
++		wcids[count++] = link->wcid.idx;
++	}
++	return an7552_npu_pn_commit(dev->mt76.mmio.an7552, wcids,
++				    count, key->keyidx);
 +}
 +
  static int
  mt7996_set_hw_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
  		  struct ieee80211_vif *vif, struct ieee80211_sta *sta,
-@@ -191,6 +219,7 @@
+@@ -191,6 +375,7 @@
  	struct ieee80211_bss_conf *link_conf;
  	struct mt7996_sta_link *msta_link;
  	struct mt7996_vif_link *link;
@@ -1264,7 +1639,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	int idx = key->keyidx;
  	u8 *wcid_keyidx;
  	bool is_bigtk;
-@@ -215,6 +244,61 @@
+@@ -215,6 +400,24 @@
  			return -EOPNOTSUPP;
  	} else {
  		msta_link = &link->msta_link;
@@ -1285,60 +1660,38 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +	    key->flags & IEEE80211_KEY_FLAG_PAIRWISE) {
 +		struct mt7996_sta *msta = (void *)sta->drv_priv;
 +
-+		if (cmd == DISABLE_KEY || key->cipher != WLAN_CIPHER_SUITE_CCMP) {
-+			kfree_sensitive(msta->npu_key[link_id]);
-+			msta->npu_key[link_id] = NULL;
-+		} else if (key->cipher == WLAN_CIPHER_SUITE_CCMP) {
-+			npu_key = msta->npu_key[link_id];
-+			if (!npu_key) {
-+				npu_key = kzalloc(sizeof(*npu_key), GFP_KERNEL);
-+				if (!npu_key)
-+					return -ENOMEM;
-+				msta->npu_key[link_id] = npu_key;
-+			} else if (npu_key->keyidx == key->keyidx &&
-+				   !memcmp(npu_key->key, key->key,
-+					   sizeof(npu_key->key))) {
-+				if (!npu_key->saved) {
-+					npu_key->error = an7552_npu_pn_get(
-+						dev->mt76.mmio.an7552,
-+						msta_link->wcid.idx, key->keyidx,
-+						&npu_key->pn[0][0]);
-+					npu_key->saved = true;
-+				}
-+				if (npu_key->error)
-+					return npu_key->error;
-+			} else {
-+				npu_key->saved = false;
-+				npu_key->error = 0;
-+			}
-+			memcpy(npu_key->key, key->key, sizeof(npu_key->key));
-+			npu_key->keyidx = key->keyidx;
-+		}
-+	}
-+	/* Keep authorization separate from key eligibility during a rekey. */
-+	if (sta && (key->flags & IEEE80211_KEY_FLAG_PAIRWISE)) {
-+		err = an7552_npu_station_set(dev->mt76.mmio.an7552,
-+					    msta_link->wcid.idx,
-+					    msta_link->wcid.phy_idx,
-+					    0, NULL, false);
-+		if (err)
-+			return err;
++		npu_key = msta->npu_key[link_id];
  	}
  	wcid_keyidx = &msta_link->wcid.hw_key_idx;
  
-@@ -256,11 +340,35 @@
- 	if (cmd != SET_KEY && !is_bigtk)
- 		return 0;
+@@ -252,15 +455,35 @@
+ 	else if (idx == *wcid_keyidx)
+ 		*wcid_keyidx = -1;
  
+-	/* only do remove key for BIGTK */
+-	if (cmd != SET_KEY && !is_bigtk)
++	/* Radio firmware only needs an explicit remove command for BIGTK.
++	 * Host replay-domain references still have to be released for data keys.
++	 */
++	if (cmd != SET_KEY && !is_bigtk) {
++		if (dev->mt76.mmio.an7552 && key->keyidx < 4)
++			return mt76_wcid_key_setup_pn(&dev->mt76, &msta_link->wcid,
++						      NULL, NULL, 0, false);
+ 		return 0;
+-
 -	mt76_wcid_key_setup(&dev->mt76, &msta_link->wcid, key);
++	}
++
 +	err = mt76_wcid_key_setup_pn(&dev->mt76, &msta_link->wcid, key,
-+				    npu_key && npu_key->saved ?
-+				    &npu_key->pn[0][0] : NULL);
++				     npu_key && npu_key->saved ?
++				     &npu_key->pn[0][0] : NULL,
++				     mt7996_npu_key_domain(dev, sta, link_id, key),
++				     sta && (key->flags & IEEE80211_KEY_FLAG_PAIRWISE));
 +	if (err)
 +		return err;
 +	if (npu_key && npu_key->saved)
 +		dev_dbg(dev->mt76.dev, "NPU replay restored WCID %u\n",
-+			 msta_link->wcid.idx);
++			msta_link->wcid.idx);
 +	if (npu_key)
 +		npu_key->saved = false;
  
@@ -1348,31 +1701,158 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +	if (!err && cmd == SET_KEY && key->keyidx < 4 &&
 +	    is_mt7992(&dev->mt76))
 +		msta_link->data_key = key;
-+	if (!err && cmd == SET_KEY && sta && msta_link->npu_authorized &&
-+	    (key->flags & IEEE80211_KEY_FLAG_PAIRWISE)) {
-+		struct ieee80211_link_sta *link_sta;
-+
-+		link_sta = link_sta_dereference_protected(sta, link_id);
-+		if (!link_sta)
-+			return -ENOENT;
-+		err = an7552_npu_station_set(dev->mt76.mmio.an7552,
-+					    msta_link->wcid.idx,
-+					    link->mt76.band_idx, link->mt76.idx,
-+					    link_sta->addr, true);
-+	}
  
  	/* remove and add beacon in order to enable beacon protection */
  	if (cmd == SET_KEY && is_bigtk && link_conf->enable_beacon) {
-@@ -354,6 +462,8 @@
+@@ -359,6 +582,8 @@
  	msta_link->wcid.link_id = link_conf->link_id;
  	msta_link->wcid.link_valid = ieee80211_vif_is_mld(vif);
  	msta_link->wcid.tx_info |= MT_WCID_TX_INFO_SET;
 +	msta_link->data_key = NULL;
-+	msta_link->npu_authorized = false;
++	WRITE_ONCE(msta_link->npu_authorized, false);
  	mt76_wcid_init(&msta_link->wcid, band_idx);
  
  	mt7996_mac_wtbl_update(dev, idx,
-@@ -701,7 +811,7 @@
+@@ -557,6 +782,74 @@
+ 	mt7996_mcu_set_sniffer_mode(phy, enabled);
+ }
+ 
++static int mt7996_npu_build_qos_map(u8 *map, struct cfg80211_qos_map *qos)
++{
++	struct sk_buff *skb;
++	struct iphdr *ip;
++	unsigned int i;
++
++	/* Use cfg80211's classifier, including custom ranges and exceptions,
++	 * instead of maintaining a second interpretation of its DSCP policy.
++	 */
++	skb = alloc_skb(sizeof(*ip), GFP_KERNEL);
++	if (!skb)
++		return -ENOMEM;
++	ip = skb_put_zero(skb, sizeof(*ip));
++	skb_reset_network_header(skb);
++	skb->protocol = htons(ETH_P_IP);
++	ip->version = 4;
++	ip->ihl = 5;
++	for (i = 0; i < 64; i++) {
++		ip->tos = i << 2;
++		map[i] = cfg80211_classify8021d(skb, qos);
++	}
++	kfree_skb(skb);
++	return 0;
++}
++
++static int mt7996_set_qos_map(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			      struct cfg80211_qos_map *qos)
++{
++	struct mt7996_dev *dev = mt7996_hw_dev(hw);
++	struct mt7996_vif *mvif = (void *)vif->drv_priv;
++	unsigned long links = vif->valid_links ?: BIT(0);
++	unsigned int id;
++	u8 map[64];
++	int ret;
++
++	if (!dev->mt76.mmio.an7552)
++		return 0;
++	ret = mt7996_npu_build_qos_map(map, qos);
++	if (ret)
++		return ret;
++	mutex_lock(&dev->mt76.mutex);
++	for_each_set_bit(id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		struct mt7996_vif_link *link = mt7996_vif_link(dev, vif, id);
++
++		if (!link)
++			continue;
++		ret = mt7996_mcu_set_qos_map(dev, link->mt76.idx, map);
++		if (ret)
++			break;
++	}
++	if (!ret) {
++		memcpy(mvif->npu_qos_map, map, sizeof(map));
++	} else {
++		/* Roll back a map which only some radios accepted. If rollback
++		 * fails, leave that BSS ineligible for accelerated steering.
++		 */
++		for_each_set_bit(id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++			struct mt7996_vif_link *link = mt7996_vif_link(dev, vif, id);
++
++			if (link && mt7996_mcu_set_qos_map(dev, link->mt76.idx,
++							   mvif->npu_qos_map))
++				an7552_npu_qos_map(dev->mt76.mmio.an7552, link->mt76.idx, NULL);
++		}
++	}
++	mutex_unlock(&dev->mt76.mutex);
++	return ret;
++}
++
+ static int mt7996_add_interface(struct ieee80211_hw *hw,
+ 				struct ieee80211_vif *vif)
+ {
+@@ -565,6 +858,11 @@
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+ 	int i, err = 0;
+ 
++	if (dev->mt76.mmio.an7552) {
++		err = mt7996_npu_build_qos_map(mvif->npu_qos_map, NULL);
++		if (err)
++			return err;
++	}
+ 	mutex_lock(&dev->mt76.mutex);
+ 
+ 	for (i = 0; i < MT7996_MAX_RADIOS; i++) {
+@@ -695,13 +993,50 @@
+ 	return ret;
+ }
+ 
++static int mt7996_npu_update_routes(struct mt7996_dev *dev,
++				    struct ieee80211_sta *sta)
++{
++	struct mt7996_sta *msta = (void *)sta->drv_priv;
++	struct mt7996_sta_link *primary, *secondary, *link;
++	unsigned int id;
++	int ret = 0;
++
++	if (!dev->mt76.mmio.an7552 || !sta->mlo)
++		return 0;
++	primary = mt7996_sta_link_protected(dev, msta, msta->deflink_id);
++	secondary = mt7996_sta_link_protected(dev, msta, msta->seclink_id);
++	if (!primary || !secondary)
++		return 0;
++	for (id = 0; id < IEEE80211_MLD_MAX_NUM_LINKS; id++) {
++		link = mt7996_sta_link_protected(dev, msta, id);
++		if (!link || !link->npu_authorized)
++			continue;
++		ret = an7552_npu_station_route(dev->mt76.mmio.an7552, link->wcid.idx,
++					       primary->wcid.idx, secondary->wcid.idx);
++		if (ret)
++			break;
++	}
++	if (ret) {
++		for (id = 0; id < IEEE80211_MLD_MAX_NUM_LINKS; id++) {
++			link = mt7996_sta_link_protected(dev, msta, id);
++			if (link)
++				an7552_npu_station_set(dev->mt76.mmio.an7552,
++						       link->wcid.idx, link->wcid.phy_idx,
++						       0, NULL, false, false, false);
++		}
++	}
++	return ret;
++}
++
+ static int mt7996_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 			  struct ieee80211_vif *vif, struct ieee80211_sta *sta,
+ 			  struct ieee80211_key_conf *key)
+ {
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+ 	unsigned int link_id;
+-	unsigned long links;
++	unsigned long links, changed = 0;
++	bool npu_pairwise = sta && dev->mt76.mmio.an7552 &&
++		(key->flags & IEEE80211_KEY_FLAG_PAIRWISE);
+ 	int err = 0;
+ 
+ 	/* The hardware does not support per-STA RX GTK, fallback
+@@ -712,7 +1047,7 @@
  	    (key->cipher == WLAN_CIPHER_SUITE_TKIP ||
  	     key->cipher == WLAN_CIPHER_SUITE_CCMP) &&
  	    !(key->flags & IEEE80211_KEY_FLAG_PAIRWISE))
@@ -1381,7 +1861,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	/* fall back to sw encryption for unsupported ciphers */
  	switch (key->cipher) {
-@@ -722,7 +832,7 @@
+@@ -733,7 +1068,7 @@
  	case WLAN_CIPHER_SUITE_WEP40:
  	case WLAN_CIPHER_SUITE_WEP104:
  	default:
@@ -1390,22 +1870,94 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	}
  
  	mutex_lock(&dev->mt76.mutex);
-@@ -1187,6 +1297,8 @@
+@@ -747,10 +1082,70 @@
+ 	else
+ 		links = BIT(0);
+ 
++	if (npu_pairwise) {
++		struct mt7996_sta *msta = (void *)sta->drv_priv;
++
++		for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++			struct mt7996_sta_link *sl;
++			struct mt7996_vif_link *vl;
++
++			vl = mt7996_vif_link(dev, vif, link_id);
++			sl = mt7996_sta_link_protected(dev, msta, link_id);
++			if (!vl || !mt7996_vif_link_phy(vl) || !sl)
++				continue;
++			if (cmd == DISABLE_KEY && sl->wcid.hw_key_idx != key->keyidx)
++				continue;
++			if (cmd == SET_KEY && sl->data_key == key &&
++			    sl->wcid.hw_key_idx == key->keyidx)
++				continue;
++			changed |= BIT(link_id);
++		}
++		for_each_set_bit(link_id, &changed, IEEE80211_MLD_MAX_NUM_LINKS) {
++			err = mt7996_npu_prepare_key(dev, sta, link_id, cmd, key);
++			if (err)
++				goto revoke;
++		}
++		/* No link may resume with its new key while another affected
++		 * link still forwards with the old key.
++		 */
++		err = mt7996_npu_key_links(dev, vif, sta, changed, key, false);
++		if (err)
++			goto revoke;
++	}
++
+ 	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
+ 		err = mt7996_set_hw_key(hw, cmd, vif, sta, link_id, key);
+ 		if (err)
+ 			break;
++	}
++	if (!err && npu_pairwise && cmd == SET_KEY)
++		err = mt7996_npu_commit_key(dev, sta, changed, key);
++	if (!err && npu_pairwise && cmd == SET_KEY)
++		err = mt7996_npu_key_links(dev, vif, sta, changed, key, true);
++	if (!err && sta && cmd == SET_KEY)
++		err = mt7996_npu_update_routes(dev, sta);
++revoke:
++	if (err && sta && (key->flags & IEEE80211_KEY_FLAG_PAIRWISE)) {
++		struct mt7996_sta *msta = (void *)sta->drv_priv;
++
++		/* A partially installed MLD key must not keep forwarding through
++		 * links which succeeded or still hold the previous key.
++		 */
++		for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++			struct mt7996_sta_link *msta_link;
++
++			msta_link = mt7996_sta_link_protected(dev, msta, link_id);
++			if (!msta_link)
++				continue;
++			if (msta_link->data_key == key)
++				msta_link->data_key = NULL;
++			mt76_wcid_key_setup_pn(&dev->mt76, &msta_link->wcid,
++					      NULL, NULL, 0, false);
++			an7552_npu_station_set(dev->mt76.mmio.an7552,
++					       msta_link->wcid.idx,
++					       msta_link->wcid.phy_idx,
++					       0, NULL, false, false, false);
++		}
+ 	}
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -1207,6 +1602,8 @@
  			   CONN_STATE_DISCONNECT, true);
  
  	rcu_assign_pointer(dev->mt76.wcid[idx], &msta_link->wcid);
 +	msta_link->data_key = NULL;
-+	msta_link->npu_authorized = false;
++	WRITE_ONCE(msta_link->npu_authorized, false);
  	mt76_wcid_init(&msta_link->wcid, phy->mt76->band_idx);
  
  	return 0;
-@@ -1202,6 +1314,13 @@
- 	msta_link = mt76_dereference(msta->link[link_id], &dev->mt76);
- 	if (!msta_link)
- 		return;
+@@ -1231,6 +1628,14 @@
+ 
+ 	if (dev->recovery.hw_full_reset)
+ 		msta->reset_wcid[link_id] = msta_link->wcid.idx + 1;
 +
++	WRITE_ONCE(msta_link->npu_authorized, false);
 +	an7552_npu_station_set(dev->mt76.mmio.an7552, msta_link->wcid.idx, msta_link->wcid.phy_idx,
-+				0, NULL, false);
++			       0, NULL, false, false, false);
 +	if (!dev->recovery.hw_full_reset) {
 +		kfree_sensitive(msta->npu_key[link_id]);
 +		msta->npu_key[link_id] = NULL;
@@ -1413,20 +1965,60 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	spin_lock_bh(&dev->mt76.sta_poll_lock);
  	if (!list_empty(&msta_link->wcid.poll_list))
-@@ -1419,6 +1538,12 @@
+@@ -1269,6 +1674,10 @@
+ 		msta_link->wcid.link_valid = false;
+ 	}
+ 
++	if (dev->mt76.mmio.an7552 && !dev->recovery.hw_full_reset)
++		mt76_npu_flush_station(&dev->mt76, msta_link->wcid.idx,
++				       msta_link->wcid.phy_idx);
++
+ 	if (flush) {
+ 		struct mt7996_phy *phy =
+ 			__mt7996_phy(dev, msta_link->wcid.phy_idx);
+@@ -1282,6 +1691,7 @@
+ 		if (msta_link != &msta->deflink)
+ 			kfree_rcu(msta_link, rcu_head);
+ 	}
++	mt7996_npu_update_routes(dev, sta);
+ }
+ 
+ static void
+@@ -1427,6 +1837,7 @@
+ 		struct ieee80211_bss_conf *link_conf;
+ 		struct mt7996_sta_link *msta_link;
+ 		struct mt7996_vif_link *link;
++		bool encrypted;
+ 		int i;
+ 
+ 		link_conf = link_conf_dereference_protected(vif, link_id);
+@@ -1462,6 +1873,16 @@
  						 CONN_STATE_PORT_SECURE, false);
  			if (err)
  				goto unlock;
++			encrypted = msta_link->data_key &&
++				mt76_npu_cipher_supported(msta_link->data_key->cipher);
++			/* Ethernet frames use the peer MLD address, not its link address. */
 +			err = an7552_npu_station_set(dev->mt76.mmio.an7552, msta_link->wcid.idx,
 +						     link->mt76.band_idx, link->mt76.idx,
-+						     link_sta->addr, true);
++						     sta->addr, true, sta->mlo,
++						     encrypted);
 +			if (err)
 +				goto unlock;
-+			msta_link->npu_authorized = true;
++			WRITE_ONCE(msta_link->npu_authorized, true);
  			break;
  		case MT76_STA_EVENT_DISASSOC:
  			for (i = 0; i < ARRAY_SIZE(msta_link->twt.flow); i++)
-@@ -1453,8 +1578,11 @@
+@@ -1482,6 +1903,8 @@
+ 			break;
+ 		}
+ 	}
++	if (ev == MT76_STA_EVENT_AUTHORIZE)
++		err = mt7996_npu_update_routes(dev, sta);
+ unlock:
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -1496,8 +1919,11 @@
  	int i;
  
  	mutex_lock(&dev->mt76.mutex);
@@ -1439,7 +2031,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	mutex_unlock(&dev->mt76.mutex);
  }
  
-@@ -1483,6 +1611,25 @@
+@@ -1526,6 +1952,25 @@
  {
  	struct mt7996_dev *dev = mt7996_hw_dev(hw);
  	enum mt76_sta_event ev;
@@ -1454,18 +2046,18 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +			struct mt7996_sta_link *link = mt7996_sta_link(msta, id);
 +
 +			if (link) {
-+				link->npu_authorized = false;
++				WRITE_ONCE(link->npu_authorized, false);
 +				an7552_npu_station_set(dev->mt76.mmio.an7552,
-+						      link->wcid.idx,
-+						      link->wcid.phy_idx,
-+						      0, NULL, false);
++						       link->wcid.idx,
++						       link->wcid.phy_idx,
++						       0, NULL, false, false, false);
 +			}
 +		}
 +	}
  
  	if (old_state == IEEE80211_STA_NOTEXIST &&
  	    new_state == IEEE80211_STA_NONE)
-@@ -1915,7 +2062,8 @@
+@@ -1958,7 +2403,8 @@
  		-(s8)ewma_avg_signal_read(&msta_link->avg_ack_signal);
  	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_ACK_SIGNAL_AVG);
  
@@ -1475,7 +2067,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		sinfo->tx_bytes = msta_link->wcid.stats.tx_bytes;
  		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES64);
  
-@@ -2462,7 +2610,10 @@
+@@ -2506,7 +2952,10 @@
  		wed = &dev->mt76.mmio.wed_hif2;
  
  	if (!mtk_wed_device_active(wed) &&
@@ -1487,6 +2079,14 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		return -ENODEV;
  
  	path->type = DEV_PATH_MTK_WDMA;
+@@ -2638,6 +3087,7 @@
+ 	.remove_interface = mt7996_remove_interface,
+ 	.config = mt7996_config,
+ 	.conf_tx = mt7996_conf_tx,
++	.set_qos_map = mt7996_set_qos_map,
+ 	.configure_filter = mt7996_configure_filter,
+ 	.vif_cfg_changed = mt7996_vif_cfg_changed,
+ 	.link_info_changed = mt7996_link_info_changed,
 --- a/mt7996/mcu.c
 +++ b/mt7996/mcu.c
 @@ -648,59 +648,90 @@
@@ -1593,8 +2193,8 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +				u8 q = mt76_connac_lmac_mapping(ac);
 +
 +				ieee80211_sta_register_airtime(sta, ac_to_tid[ac],
-+					le32_to_cpu(adm->tx_bytes[q]),
-+					le32_to_cpu(adm->rx_bytes[q]));
++							       le32_to_cpu(adm->tx_bytes[q]),
++							       le32_to_cpu(adm->rx_bytes[q]));
  			}
  			break;
  		case UNI_ALL_STA_TXRX_MSDU_COUNT:
@@ -1619,7 +2219,63 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  }
  
  static void
-@@ -3196,7 +3227,11 @@
+@@ -1289,6 +1320,27 @@
+ 	return skb;
+ }
+ 
++int mt7996_mcu_set_qos_map(struct mt7996_dev *dev, u8 bss, const u8 *map)
++{
++	struct {
++		u8 bss_idx;
++		u8 enable;
++		u8 reserved[2];
++		u8 map[64];
++	} __packed request = {
++		.bss_idx = bss,
++		.enable = 1,
++	};
++	int ret;
++
++	memcpy(request.map, map, sizeof(request.map));
++	ret = mt76_mcu_send_msg(&dev->mt76, MCU_WA_EXT_CMD(SET_QOS_MAP),
++				&request, sizeof(request), false);
++	if (ret)
++		return ret;
++	return an7552_npu_qos_map(dev->mt76.mmio.an7552, bss, map);
++}
++
+ int mt7996_mcu_add_bss_info(struct mt7996_phy *phy, struct ieee80211_vif *vif,
+ 			    struct ieee80211_bss_conf *link_conf,
+ 			    struct mt76_vif_link *mlink,
+@@ -1296,6 +1348,7 @@
+ {
+ 	struct mt7996_dev *dev = phy->dev;
+ 	struct sk_buff *skb;
++	int ret;
+ 
+ 	if (mlink->omac_idx >= REPEATER_BSSID_START) {
+ 		mt7996_mcu_muar_config(dev, mlink, link_conf->addr, false, enable);
+@@ -1335,8 +1388,17 @@
+ 	mt7996_mcu_bss_mbssid_tlv(skb, link_conf, enable);
+ 
+ out:
+-	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
+-				     MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE), true);
++	ret = mt76_mcu_skb_send_msg(&dev->mt76, skb,
++				    MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE), true);
++	if (!ret && dev->mt76.mmio.an7552) {
++		struct mt7996_vif *mvif = (void *)vif->drv_priv;
++
++		if (enable && vif->type != NL80211_IFTYPE_MONITOR)
++			ret = mt7996_mcu_set_qos_map(dev, mlink->idx, mvif->npu_qos_map);
++		else
++			ret = an7552_npu_qos_map(dev->mt76.mmio.an7552, mlink->idx, NULL);
++	}
++	return ret;
+ }
+ 
+ int mt7996_mcu_update_bss_rfch(struct mt7996_phy *phy, struct mt7996_vif_link *link)
+@@ -3196,7 +3258,11 @@
  		       struct mt76_wcid *wcid, enum set_key_cmd cmd)
  {
  	struct sk_buff *skb;
@@ -1631,7 +2287,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	skb = __mt76_connac_mcu_alloc_sta_req(dev, (struct mt76_vif_link *)link,
  					      wcid, MT7996_STA_UPDATE_MAX_SIZE);
-@@ -3209,7 +3244,12 @@
+@@ -3209,7 +3275,12 @@
  		return ret;
  	}
  
@@ -1647,11 +2303,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  int mt7996_mcu_add_dev_info(struct mt7996_phy *phy, struct ieee80211_vif *vif,
 --- a/mt7996/mmio.c
 +++ b/mt7996/mmio.c
-@@ -717,9 +717,20 @@
- 	spin_unlock_irqrestore(&mdev->mmio.irq_lock, flags);
- }
- 
-+
+@@ -720,6 +720,16 @@
  static void mt7996_rx_poll_complete(struct mt76_dev *mdev,
  				    enum mt76_rxq_id q)
  {
@@ -1679,14 +2331,16 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  	struct list_head rc_list;
  	u32 airtime_ac[8];
-@@ -308,6 +310,14 @@
+@@ -308,6 +310,16 @@
  	} twt;
  
  	struct rcu_head rcu_head;
 +};
 +
 +struct mt7996_npu_key {
-+	u8 key[WLAN_KEY_LEN_CCMP];
++	u8 key[WLAN_KEY_LEN_CCMP_256];
++	u32 cipher;
++	u8 keylen;
 +	u8 keyidx;
 +	u8 pn[IEEE80211_NUM_TIDS + 1][6];
 +	bool saved;
@@ -1694,8 +2348,8 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  };
  
  struct mt7996_sta {
-@@ -317,7 +327,10 @@
- 	u8 seclink_id;
+@@ -321,7 +333,10 @@
+ 	u16 reset_wcid[IEEE80211_MLD_MAX_NUM_LINKS];
  
  	struct mt7996_vif *vif;
 -};
@@ -1706,7 +2360,15 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  struct mt7996_vif_link {
  	struct mt76_vif_link mt76; /* must be first */
-@@ -740,7 +753,10 @@
+@@ -345,6 +360,7 @@
+ 	u8 reset_bss[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	u8 mld_group_idx;
+ 	u8 mld_remap_idx;
++	u8 npu_qos_map[64];
+ };
+ 
+ /* crash-dump */
+@@ -745,7 +761,10 @@
  s8 mt7996_eeprom_get_power_delta(struct mt7996_dev *dev, int band);
  bool mt7996_eeprom_has_background_radar(struct mt7996_dev *dev);
  int mt7996_dma_init(struct mt7996_dev *dev);
@@ -1718,7 +2380,15 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  void mt7996_dma_prefetch(struct mt7996_dev *dev);
  void mt7996_dma_cleanup(struct mt7996_dev *dev);
  void mt7996_dma_start(struct mt7996_dev *dev, bool reset, bool wed_reset);
-@@ -1013,7 +1029,8 @@
+@@ -764,6 +783,7 @@
+ int mt7996_mcu_add_dev_info(struct mt7996_phy *phy, struct ieee80211_vif *vif,
+ 			    struct ieee80211_bss_conf *link_conf,
+ 			    struct mt76_vif_link *mlink, bool enable);
++int mt7996_mcu_set_qos_map(struct mt7996_dev *dev, u8 bss, const u8 *map);
+ int mt7996_mcu_add_bss_info(struct mt7996_phy *phy, struct ieee80211_vif *vif,
+ 			    struct ieee80211_bss_conf *link_conf,
+ 			    struct mt76_vif_link *mlink,
+@@ -1018,7 +1038,8 @@
  u32 mt7996_wed_init_buf(void *ptr, dma_addr_t phys, int token_id);
  
  int mt7996_dma_rro_init(struct mt7996_dev *dev);
@@ -1758,7 +2428,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  #define MT_WTBL_LMAC_DW				GENMASK(7, 2)
 --- a/npu.c
 +++ b/npu.c
-@@ -66,51 +66,73 @@
+@@ -66,60 +66,100 @@
  	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
  	int i, nframes, index = q->tail;
  	struct sk_buff *skb = NULL;
@@ -1854,11 +2524,31 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	Q_WRITE(q, dma_idx, q->tail);
  
 -	return skb;
+-}
 +	return drop ? ERR_PTR(-EINVAL) : skb;
- }
++}
++
++void mt76_npu_flush_station(struct mt76_dev *dev, u16 wcid, u8 band)
++{
++	struct airoha_ppe_dev *ppe;
++
++	/* The caller has revoked npu_authorized. Finish receive callbacks that
++	 * observed its old value before flushing and releasing this WCID.
++	 * Full radio recovery stops NAPI separately and does not call here.
++	 */
++	synchronize_net();
++	rcu_read_lock();
++	ppe = rcu_dereference(dev->mmio.ppe_dev);
++	if (ppe)
++		airoha_ppe_dev_flush_wdma(ppe, wcid, band);
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL_GPL(mt76_npu_flush_station);
  
  void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
-@@ -119,7 +141,8 @@
+-			u32 info)
++			u32 info, u16 domain)
+ {
  	struct airoha_ppe_dev *ppe_dev;
  	u16 reason, hash;
  
@@ -1868,7 +2558,20 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		return;
  
  	rcu_read_lock();
-@@ -161,6 +184,11 @@
+@@ -134,7 +174,11 @@
+ 	reason = FIELD_GET(NPU_RX_DMA_CRSN_MASK, info);
+ 	if (reason == PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED) {
+ 		skb_set_mac_header(skb, 0);
+-		airoha_ppe_dev_check_skb(ppe_dev, skb, hash, true);
++		if (an7552_npu_active(dev->mmio.an7552) &&
++		    ppe_dev->ops.check_skb_domain && (info & BIT(29)))
++			ppe_dev->ops.check_skb_domain(ppe_dev, skb, hash, domain);
++		else
++			airoha_ppe_dev_check_skb(ppe_dev, skb, hash, true);
+ 	}
+ out:
+ 	rcu_read_unlock();
+@@ -161,6 +205,11 @@
  		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info);
  		if (!skb)
  			break;
@@ -1880,7 +2583,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  
  		dev->drv->rx_skb(dev, qid, skb, &info);
  		mt76_rx_poll_complete(dev, qid, napi);
-@@ -370,7 +398,7 @@
+@@ -370,7 +419,7 @@
  	if (!tc_can_offload(dev))
  		return -EOPNOTSUPP;
  
@@ -1889,7 +2592,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  		return -EOPNOTSUPP;
  
  	switch (type) {
-@@ -443,6 +471,26 @@
+@@ -443,6 +492,27 @@
  	struct airoha_npu *npu;
  	int err = 0;
  
@@ -1902,6 +2605,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
 +				an7552_npu_put(native);
 +				return PTR_ERR(ppe_dev);
 +			}
++			an7552_npu_set_bridge(native, !!ppe_dev->ops.check_skb_domain);
 +			dev->mmio.an7552 = native;
 +			rcu_assign_pointer(dev->mmio.ppe_dev, ppe_dev);
 +			dev->hwrro_mode = MT76_HWRRO_V3_1;
@@ -1916,7 +2620,7 @@ to the AN7552 firmware, and preserve encryption counters on recovery.
  	mutex_lock(&dev->mutex);
  
  	npu = airoha_npu_get(dev->dev);
-@@ -497,15 +545,45 @@
+@@ -497,15 +567,45 @@
  }
  EXPORT_SYMBOL_GPL(mt76_npu_init);
  

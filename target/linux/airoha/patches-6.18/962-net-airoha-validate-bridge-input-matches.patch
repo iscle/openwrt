@@ -1,0 +1,322 @@
+Subject: [PATCH] net: airoha: validate bridge subflow input matches
+
+Bridge rules currently use only their MAC pair to select an offload owner.
+Validate the ingress device, VLAN stack and payload protocol before binding
+a subflow, and reject unsupported dissector keys and non-exact MAC masks.
+Resolve DSA ingress from receive metadata and hold the input device until
+the rule is deleted or device unregister invalidates its subflows.
+
+This validates the first packet against the software rule. It does not make
+hardware keys distinguish every ingress domain or enable native bridge
+classification; those require separate hardware configuration.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -505,6 +505,18 @@
+ 	FLOW_TYPE_L2_SUBFLOW,
+ };
+ 
++struct airoha_bridge_vlan_match {
++	__be16 tpid, tpid_mask;
++	__be16 proto, proto_mask;
++	u16 tci, tci_mask;
++};
++
++struct airoha_bridge_match {
++	struct airoha_bridge_vlan_match vlan[2];
++	__be16 proto, proto_mask;
++	u8 num_vlans, num_vlans_mask;
++};
++
+ struct airoha_flow_table_entry {
+ 	union {
+ 		struct hlist_node list; /* PPE L3 flow entry */
+@@ -515,6 +527,9 @@
+ 	};
+ 
+ 	/* Protected by ppe_lock, including the cached WDMA identity. */
++	struct hlist_node ingress_node;
++	struct net_device *ingress_dev;
++	struct airoha_bridge_match match;
+ 	struct hlist_node wlan_node;
+ 	struct net_device *wdma_dev;
+ 	bool wdma_dead;
+@@ -627,6 +642,7 @@
+ 
+ 	struct rhashtable l2_flows;
+ 
++	struct hlist_head ingress_flows;
+ 	struct hlist_head wlan_flows;
+ 	struct notifier_block netdevice_nb;
+ 	bool netdevice_registered;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -9,6 +9,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/rhashtable.h>
++#include <net/dst_metadata.h>
+ #include <net/ipv6.h>
+ #include <linux/if_vlan.h>
+ #include <net/pkt_cls.h>
+@@ -951,6 +952,7 @@
+ {
+ 	spin_lock_bh(&ppe_lock);
+ 
++	hlist_del_init(&e->ingress_node);
+ 	hlist_del_init(&e->wlan_node);
+ 	if (e->type == FLOW_TYPE_L2)
+ 		airoha_ppe_foe_remove_l2_flow(ppe, e);
+@@ -958,6 +960,83 @@
+ 		airoha_ppe_foe_remove_flow(ppe, e);
+ 
+ 	spin_unlock_bh(&ppe_lock);
++}
++
++/* The hardware miss arrives before DSA decapsulation. Resolve its input
++ * from the descriptor metadata rather than treating all switch ports as eth0.
++ */
++static bool airoha_ppe_bridge_ingress_match(struct airoha_flow_table_entry *e,
++					    struct sk_buff *skb)
++{
++	struct net_device *dev = skb->dev;
++
++	if (!e->ingress_dev || !dev)
++		return false;
++	if (e->ingress_dev == dev)
++		return true;
++#if IS_ENABLED(CONFIG_NET_DSA)
++	if (netdev_uses_dsa(dev)) {
++		struct metadata_dst *md = skb_metadata_dst(skb);
++		struct dsa_port *dp;
++
++		if (!md || md->type != METADATA_HW_PORT_MUX)
++			return false;
++		list_for_each_entry(dp, &dev->dsa_ptr->dst->ports, list)
++			if (!dp->ds->index && dp->index == md->u.port_info.port_id &&
++			    dp->type == DSA_PORT_TYPE_USER)
++				return e->ingress_dev == dp->user;
++	}
++#endif
++	return false;
++}
++
++static bool airoha_ppe_bridge_match(struct airoha_flow_table_entry *e,
++				    struct sk_buff *skb)
++{
++	struct airoha_bridge_match *match = &e->match;
++	__be16 proto = eth_hdr(skb)->h_proto;
++	int offset = skb_mac_offset(skb) + ETH_HLEN;
++	unsigned int count = 0;
++
++	if (!airoha_ppe_bridge_ingress_match(e, skb))
++		return false;
++	while (eth_type_vlan(proto) || (!count && skb_vlan_tag_present(skb))) {
++		struct airoha_bridge_vlan_match *vlan;
++		__be16 tpid = proto;
++		u16 tci;
++
++		if (count == ARRAY_SIZE(match->vlan))
++			return false;
++		if (!count && skb_vlan_tag_present(skb)) {
++			tpid = skb->vlan_proto;
++			tci = skb_vlan_tag_get(skb);
++		} else {
++			struct vlan_hdr buffer, *vh;
++
++			vh = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++			if (!vh)
++				return false;
++			tci = ntohs(vh->h_vlan_TCI);
++			proto = vh->h_vlan_encapsulated_proto;
++			offset += VLAN_HLEN;
++		}
++		vlan = &match->vlan[count++];
++		if (((tpid ^ vlan->tpid) & vlan->tpid_mask) ||
++		    ((tci ^ vlan->tci) & vlan->tci_mask) ||
++		    ((proto ^ vlan->proto) & vlan->proto_mask))
++			return false;
++	}
++	if (((count ^ match->num_vlans) & match->num_vlans_mask) ||
++	    ((proto ^ match->proto) & match->proto_mask))
++		return false;
++	/* An absent tag must not satisfy a masked zero-valued tag condition. */
++	for (; count < ARRAY_SIZE(match->vlan); count++) {
++		struct airoha_bridge_vlan_match *vlan = &match->vlan[count];
++
++		if (vlan->tpid_mask || vlan->tci_mask || vlan->proto_mask)
++			return false;
++	}
++	return true;
+ }
+ 
+ /* A bridge rule without VLAN actions must retain the packet's tag stack.
+@@ -1228,7 +1307,7 @@
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
+-	if (e)
++	if (e && airoha_ppe_bridge_match(e, skb))
+ 		airoha_ppe_foe_commit_subflow_entry(ppe, e, skb, hash, rx_wlan);
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1264,8 +1343,10 @@
+ 
+ 	e->hash = 0xffff;
+ 	spin_lock_bh(&ppe_lock);
+-	if (e->wdma_dev &&
+-	    READ_ONCE(e->wdma_dev->reg_state) != NETREG_REGISTERED) {
++	if ((e->wdma_dev &&
++	     READ_ONCE(e->wdma_dev->reg_state) != NETREG_REGISTERED) ||
++	    (e->ingress_dev &&
++	     READ_ONCE(e->ingress_dev->reg_state) != NETREG_REGISTERED)) {
+ 		ret = -ENODEV;
+ 		goto unlock;
+ 	}
+@@ -1276,6 +1357,8 @@
+ 		e->type = FLOW_TYPE_L4;
+ 		hlist_add_head(&e->list, &ppe->foe_flow[hash]);
+ 	}
++	if (!ret && e->ingress_dev)
++		hlist_add_head(&e->ingress_node, &ppe->ingress_flows);
+ 	if (!ret && e->wdma_dev)
+ 		hlist_add_head(&e->wlan_node, &ppe->wlan_flows);
+ unlock:
+@@ -1394,6 +1477,17 @@
+ 		return NOTIFY_DONE;
+ 
+ 	spin_lock_bh(&ppe_lock);
++	hlist_for_each_entry(e, &ppe->ingress_flows, ingress_node) {
++		struct airoha_flow_table_entry *sub;
++		struct hlist_node *next;
++
++		if (e->ingress_dev != netdev)
++			continue;
++		hlist_for_each_entry_safe(sub, next, &e->l2_flows, l2_subflow_node)
++			airoha_ppe_foe_remove_flow(ppe, sub);
++		e->ingress_dev = NULL;
++		dev_put(netdev);
++	}
+ 	hlist_for_each_entry(e, &ppe->wlan_flows, wlan_node) {
+ 		if (e->wdma_dev != netdev)
+ 			continue;
+@@ -1505,6 +1599,84 @@
+ 	airoha_ppe_foe_flow_entry_update(ppe, e);
+ 
+ 	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
++}
++
++static void airoha_ppe_bridge_vlan_match_parse(struct airoha_bridge_vlan_match *vlan,
++					       struct flow_match_vlan *match)
++{
++	vlan->tpid = match->key->vlan_tpid;
++	vlan->tpid_mask = match->mask->vlan_tpid;
++	vlan->proto = match->key->vlan_eth_type;
++	vlan->proto_mask = match->mask->vlan_eth_type;
++	vlan->tci = match->key->vlan_id | match->key->vlan_dei << 12 |
++		    match->key->vlan_priority << VLAN_PRIO_SHIFT;
++	vlan->tci_mask = match->mask->vlan_id | match->mask->vlan_dei << 12 |
++			 match->mask->vlan_priority << VLAN_PRIO_SHIFT;
++}
++
++static int airoha_ppe_bridge_match_parse(struct airoha_flow_table_entry *e,
++					 struct flow_rule *rule,
++					 struct net_device *odev)
++{
++	struct flow_match_eth_addrs eth;
++	struct flow_match_basic basic;
++	struct flow_match_meta meta;
++	u64 supported = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_VLAN) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN) |
++			BIT_ULL(FLOW_DISSECTOR_KEY_NUM_OF_VLANS);
++
++	if (rule->match.dissector->used_keys & ~supported)
++		return -EOPNOTSUPP;
++	flow_rule_match_meta(rule, &meta);
++	if (meta.mask->ingress_ifindex != -1 || meta.mask->ingress_iftype ||
++	    meta.mask->l2_miss)
++		return -EOPNOTSUPP;
++	flow_rule_match_eth_addrs(rule, &eth);
++	if (!is_broadcast_ether_addr(eth.mask->src) ||
++	    !is_broadcast_ether_addr(eth.mask->dst))
++		return -EOPNOTSUPP;
++	flow_rule_match_basic(rule, &basic);
++	if (basic.mask->ip_proto)
++		return -EOPNOTSUPP;
++	e->match.proto = basic.key->n_proto;
++	e->match.proto_mask = basic.mask->n_proto;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_match_vlan match;
++
++		flow_rule_match_vlan(rule, &match);
++		airoha_ppe_bridge_vlan_match_parse(&e->match.vlan[0], &match);
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN)) {
++		struct flow_match_vlan match;
++
++		flow_rule_match_cvlan(rule, &match);
++		airoha_ppe_bridge_vlan_match_parse(&e->match.vlan[1], &match);
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_NUM_OF_VLANS)) {
++		struct flow_dissector_key_num_of_vlans *key, *mask;
++
++		key = skb_flow_dissector_target(rule->match.dissector,
++						FLOW_DISSECTOR_KEY_NUM_OF_VLANS,
++						rule->match.key);
++		mask = skb_flow_dissector_target(rule->match.dissector,
++						 FLOW_DISSECTOR_KEY_NUM_OF_VLANS,
++						 rule->match.mask);
++		e->match.num_vlans = key->num_of_vlans;
++		e->match.num_vlans_mask = mask->num_of_vlans;
++	}
++	if (!odev)
++		return -ENODEV;
++	e->ingress_dev = dev_get_by_index(dev_net(odev), meta.key->ingress_ifindex);
++	if (!e->ingress_dev)
++		return -ENODEV;
++	/* The hardware miss precedes VLAN upper-device demultiplexing. */
++	if (is_vlan_dev(e->ingress_dev))
++		return -EOPNOTSUPP;
++	return 0;
+ }
+ 
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+@@ -1714,6 +1886,9 @@
+ 	if (offload_type == PPE_PKT_TYPE_BRIDGE) {
+ 		struct net_device *dev = odev;
+ 
++		err = airoha_ppe_bridge_match_parse(e, rule, odev);
++		if (err)
++			goto free_entry;
+ 		e->vlan_dsa = airoha_get_dsa_port(&dev) >= 0;
+ 	}
+ 	memcpy(&e->data, &hwe, sizeof(e->data));
+@@ -1744,6 +1919,7 @@
+ remove_foe_entry:
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ free_entry:
++	dev_put(e->ingress_dev);
+ 	dev_put(e->wdma_dev);
+ 	kfree(e);
+ 
+@@ -1763,6 +1939,7 @@
+ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+ 	rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 			       airoha_flow_table_params);
++	dev_put(e->ingress_dev);
+ 	dev_put(e->wdma_dev);
+ 	kfree(e);
+ 
+@@ -2180,6 +2357,7 @@
+ 	struct airoha_ppe *ppe = arg;
+ 
+ 	airoha_ppe_foe_flow_remove_entry(ppe, e);
++	dev_put(e->ingress_dev);
+ 	dev_put(e->wdma_dev);
+ 	kfree(e);
+ }

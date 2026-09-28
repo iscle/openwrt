@@ -1,0 +1,136 @@
+Subject: [PATCH] wifi: mac80211: propagate QoS maps to hardware offload
+
+Let transmit-offload drivers program the same DSCP policy as the software
+path. Keep the software map unchanged on a driver error and restore a
+configured map when rebuilding an interface after hardware restart.
+
+---
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4362,6 +4362,13 @@
+  *	Returns a negative error code on failure.
+  *	The callback can sleep.
+  *
++ * @set_qos_map: Update the per-interface DSCP to user-priority map used by
++ *	hardware transmit offload. NULL restores the default cfg80211 mapping.
++ *	The driver must initialize the default map when adding an interface and
++ *	retain the previous map if this callback fails. mac80211 restores a
++ *	configured map after adding an interface during hardware restart.
++ *	This optional callback can sleep and returns a negative error on failure.
++ *
+  * @get_tsf: Get the current TSF timer value from firmware/hardware. Currently,
+  *	this is only used for IBSS mode BSSID merging and debugging. Is not a
+  *	required function.
+@@ -4861,6 +4868,8 @@
+ 		       struct ieee80211_vif *vif,
+ 		       unsigned int link_id, u16 ac,
+ 		       const struct ieee80211_tx_queue_params *params);
++	int (*set_qos_map)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			   struct cfg80211_qos_map *qos_map);
+ 	u64 (*get_tsf)(struct ieee80211_hw *hw, struct ieee80211_vif *vif);
+ 	void (*set_tsf)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			u64 tsf);
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -5124,6 +5124,7 @@
+ {
+ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 	struct mac80211_qos_map *new_qos_map, *old_qos_map;
++	int ret;
+ 
+ 	if (qos_map) {
+ 		new_qos_map = kzalloc_obj(*new_qos_map);
+@@ -5133,6 +5134,12 @@
+ 	} else {
+ 		/* A NULL qos_map was passed to disable QoS mapping */
+ 		new_qos_map = NULL;
++	}
++
++	ret = drv_set_qos_map(sdata->local, sdata, qos_map);
++	if (ret) {
++		kfree(new_qos_map);
++		return ret;
+ 	}
+ 
+ 	old_qos_map = sdata_dereference(sdata->qos_map, sdata);
+--- a/net/mac80211/driver-ops.c
++++ b/net/mac80211/driver-ops.c
+@@ -57,6 +57,7 @@
+ int drv_add_interface(struct ieee80211_local *local,
+ 		      struct ieee80211_sub_if_data *sdata)
+ {
++	struct mac80211_qos_map *qos_map;
+ 	int ret;
+ 
+ 	might_sleep();
+@@ -82,6 +83,15 @@
+ 		drv_vif_add_debugfs(local, sdata);
+ 		/* initially vif is not MLD */
+ 		ieee80211_link_debugfs_drv_add(&sdata->deflink);
++	}
++
++	qos_map = sdata_dereference(sdata->qos_map, sdata);
++	if (qos_map) {
++		ret = drv_set_qos_map(local, sdata, &qos_map->qos_map);
++		if (ret) {
++			drv_remove_interface(local, sdata);
++			return ret;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -248,6 +258,26 @@
+ 	return ret;
+ }
+ 
++int drv_set_qos_map(struct ieee80211_local *local,
++		    struct ieee80211_sub_if_data *sdata,
++		    struct cfg80211_qos_map *qos_map)
++{
++	int ret = 0;
++
++	might_sleep();
++	lockdep_assert_wiphy(local->hw.wiphy);
++	if (!local->ops->set_qos_map)
++		return 0;
++	if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
++		return -EOPNOTSUPP;
++	if (!check_sdata_in_driver(sdata))
++		return -EIO;
++	trace_drv_set_qos_map(local, sdata);
++	ret = local->ops->set_qos_map(&local->hw, &sdata->vif, qos_map);
++	trace_drv_return_int(local, ret);
++	return ret;
++}
++
+ u64 drv_get_tsf(struct ieee80211_local *local,
+ 		struct ieee80211_sub_if_data *sdata)
+ {
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -657,6 +657,10 @@
+ int drv_conf_tx(struct ieee80211_local *local,
+ 		struct ieee80211_link_data *link, u16 ac,
+ 		const struct ieee80211_tx_queue_params *params);
++
++int drv_set_qos_map(struct ieee80211_local *local,
++		    struct ieee80211_sub_if_data *sdata,
++		    struct cfg80211_qos_map *qos_map);
+ 
+ u64 drv_get_tsf(struct ieee80211_local *local,
+ 		struct ieee80211_sub_if_data *sdata);
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -1136,6 +1136,12 @@
+ 	)
+ );
+ 
++DEFINE_EVENT(local_sdata_evt, drv_set_qos_map,
++	TP_PROTO(struct ieee80211_local *local,
++		 struct ieee80211_sub_if_data *sdata),
++	TP_ARGS(local, sdata)
++);
++
+ DEFINE_EVENT(local_sdata_evt, drv_get_tsf,
+ 	TP_PROTO(struct ieee80211_local *local,
+ 		 struct ieee80211_sub_if_data *sdata),

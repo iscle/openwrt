@@ -1,0 +1,164 @@
+Subject: [PATCH] net: airoha: validate the triggering bridge packet
+
+A delayed receive notification may refer to an unbound slot that has since
+been replaced. Compare its IP tuple and transport protocol with the packet
+before assigning the packet-selected bridge owner, and bind only unbound
+slots. Fall back for fragments and unsupported encapsulation formats.
+
+Also reject native bridge entries with a different MAC pair. Native bridge
+classification remains disabled; complete ingress-domain and native-key
+validation are separate requirements.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -9,6 +9,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/rhashtable.h>
++#include <linux/unaligned.h>
+ #include <net/dst_metadata.h>
+ #include <net/ipv6.h>
+ #include <linux/if_vlan.h>
+@@ -1159,6 +1160,103 @@
+ 	return 0;
+ }
+ 
++/* Receive notifications can outlive an unbound hardware entry. Do not
++ * attach a bridge action to a recycled slot based on the old packet's MACs.
++ */
++static bool airoha_ppe_foe_packet_match(struct airoha_ppe *ppe,
++					struct airoha_foe_entry *hwe,
++					struct sk_buff *skb)
++{
++	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1);
++	int offset = skb_mac_offset(skb) + ETH_HLEN;
++	__be16 proto = eth_hdr(skb)->h_proto;
++	struct flow_keys keys = {};
++	__be32 ports_buffer;
++	bool ports;
++	int i;
++
++	if (airoha_is_7563(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
++		const struct ethhdr *eh = eth_hdr(skb);
++		const u32 *key = hwe->bridge_an7563.key;
++
++		/* Native classification remains disabled until all key fields
++		 * distinguish supported ingress domains. Check the MAC fields
++		 * here as well, without claiming that they are the complete key.
++		 */
++		return key[0] == get_unaligned_be32(eh->h_dest) &&
++		       key[1] >> 16 == get_unaligned_be16(eh->h_dest + 4) &&
++		       key[3] == get_unaligned_be32(eh->h_source) &&
++		       key[4] >> 16 == get_unaligned_be16(eh->h_source + 4);
++	}
++	/* Parse inline tags explicitly: Wi-Fi has not called eth_type_trans()
++	 * yet, and DSA may have replaced skb->protocol with ETH_P_XDSA.
++	 */
++	for (i = 0; eth_type_vlan(proto); i++) {
++		struct vlan_hdr buffer, *vh;
++
++		if (i == 2)
++			return false;
++		vh = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++		if (!vh)
++			return false;
++		proto = vh->h_vlan_encapsulated_proto;
++		offset += VLAN_HLEN;
++	}
++	if (proto != htons(ETH_P_IP) && proto != htons(ETH_P_IPV6))
++		return false;
++	if (!__skb_flow_dissect(NULL, skb, &flow_keys_dissector, &keys,
++				skb->data, proto, offset, skb_headlen(skb),
++				FLOW_DISSECTOR_F_STOP_BEFORE_ENCAP) ||
++	    keys.control.flags & (FLOW_DIS_IS_FRAGMENT | FLOW_DIS_ENCAPSULATION))
++		return false;
++
++	switch (type) {
++	case PPE_PKT_TYPE_IPV4_HNAPT:
++	case PPE_PKT_TYPE_IPV4_ROUTE:
++		if (keys.control.addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
++		    hwe->ipv4.orig_tuple.src_ip != ntohl(keys.addrs.v4addrs.src) ||
++		    hwe->ipv4.orig_tuple.dest_ip != ntohl(keys.addrs.v4addrs.dst))
++			return false;
++		ports = type == PPE_PKT_TYPE_IPV4_HNAPT;
++		if (!ports)
++			return hwe->ipv4.orig_tuple.protocol == keys.basic.ip_proto;
++		if (hwe->ipv4.orig_tuple.src_port != ntohs(keys.ports.src) ||
++		    hwe->ipv4.orig_tuple.dest_port != ntohs(keys.ports.dst))
++			return false;
++		break;
++	case PPE_PKT_TYPE_IPV6_ROUTE_3T:
++	case PPE_PKT_TYPE_IPV6_ROUTE_5T:
++		if (keys.control.addr_type != FLOW_DISSECTOR_KEY_IPV6_ADDRS)
++			return false;
++		for (i = 0; i < ARRAY_SIZE(hwe->ipv6.src_ip); i++)
++			if (hwe->ipv6.src_ip[i] !=
++			    ntohl(keys.addrs.v6addrs.src.s6_addr32[i]) ||
++			    hwe->ipv6.dest_ip[i] !=
++			    ntohl(keys.addrs.v6addrs.dst.s6_addr32[i]))
++				return false;
++		ports = type == PPE_PKT_TYPE_IPV6_ROUTE_5T;
++		if (!ports)
++			return hwe->ipv6.protocol == keys.basic.ip_proto;
++		if (hwe->ipv6.src_port != ntohs(keys.ports.src) ||
++		    hwe->ipv6.dest_port != ntohs(keys.ports.dst))
++			return false;
++		break;
++	default:
++		/* Encapsulated hardware formats require their own full match. */
++		return false;
++	}
++
++	if (keys.basic.ip_proto != IPPROTO_TCP &&
++	    keys.basic.ip_proto != IPPROTO_UDP)
++		return false;
++	/* The dissector can return zero ports for a truncated transport header. */
++	if (!skb_header_pointer(skb, keys.control.thoff, sizeof(ports_buffer),
++				&ports_buffer))
++		return false;
++	return !!(hwe->ib1 & AIROHA_FOE_IB1_BIND_UDP) ==
++	       (keys.basic.ip_proto == IPPROTO_UDP);
++}
++
+ static int
+ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 				    struct airoha_flow_table_entry *e,
+@@ -1173,13 +1271,18 @@
+ 	hwe_p = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe_p)
+ 		return -EINVAL;
++	memcpy(&hwe, hwe_p, sizeof(hwe));
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe.ib1) !=
++	    AIROHA_FOE_STATE_UNBIND ||
++	    !airoha_ppe_foe_packet_match(ppe, &hwe, skb))
++		return -ESTALE;
+ 
+ 	if (airoha_ppe_foe_refresh_wdma(e))
+ 		return -ENODEV;
+ 
+ 	/* Native L2 entries cannot insert or remove PPPoE headers. */
+ 	if (airoha_is_7563(ppe->eth) &&
+-	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe_p->ib1) ==
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1) ==
+ 	    PPE_PKT_TYPE_BRIDGE && (e->data.ib1 & AIROHA_FOE_IB1_BIND_PPPOE))
+ 		return -EOPNOTSUPP;
+ 
+@@ -1187,8 +1290,6 @@
+ 	if (!f)
+ 		return -ENOMEM;
+ 
+-
+-	memcpy(&hwe, hwe_p, sizeof(*hwe_p));
+ 	hwe.ib1 = (hwe.ib1 & mask) | (e->data.ib1 & ~mask);
+ 
+ 	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1);
+@@ -1265,7 +1366,7 @@
+ 		goto unlock;
+ 
+ 	state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1);
+-	if (state == AIROHA_FOE_STATE_BIND)
++	if (state != AIROHA_FOE_STATE_UNBIND)
+ 		goto unlock;
+ 
+ 	if (airoha_is_7563(ppe->eth) &&

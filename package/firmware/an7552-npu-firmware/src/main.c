@@ -115,6 +115,26 @@ static void tdma_receive(volatile uint32_t *state, uint32_t *consumer,
 #include "rro.c.inc"
 #include "ppe.c.inc"
 
+/* Timer 0 is reserved by the host for recovering unresponsive cores.
+ * The PLIC is core-local; leave every unrelated source masked.
+ */
+static void recovery_interrupt_init(uint32_t core)
+{
+	for (uint32_t i = 0; i < 7; i++) {
+		*(volatile uint32_t *)(uintptr_t)(0x0c002000 + 4 * i) = 0;
+		*(volatile uint32_t *)(uintptr_t)(0x0c003000 + 4 * i) = ~0U;
+	}
+	*(volatile uint32_t *)(uintptr_t)0x0c00004c = 16;
+	*(volatile uint32_t *)(uintptr_t)0x0c200000 = 0;
+	*(volatile uint32_t *)(uintptr_t)0x0c003000 = ~(1U << 19);
+	*(volatile uint32_t *)(uintptr_t)0x0c002000 = 1U << 19;
+	barrier();
+	__asm__ volatile("csrw mie, %0; csrsi mstatus, 8" : : "r"(1U << 11) : "memory");
+	*(volatile uint32_t *)(uintptr_t)(AN7552_NPU_BASE +
+					  AN7552_FW_RECOVERY_READY + core * 4) = 1;
+	barrier();
+}
+
 void firmware_main(uint32_t core)
 {
 	volatile uint32_t *state =
@@ -132,7 +152,17 @@ void firmware_main(uint32_t core)
 		AN7552_FW_ABI_VERSION;
 	barrier();
 	state[0] = AN7552_MAGIC;
+	recovery_interrupt_init(core);
 	for (;;) {
+#ifdef AN7552_TEST_FAULT
+		/* Exercise heartbeat timeout and interrupt-assisted parking. */
+		if (read32(AN7552_NPU_BASE + 0x1f8) & (1U << (core + 8)))
+			for (;;)
+				__asm__ volatile("nop");
+		/* RAM-test build only: exercise the real exception handler. */
+		if (read32(AN7552_NPU_BASE + 0x1f8) & (1U << core))
+			__asm__ volatile("ebreak");
+#endif
 		if (read32(AN7552_NPU_BASE + AN7552_PARK_CONTROL)) {
 			barrier();
 			*(volatile uint32_t *)(uintptr_t)(AN7552_NPU_BASE +

@@ -12,6 +12,16 @@ static uint32_t packet_mac_high(volatile uint8_t *packet)
 	return packet[4] | ((uint32_t)packet[5] << 8);
 }
 
+/* A raw MLO WCID identifies a reorder context, not necessarily its RX band. */
+static inline int station_rx_authorized(volatile uint32_t *entry, uint32_t band,
+                                        volatile uint8_t *source)
+{
+	return band < 2 && (entry[0] & AN7552_STATION_AUTHORIZED) &&
+	       ((entry[1] & 255) == band || (entry[0] & AN7552_STATION_MLO)) &&
+	       entry[2] == packet_mac_low(source) &&
+	       entry[3] == packet_mac_high(source);
+}
+
 static int station_data_frame(volatile uint8_t *packet, uint32_t length)
 {
 	uint32_t offset = 12, protocol;
@@ -39,7 +49,9 @@ static void station_learn(uint32_t band, uint32_t metadata, uint32_t flags,
 	if (!station_data_frame(packet, length))
 		return;
 	entry = (void *)(uintptr_t)(AN7552_STATION_NPU + wcid * 32);
-	if (entry[0] && entry[1] == (band | ((metadata & 255) << 8)) &&
+	/* Never let queued plaintext traffic replace host-installed key policy. */
+	if ((entry[0] & AN7552_STATION_AUTHORIZED) && !entry[4] &&
+	    entry[1] == (band | ((metadata & 255) << 8)) &&
 	    entry[2] == packet_mac_low(packet) &&
 	    entry[3] == packet_mac_high(packet))
 		entry[4] = flags;

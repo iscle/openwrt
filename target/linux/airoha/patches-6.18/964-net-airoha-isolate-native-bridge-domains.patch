@@ -1,0 +1,316 @@
+Subject: [PATCH] net: airoha: isolate native bridge ingress domains
+
+Use native L2 actions to retain the IP DS field. Preserve the complete
+ingress identity for supported wired frames and source-NPU station tags.
+Validate native key fields before binding. Invalidate station ingress
+entries before reusing their identifiers.
+
+Unsupported tag stacks and routed traffic use the software path rather
+than matching an ambiguous hardware key.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4592,6 +4592,20 @@
+ 	},
+ };
+ 
++static int airoha_an7563_get_dev_from_sport(struct airoha_qdma_desc *desc,
++					    u16 *port, u16 *dev)
++{
++	u32 sport = FIELD_GET(QDMA_ETH_RXMSG_SPORT_MASK,
++			      le32_to_cpu(READ_ONCE(desc->msg1)));
++
++	if (sport >= 0x18 && sport <= 0x1c) {
++		*port = 0;
++		*dev = 0;
++		return 0;
++	}
++	return airoha_an7583_get_dev_from_sport(desc, port, dev);
++}
++
+ static const char * const an7563_xsi_rsts_names[] = {
+ 	"hsi0-mac",
+ 	"hsi1-mac",
+@@ -4605,7 +4619,7 @@
+ 	.num_ppe = 1,
+ 	.ops = {
+ 		.get_sport = airoha_an7583_get_sport,
+-		.get_dev_from_sport = airoha_an7583_get_dev_from_sport,
++		.get_dev_from_sport = airoha_an7563_get_dev_from_sport,
+ 		.get_vip_port = airoha_an7583_get_vip_port,
+ 	},
+ };
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1158,6 +1158,104 @@
+ 			*etype |= BIT(15);
+ 	}
+ 	return 0;
++}
++
++/* Keep switch inputs in a separate source-port range. The hardware key
++ * includes all five bits: GDM1 occupies 24..28, GDM2 uses 2 and NPU uses 7.
++ */
++static int airoha_ppe_bridge_source_port(struct airoha_ppe *ppe,
++					 struct sk_buff *skb)
++{
++	struct airoha_eth *eth = ppe->eth;
++	unsigned int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
++		struct airoha_gdm_port *port = eth->ports[i];
++
++		if (!port)
++			continue;
++		for (j = 0; j < ARRAY_SIZE(port->devs); j++) {
++			struct airoha_gdm_dev *gdm = port->devs[j];
++
++			if (!gdm || netdev_from_priv(gdm) != skb->dev)
++				continue;
++			if (port->id == AIROHA_GDM2_IDX)
++				return 2;
++#if IS_ENABLED(CONFIG_NET_DSA)
++			if (port->id == AIROHA_GDM1_IDX && netdev_uses_dsa(skb->dev)) {
++				struct metadata_dst *md = skb_metadata_dst(skb);
++
++				if (md && md->type == METADATA_HW_PORT_MUX &&
++				    md->u.port_info.port_id < 5)
++					return 24 + md->u.port_info.port_id;
++			}
++#endif
++			return -EOPNOTSUPP;
++		}
++	}
++	return -ENODEV;
++}
++
++static bool airoha_ppe_native_bridge_match(struct airoha_ppe *ppe,
++					   struct airoha_foe_entry *hwe,
++					   struct sk_buff *skb, u16 domain)
++{
++	const struct ethhdr *eh = eth_hdr(skb);
++	const u32 *key = hwe->bridge_an7563.key;
++	__be16 proto = eh->h_proto, tpid = 0;
++	int offset = skb_mac_offset(skb) + ETH_HLEN;
++	u32 hsk;
++	u16 tci = 0;
++	int port;
++
++	if (key[0] != get_unaligned_be32(eh->h_dest) ||
++	    key[1] >> 16 != get_unaligned_be16(eh->h_dest + 4) ||
++	    key[3] != get_unaligned_be32(eh->h_source) ||
++	    key[4] >> 16 != get_unaligned_be16(eh->h_source + 4))
++		return false;
++	if (domain) {
++		/* Firmware only tags complete, untagged IP frames. */
++		if (domain > 2048 || skb_vlan_tag_present(skb) || eth_type_vlan(proto))
++			return false;
++		tci = domain;
++		tpid = htons(ETH_P_8021Q);
++		port = 7;
++	} else {
++		port = airoha_ppe_bridge_source_port(ppe, skb);
++		if (port < 0)
++			return false;
++		if (skb_vlan_tag_present(skb)) {
++			tci = skb_vlan_tag_get(skb);
++			tpid = skb->vlan_proto;
++		} else if (eth_type_vlan(proto)) {
++			struct vlan_hdr buffer, *vh;
++
++			vh = skb_header_pointer(skb, offset, sizeof(buffer), &buffer);
++			if (!vh)
++				return false;
++			tci = ntohs(vh->h_vlan_TCI);
++			tpid = proto;
++			proto = vh->h_vlan_encapsulated_proto;
++		}
++	}
++	/* AN7552 collapses double-tag TPIDs and arbitrary non-IP EtherTypes.
++	 * Those keys cannot represent a Linux bridge rule without ambiguity.
++	 */
++	if (proto == htons(ETH_P_IP))
++		hsk = AN7563_L2_KEY_IPV4;
++	else if (proto == htons(ETH_P_IPV6))
++		hsk = AN7563_L2_KEY_IPV6;
++	else
++		return false;
++	if (tpid == htons(ETH_P_8021Q))
++		hsk |= AN7563_L2_KEY_CTAG;
++	else if (tpid == htons(ETH_P_8021AD))
++		hsk |= AN7563_L2_KEY_STAG;
++	else if (tpid)
++		return false;
++	hsk |= port;
++
++	return (key[1] & 0xffff) == tci && key[2] == hsk;
+ }
+ 
+ /* Receive notifications can outlive an unbound hardware entry. Do not
+@@ -1261,7 +1359,7 @@
+ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 				    struct airoha_flow_table_entry *e,
+ 				    struct sk_buff *skb,
+-				    u32 hash, bool rx_wlan)
++				    u32 hash, bool rx_wlan, u16 domain)
+ {
+ 	u32 mask = AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP;
+ 	struct airoha_foe_entry *hwe_p, hwe;
+@@ -1276,6 +1374,12 @@
+ 	    AIROHA_FOE_STATE_UNBIND ||
+ 	    !airoha_ppe_foe_packet_match(ppe, &hwe, skb))
+ 		return -ESTALE;
++
++	if (airoha_is_7563(ppe->eth) &&
++	    (FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1) !=
++	     PPE_PKT_TYPE_BRIDGE ||
++	     !airoha_ppe_native_bridge_match(ppe, &hwe, skb, domain)))
++		return -EOPNOTSUPP;
+ 
+ 	if (airoha_ppe_foe_refresh_wdma(e))
+ 		return -ENODEV;
+@@ -1350,7 +1454,7 @@
+ 
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 					struct sk_buff *skb,
+-					u32 hash, bool rx_wlan)
++					u32 hash, bool rx_wlan, u16 domain)
+ {
+ 	struct airoha_flow_table_entry *e;
+ 	struct airoha_foe_bridge br = {};
+@@ -1409,7 +1513,7 @@
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
+ 	if (e && airoha_ppe_bridge_match(e, skb))
+-		airoha_ppe_foe_commit_subflow_entry(ppe, e, skb, hash, rx_wlan);
++		airoha_ppe_foe_commit_subflow_entry(ppe, e, skb, hash, rx_wlan, domain);
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+ }
+@@ -1551,6 +1655,23 @@
+ 	int err = 0;
+ 
+ 	spin_lock_bh(&ppe_lock);
++	if (airoha_is_7563(ppe->eth)) {
++		unsigned int hash;
++
++		for (hash = 0; hash < airoha_ppe_get_total_num_entries(ppe); hash++) {
++			const u32 *key;
++
++			e = ppe->foe_owner[hash];
++			if (!e || e->type != FLOW_TYPE_L2_SUBFLOW ||
++			    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->data.ib1) !=
++			    PPE_PKT_TYPE_BRIDGE)
++				continue;
++			key = e->data.bridge_an7563.key;
++			if (FIELD_GET(AN7563_L2_KEY_SPORT, key[2]) == 7 &&
++			    (key[1] & 0xffff) == wcid + 1)
++				airoha_ppe_foe_release_slot(ppe, hash);
++		}
++	}
+ 	hlist_for_each_entry(e, &ppe->wlan_flows, wlan_node) {
+ 		if (e->wdma_wcid != wcid || e->wdma_idx != band)
+ 			continue;
+@@ -2241,8 +2362,9 @@
+ 	return err;
+ }
+ 
+-void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+-			  u16 hash, bool rx_wlan)
++static void airoha_ppe_check_skb_common(struct airoha_ppe_dev *dev,
++					struct sk_buff *skb, u16 hash,
++					bool rx_wlan, u16 domain)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+ 	u32 ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+@@ -2257,7 +2379,20 @@
+ 		return;
+ 
+ 	ppe->foe_check_time[hash] = now;
+-	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan);
++	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan, domain);
++}
++
++void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
++			  u16 hash, bool rx_wlan)
++{
++	airoha_ppe_check_skb_common(dev, skb, hash, rx_wlan, 0);
++}
++
++static void airoha_ppe_check_skb_domain(struct airoha_ppe_dev *dev,
++					struct sk_buff *skb, u16 hash, u16 domain)
++{
++	if (domain && domain <= 2048)
++		airoha_ppe_check_skb_common(dev, skb, hash, true, domain);
+ }
+ 
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr)
+@@ -2357,10 +2492,18 @@
+ 	airoha_fe_wr(eth, REG_PPE_BIND_LIMIT1(0),
+ 		     FIELD_PREP(PPE_BIND_LIMIT1_FULL_MASK, 8000) |
+ 		     FIELD_PREP(PPE_BIND_LIMIT1_NON_L4_MASK, 1));
+-	/* AN7552 uses the same IPv4/IPv6 classifier enables as EN7581. */
+-	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0),
+-		     PPE_FLOW_CFG_IP4_NAPT_MASK | PPE_FLOW_CFG_IP4_NAT_MASK |
+-		     PPE_FLOW_CFG_IP6_5T_ROUTE_MASK | PPE_FLOW_CFG_IP6_3T_ROUTE_MASK);
++	/* Include every supported input key; TLS must not suppress fields. */
++	airoha_fe_wr(eth, REG_PPE_L2B_CFG(0),
++		     PPE_L2B_DMAC_MASK | PPE_L2B_SMAC_MASK | PPE_L2B_VID_MASK |
++		     PPE_L2B_PBITS_MASK | PPE_L2B_SPORT_MASK | PPE_L2B_ETYPE_MASK |
++		     PPE_L2B_ETYPE_BLACKLIST_MASK | PPE_L2B_SECOND_VLAN_MASK);
++	airoha_fe_rmw(eth, REG_GDM_SRC_PORT_SET(AIROHA_GDM1_IDX),
++		      GDM_SPORT_OFF0_MASK | BIT(0),
++		      FIELD_PREP(GDM_SPORT_OFF0_MASK, 8) | BIT(0));
++	/* IP tuple keys cannot carry the private ingress domain. Keep routed
++	 * traffic in software instead of letting it bypass bridge isolation.
++	 */
++	airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(0), PPE_FLOW_CFG_L2_BRIDGE_MASK);
+ 	airoha_fe_set(eth, REG_PPE_GLO_CFG(0), PPE_GLO_CFG_EN_MASK);
+ }
+ 
+@@ -2377,6 +2520,8 @@
+ 	ppe->dev.ops.flush_wdma = airoha_ppe_flush_wdma;
+ 	ppe->dev.ops.setup_tc_block_cb = airoha_ppe_setup_tc_block_cb;
+ 	ppe->dev.ops.check_skb = airoha_ppe_check_skb;
++	if (airoha_is_7563(eth))
++		ppe->dev.ops.check_skb_domain = airoha_ppe_check_skb_domain;
+ 	ppe->dev.priv = ppe;
+ 	ppe->eth = eth;
+ 	eth->ppe = ppe;
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -342,9 +342,22 @@
+ #define PPE_SRAM_TABLE_EN_MASK			BIT(0)
+ 
+ #define REG_PPE_L2B_CFG(_n)		(((_n) ? PPE2_BASE : PPE1_BASE) + 0x288)
++#define PPE_L2B_DMAC_MASK			BIT(0)
++#define PPE_L2B_SMAC_MASK			BIT(1)
++#define PPE_L2B_SPORT_MASK		BIT(4)
++#define PPE_L2B_ETYPE_MASK		BIT(5)
++#define PPE_L2B_ETYPE_BLACKLIST_MASK	BIT(16)
+ #define PPE_L2B_VID_MASK			BIT(2)
+ #define PPE_L2B_PBITS_MASK		BIT(3)
+ #define PPE_L2B_SECOND_VLAN_MASK		BIT(20)
++#define PPE_FLOW_CFG_L2_BRIDGE_MASK	BIT(15)
++
++/* AN7552 native bridge key qualifiers, relative to key word 2. */
++#define AN7563_L2_KEY_SPORT		GENMASK(4, 0)
++#define AN7563_L2_KEY_CTAG		BIT(5)
++#define AN7563_L2_KEY_STAG		BIT(6)
++#define AN7563_L2_KEY_IPV4		(BIT(14) | BIT(10))
++#define AN7563_L2_KEY_IPV6		(BIT(14) | BIT(11))
+ 
+ #define REG_PPE_MTU_BASE(_n)			(((_n) ? PPE2_BASE : PPE1_BASE) + 0x304)
+ #define REG_PPE_MTU(_m, _n)			(REG_PPE_MTU_BASE(_m) + (((_n) / 2) << 2))
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -21,6 +21,8 @@
+ 		void (*check_skb)(struct airoha_ppe_dev *dev,
+ 				  struct sk_buff *skb, u16 hash,
+ 				  bool rx_wlan);
++		void (*check_skb_domain)(struct airoha_ppe_dev *dev,
++					 struct sk_buff *skb, u16 hash, u16 domain);
+ 		int (*flush_wdma)(struct airoha_ppe_dev *dev, u16 wcid, u8 band);
+ 	} ops;
+ 

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+#include "ppe-domain.h"
 static volatile uint32_t *rx_words(uint32_t host)
 {
 	return (void *)(uintptr_t)((host & 0x3fffffff) | 0x40000000);
@@ -55,6 +56,11 @@ static volatile uint32_t *rx_metadata(uint32_t token)
 {
 	return rx_words(0x841b0000 + token * 32);
 }
+static volatile struct ppe_domain_saved *rx_domain(uint32_t token)
+{
+	return (void *)rx_words(AN7552_PPE_DOMAIN_HOST +
+			       token * AN7552_PPE_DOMAIN_STRIDE);
+}
 static void native_rx_release(uint32_t token)
 {
 	volatile uint32_t *q =
@@ -66,6 +72,7 @@ static void native_rx_release(uint32_t token)
 		q[6] = 5;
 		return;
 	}
+	rx_domain(token)->active = 0;
 	states[token] = 0;
 	free_ids[q[21]] = token;
 	q[21] = (q[21] + 1) % AN7552_RX_BUFFER_COUNT;
@@ -93,6 +100,7 @@ static int native_rx_deliver(uint32_t token, uint32_t ppe_info)
 		q[6] = 4;
 		return 0;
 	}
+	ppe_domain_restore(packet, saved[6], rx_domain(token));
 	destination = (void *)rx_words(host[0]);
 	sidecar = rx_words(0x842f9000 + producer * 16);
 	sidecar[0] = saved[4];
@@ -132,9 +140,9 @@ static void native_rro_receive(void)
 	volatile uint32_t *states = rx_words(AN7552_RX_STATE_HOST), *descriptor,
 			  *saved, *station;
 	volatile uint8_t *packet;
-	struct rx_metadata parsed;
+	struct rx_metadata parsed = {0};
 	uint32_t index, length, address, token, reason, cookie = 0, security,
-							mode, band;
+							mode, band, split;
 	if (!q[4]) {
 		q[5] = 0;
 		return;
@@ -165,9 +173,15 @@ static void native_rro_receive(void)
 	saved = rx_metadata(token);
 	band = (states[token] >> 8) & 1;
 	if (!(states[token] & 0x10000)) {
+		rx_domain(token)->active = 0;
 		for (uint32_t i = 0; i < 4; i++)
 			saved[i] = descriptor[i];
-		security = (reason == 1 || reason == 2) ?
+		/* Only a complete single-buffer frame can be parsed here. Later
+		 * buffers carry arbitrary payload, not another RXD. Defer the
+		 * whole split frame to the host's assembled-frame replay check.
+		 */
+		split = q[30] || !(descriptor[1] & (1U << 30));
+		security = (split || reason == 1 || reason == 2) ?
 				   0 :
 				   native_rx_security(packet, length, &cookie);
 		saved[4] = security;
@@ -181,7 +195,8 @@ static void native_rro_receive(void)
 				q[10 + i] = packet_word(packet + i * 4);
 		mode = read32(AN7552_NPU_BASE + 0x6c0);
 		uint32_t parsed_result =
-			rx_parse(packet, length, reason, &parsed);
+			split ? RX_PARSE_FRAGMENT :
+				rx_parse(packet, length, reason, &parsed);
 		if ((security & 15) == 1) {
 			q[25] = parsed_result;
 			q[29] = packet_word(packet + 32);
@@ -190,7 +205,8 @@ static void native_rro_receive(void)
 							   parsed_result *
 								   4))++;
 		}
-		if (mode == 2 && (security & 15) == 1 &&
+		if ((mode == 2 || mode == AN7552_PPE_MODE_BRIDGE) &&
+		    (security & 15) == 1 &&
 		    parsed_result == RX_PARSE_OK &&
 		    parsed.wcid == (security >> 4) && parsed.band < 2) {
 			q[26]++;
@@ -198,9 +214,7 @@ static void native_rro_receive(void)
 						      parsed.wcid * 32);
 			q[31] = station[1] ^ (parsed.band | (parsed.bss << 8));
 			volatile uint8_t *source = packet + parsed.offset + 6;
-			if (station[0] && (station[1] & 255) == parsed.band &&
-			    station[2] == packet_mac_low(source) &&
-			    station[3] == packet_mac_high(source)) {
+			if (station_rx_authorized(station, parsed.band, source)) {
 				saved[6] = parsed.offset;
 				saved[7] = parsed.length;
 			} else
@@ -216,11 +230,19 @@ static void native_rro_receive(void)
 			saved[7] = 0;
 	}
 	if (saved[7]) {
-		if (!native_ppe_submit(token, address + saved[6], saved[7]))
+		int ret = native_ppe_submit(token, address + saved[6], saved[7]);
+
+		if (!ret)
 			return;
-		states[token] = 2 | (band << 8);
-	} else if (!native_rx_deliver(token, 0))
+		if (ret > 0)
+			states[token] = 2 | (band << 8);
+		else
+			saved[7] = 0;
+	}
+	if (!saved[7] && !native_rx_deliver(token, 0))
 		return;
+	/* Advance fragment state only after the descriptor is consumed. */
+	q[30] = !(descriptor[1] & (1U << 30));
 	barrier();
 	*rx_words(AN7552_RX_EMI_HOST) = index;
 	index++;

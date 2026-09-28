@@ -44,7 +44,16 @@ trap_entry:
 	sw t1, 12(t0)
 	csrr t1, mtval
 	sw t1, 16(t0)
-	li t1, 0xdead7552
+	li t1, AN7552_FW_TRAP_MAGIC
 	fence iorw, iorw
 	sw t1, 0(t0)
+	/* No outstanding local-SRAM transaction may survive a host core halt. */
+	fence iorw, iorw
+	csrr t0, mhartid
+	slli t0, t0, 2
+	li t1, 0x3e903000 + AN7552_FW_PARK_ACK
+	add t0, t0, t1
+	li t1, AN7552_FW_PARK_MAGIC
+	sw t1, 0(t0)
+	fence iorw, iorw
 	j .Lpark

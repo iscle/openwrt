@@ -1,0 +1,33 @@
+Subject: [PATCH] bridger: retain hardware activity when refreshing the FDB
+
+Advance the software idle counter before querying hardware statistics. A
+recent hardware last-use timestamp can then reset idle to zero even when
+the driver has no packet counters. Incrementing idle after the query
+prevents FDB refresh for these active flows.
+
+Also skip the rest of the iteration after deleting an idle flow, avoiding
+a read from the freed flow.
+
+---
+--- a/flow.c
++++ b/flow.c
+@@ -198,6 +198,7 @@
+ 	}
+ 
+ 	avl_for_each_element_safe(&flows, flow, node, tmp) {
++		flow->idle++;
+ 		avl_delete(&sorted_flows, &flow->sort_node);
+ 		bridger_bpf_flow_update(flow);
+ 		bridger_nl_flow_offload_update(flow);
+@@ -207,8 +208,10 @@
+ 
+ 		if (flow->cur_packets)
+ 			flow->idle = 0;
+-		else if (++flow->idle >= 30)
++		else if (flow->idle >= 30) {
+ 			bridger_flow_delete(flow);
++			continue;
++		}
+ 
+ 		if (flow->idle)
+ 			continue;

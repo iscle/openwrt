@@ -4,9 +4,19 @@ static int native_ppe_submit(uint32_t token, uint32_t address, uint32_t length)
 	volatile uint32_t *q = (void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
 	uint32_t producer = q[10], next = (producer + 1) % 64;
 	volatile uint32_t *descriptor = rx_words(0x842f0000 + producer * 32);
-	if (q[0] != 2 || q[3] || next == read32(0x1fb5080c) ||
+	if ((q[0] != 2 && q[0] != AN7552_PPE_MODE_BRIDGE) || q[3] || next == read32(0x1fb5080c) ||
 	    !(descriptor[1] & 0x80000000))
 		return 0;
+	if (q[0] == AN7552_PPE_MODE_BRIDGE) {
+		volatile uint32_t *saved = rx_metadata(token);
+		volatile uint8_t *buffer = (void *)rx_words(saved[0]);
+
+		if (!ppe_domain_push(buffer, 2048, saved[6], length,
+				     (saved[4] >> 4) + 1, rx_domain(token)))
+			return -1;
+		address -= 4;
+		length += 4;
+	}
 	descriptor[2] = address;
 	descriptor[4] = 0x80000000 | (token << 14);
 	descriptor[5] = 0x7f4087ff;

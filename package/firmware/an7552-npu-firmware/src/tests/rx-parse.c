@@ -35,6 +35,13 @@ int main(void)
 	assert(m.offset == 96 && m.length == 64 && m.wcid == 2 && m.tid == 5);
 	assert(m.pn_low == 0x87654321 && m.pn_high == 0xcdab &&
 	       m.sequence == 0x123);
+	for (unsigned int cipher = 0; cipher < 32; cipher++) {
+		put32(p + 8, (cipher << 16) | 0x80);
+		assert(rx_parse(p, 160, 0, &m) ==
+		       ((cipher == 4 || cipher == 10 || cipher == 11 || cipher == 12) ?
+			RX_PARSE_OK : RX_PARSE_SECURITY));
+	}
+	put32(p + 8, 0x00040080);
 	for (unsigned int n = 0; n < 160; n++)
 		assert(rx_parse(p, n, 0, &m) != RX_PARSE_OK);
 	assert(rx_parse(p, 160, 1, &m) == RX_PARSE_TYPE);

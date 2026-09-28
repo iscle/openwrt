@@ -1,0 +1,142 @@
+Subject: [PATCH] net: airoha: handle AN7563 native bridge entries
+
+AN7563 uses a distinct native L2 entry format. Preserve the complete
+learned key and program actions at their native offsets, without DSCP
+remarking. Keep the L2 classifier disabled pending mode selection.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -353,6 +353,24 @@
+ 	struct airoha_foe_mac_info l2;
+ };
+ 
++/* AN7563 native L2 entries keep the learned key and do not rewrite MACs. */
++struct airoha_foe_bridge_an7563 {
++	u32 key[5];
++	u32 reserved0[2];
++	u32 flags;
++	u32 reserved1;
++	u32 data;
++	u32 ib2;
++	u16 vlan1;
++	u16 etype;
++	u32 reserved2;
++	u16 vlan2;
++	u16 reserved3;
++	u32 reserved4;
++	u32 meter;
++	u32 reserved5[3];
++};
++
+ struct airoha_foe_ipv4_tuple {
+ 	u32 src_ip;
+ 	u32 dest_ip;
+@@ -429,6 +447,7 @@
+ 			u32 ib1;
+ 			union {
+ 				struct airoha_foe_bridge bridge;
++				struct airoha_foe_bridge_an7563 bridge_an7563;
+ 				struct airoha_foe_ipv4 ipv4;
+ 				struct airoha_foe_ipv4_dslite dslite;
+ 				struct airoha_foe_ipv6 ipv6;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -879,6 +879,12 @@
+ 	if (!hwe_p)
+ 		return -EINVAL;
+ 
++	/* Native L2 entries cannot insert or remove PPPoE headers. */
++	if (airoha_is_7563(ppe->eth) &&
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe_p->ib1) ==
++	    PPE_PKT_TYPE_BRIDGE && (e->data.ib1 & AIROHA_FOE_IB1_BIND_PPPOE))
++		return -EOPNOTSUPP;
++
+ 	f = kzalloc(sizeof(*f), GFP_ATOMIC);
+ 	if (!f)
+ 		return -ENOMEM;
+@@ -891,6 +897,21 @@
+ 	hwe.ib1 = (hwe.ib1 & mask) | (e->data.ib1 & ~mask);
+ 
+ 	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1);
++	if (airoha_is_7563(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
++		struct airoha_foe_bridge_an7563 *br = &hwe.bridge_an7563;
++		struct airoha_foe_mac_info_common *l2 = &e->data.bridge.l2.common;
++
++		/* Preserve the complete hardware-learned key. The remainder
++		 * contains actions, with DSCP remarking disabled for bridging.
++		 */
++		memset_after(br, 0, key);
++		br->data = e->data.bridge.data;
++		br->ib2 = e->data.bridge.ib2 & ~AIROHA_FOE_IB2_DSCP;
++		br->vlan1 = l2->vlan1;
++		br->vlan2 = l2->vlan2;
++		br->etype = l2->etype;
++		goto commit;
++	}
+ 	if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
+ 		memcpy(&hwe.ipv6.l2, &e->data.bridge.l2, sizeof(hwe.ipv6.l2));
+ 		hwe.ipv6.ib2 = e->data.bridge.ib2;
+@@ -909,6 +930,7 @@
+ 	}
+ 
+ 	hwe.bridge.data = e->data.bridge.data;
++commit:
+ 	airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
+ 
+ 	return 0;
+@@ -934,6 +956,11 @@
+ 	state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1);
+ 	if (state == AIROHA_FOE_STATE_BIND)
+ 		goto unlock;
++
++	if (airoha_is_7563(ppe->eth) &&
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
++	    PPE_PKT_TYPE_BRIDGE)
++		goto bridge;
+ 
+ 	index = airoha_ppe_foe_get_entry_hash(ppe, hwe);
+ 	hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
+@@ -957,6 +984,7 @@
+ 	if (commit_done)
+ 		goto unlock;
+ 
++bridge:
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -60,7 +60,7 @@
+ 		const char *state_str, *type_str = "UNKNOWN";
+ 		void *src_addr = NULL, *dest_addr = NULL;
+ 		u16 *src_port = NULL, *dest_port = NULL;
+-		struct airoha_foe_mac_info_common *l2;
++		struct airoha_foe_mac_info_common *l2, native_l2;
+ 		unsigned char h_source[ETH_ALEN] = {};
+ 		struct airoha_foe_stats64 stats = {};
+ 		unsigned char h_dest[ETH_ALEN];
+@@ -132,7 +132,22 @@
+ 			break;
+ 		}
+ 
+-		if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
++		if (airoha_is_7563(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
++			struct airoha_foe_bridge_an7563 *br = &hwe->bridge_an7563;
++
++			native_l2 = (struct airoha_foe_mac_info_common) {
++				.dest_mac_hi = br->key[0],
++				.dest_mac_lo = br->key[1] >> 16,
++				.src_mac_hi = br->key[3],
++				.etype = br->etype,
++				.vlan1 = br->vlan1,
++				.vlan2 = br->vlan2,
++			};
++			data = br->data;
++			ib2 = br->ib2;
++			l2 = &native_l2;
++			*((__be16 *)&h_source[4]) = cpu_to_be16(br->key[4] >> 16);
++		} else if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
+ 			data = hwe->ipv6.data;
+ 			ib2 = hwe->ipv6.ib2;
+ 			l2 = &hwe->ipv6.l2;

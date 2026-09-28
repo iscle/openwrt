@@ -39,7 +39,8 @@ static enum rx_parse_result rx_parse(const volatile uint8_t *packet,
 	if ((d0 >> 27) != 2 || reason == 1 || reason == 2 || !(d2 & (1U << 7)))
 		return RX_PARSE_TYPE;
 	if (!(d1 & (1U << 31)) || (d1 & (15U << 23)) ||
-	    ((d2 >> 16) & 31) != 4 ||
+	    (((d2 >> 16) & 31) != 4 && ((d2 >> 16) & 31) != 10 &&
+	     ((d2 >> 16) & 31) != 11 && ((d2 >> 16) & 31) != 12) ||
 	    (d2 & ((1U << 23) | (1U << 24) | (1U << 25))) ||
 	    (d3 & (1U << 24)) || ((d3 >> 16) & 3) != 1)
 		return RX_PARSE_SECURITY;

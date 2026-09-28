@@ -32,13 +32,14 @@ station authorization, replay state and PPE queue teardown.
 +obj-$(CONFIG_NET_AIROHA_AN7552_NPU) += an7552_npu.o
 --- a/drivers/net/ethernet/airoha/an7552_npu.c
 +++ b/drivers/net/ethernet/airoha/an7552_npu.c
-@@ -0,0 +1,1405 @@
+@@ -0,0 +1,1805 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* AN7552 source-firmware transport and MT7992 DMA ownership. */
 +#include <linux/debugfs.h>
 +#include <linux/delay.h>
 +#include <linux/firmware.h>
 +#include <linux/interrupt.h>
++#include <linux/jiffies.h>
 +#include <linux/io.h>
 +#include <linux/iopoll.h>
 +#include <linux/module.h>
@@ -54,7 +55,7 @@ station authorization, replay state and PPE queue teardown.
 +#include "an7552_npu_fw.h"
 +
 +#define CODE_BASE 0x84000000
-+#define CODE_SIZE 0x300000
++#define CODE_SIZE 0x400000
 +#define PACKET_SIZE 0x1600000
 +#define BOOT_TRIGGER 0x306000
 +#define BOOT_CONFIG 0x306004
@@ -62,6 +63,9 @@ station authorization, replay state and PPE queue teardown.
 +#define PN_TABLE_HOST 0x84110000U
 +#define PN_STAGING_HOST 0x841a0000U
 +#define PN_CONTROL 0x700U
++#define PN_DOMAIN_HOST AN7552_PN_DOMAIN_HOST
++#define PN_RADIO_STATE_HOST AN7552_PN_RADIO_STATE_HOST
++#define PN_DOMAIN_INDEX_BITS AN7552_PN_DOMAIN_INDEX_BITS
 +
 +struct an7552_npu;
 +struct an7552_npu_irq {
@@ -71,7 +75,7 @@ station authorization, replay state and PPE queue teardown.
 +
 +struct an7552_npu {
 +	struct device *dev;
-+	void __iomem *regs, *ram, *fe, *pool;
++	void __iomem *regs, *ram, *fe, *pool, *timer;
 +	/* Serializes attachment, boot and teardown of the radio consumer. */
 +	struct mutex attach_lock;
 +	/* Serializes station table updates with the two-core quiesce handshake. */
@@ -80,9 +84,14 @@ station authorization, replay state and PPE queue teardown.
 +	spinlock_t pn_lock;
 +	bool attached, running, failed, stopping, pn_failed;
 +	bool ppe_enabled, tdma_enabled;
++	bool faulted, fault_quiesced;
++	bool pn_domains_initialized;
++	u32 heartbeat[AN7552_CORES], fault_count, recovery_count;
++	u32 discarded_completions, interrupt_parks;
++	unsigned long heartbeat_seen[AN7552_CORES];
 +	u32 pn_sequence, errors;
 +	int queue_error;
-+	bool defer_queues;
++	bool defer_queues, bridge_domains;
 +	u32 tx_base[2], tx_count[2];
 +	struct {
 +		u32 base, count, regs;
@@ -102,7 +111,15 @@ station authorization, replay state and PPE queue teardown.
 +	struct dentry *debugfs;
 +};
 +
++void an7552_npu_set_bridge(struct an7552_npu *ctx, bool enable)
++{
++	/* Called before radio queues start; recovery retains this capability. */
++	ctx->bridge_domains = enable;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_set_bridge);
++
 +static void tdma_stop(struct an7552_npu *ctx);
++static int park_cores(struct an7552_npu *ctx);
 +static bool station_ready(struct an7552_npu *ctx, u32 band, u32 bss, u32 wcid);
 +static irqreturn_t txfree_interrupt(int irq, void *context);
 +static void native_txfree_stop(struct an7552_npu *ctx);
@@ -114,7 +131,8 @@ station authorization, replay state and PPE queue teardown.
 +		      u32 low, u32 high, u32 enable);
 +
 +int an7552_npu_station_set(struct an7552_npu *ctx, u32 wcid, u32 band, u32 bss,
-+			   const u8 *address, bool authorized)
++			   const u8 *address, bool authorized, bool mlo,
++			   bool encrypted)
 +{
 +	void __iomem *control, *entry;
 +	unsigned long flags;
@@ -123,6 +141,8 @@ station authorization, replay state and PPE queue teardown.
 +
 +	if (!ctx || !ctx->running || ctx->stopping)
 +		return 0;
++	if (ctx->faulted)
++		return -EIO;
 +	if (wcid >= AN7552_STATION_COUNT || band > 1 || bss > 255)
 +		return -EINVAL;
 +	control = ctx->regs + 0x3000 + AN7552_STATION_CONTROL;
@@ -130,6 +150,7 @@ station authorization, replay state and PPE queue teardown.
 +	spin_lock_irqsave(&ctx->station_lock, flags);
 +	if (!authorized) {
 +		writel(0, entry);
++		writel(0, entry + 28);
 +		/* Revoke station eligibility before asking the firmware to quiesce. */
 +		wmb();
 +	}
@@ -142,7 +163,8 @@ station authorization, replay state and PPE queue teardown.
 +	writel(0, entry);
 +	if (!authorized)
 +		writel(0, ctx->ram + 0x110000 + wcid * 256);
-+	writel(0, entry + 16);
++	/* A successfully installed data key supplies policy without a CPU packet. */
++	writel(authorized && encrypted ? 0x80 : 0, entry + 16);
 +	if (authorized) {
 +		writel(band | (bss << 8), entry + 4);
 +		writel((u32)address[0] | ((u32)address[1] << 8) |
@@ -152,7 +174,8 @@ station authorization, replay state and PPE queue teardown.
 +		writel((u32)address[4] | ((u32)address[5] << 8), entry + 12);
 +		/* Publish station identity before granting forwarding eligibility. */
 +		wmb();
-+		writel(1, entry);
++		writel(AN7552_STATION_AUTHORIZED |
++		       (mlo ? AN7552_STATION_MLO : 0), entry);
 +	}
 +release:
 +	writel(0, control);
@@ -166,6 +189,89 @@ station authorization, replay state and PPE queue teardown.
 +	return ret;
 +}
 +EXPORT_SYMBOL_GPL(an7552_npu_station_set);
++
++/* Policy changes use the same quiesce protocol as station authorization. */
++static int an7552_npu_policy_write(struct an7552_npu *ctx, void __iomem *entry,
++				   const u32 *words, unsigned int count)
++{
++	void __iomem *control = ctx->regs + 0x3000 + AN7552_STATION_CONTROL;
++	unsigned long flags;
++	u32 value;
++	unsigned int i;
++	int ret;
++
++	spin_lock_irqsave(&ctx->station_lock, flags);
++	writel(0, entry + count * 4);
++	/* Revoke the old policy before requesting the two-core pause. */
++	wmb();
++	writel(1, control);
++	ret = readl_poll_timeout_atomic(control + 4, value,
++					value == 1 && readl(control + 8) == 1,
++					1, 10000);
++	if (!ret && words) {
++		for (i = 0; i < count; i++)
++			writel(words[i], entry + i * 4);
++		/* Publish the complete policy before making it eligible. */
++		wmb();
++		writel(1, entry + count * 4);
++	}
++	writel(0, control);
++	if (!ret)
++		ret = readl_poll_timeout_atomic(control + 4, value,
++						!value && !readl(control + 8),
++						1, 10000);
++	if (ret)
++		writel(0, entry + count * 4);
++	spin_unlock_irqrestore(&ctx->station_lock, flags);
++	return ret;
++}
++
++int an7552_npu_station_route(struct an7552_npu *ctx, u16 wcid,
++			     u16 primary, u16 secondary)
++{
++	u32 words[] = { primary + 1, secondary + 1 };
++	void __iomem *entry;
++
++	if (!ctx || !ctx->running || ctx->stopping)
++		return 0;
++	if (ctx->faulted)
++		return -EIO;
++	if (wcid >= AN7552_STATION_COUNT || primary >= AN7552_STATION_COUNT ||
++	    secondary >= AN7552_STATION_COUNT)
++		return -EINVAL;
++	entry = ctx->ram + AN7552_STATION_HOST - CODE_BASE;
++	/* Bind each WCID to its BSS/radio as well as its peer address. */
++	words[0] |= readl(entry + primary * 32 + 4) << 16;
++	words[1] |= readl(entry + secondary * 32 + 4) << 16;
++	entry += wcid * 32 + 20;
++	return an7552_npu_policy_write(ctx, entry, words, ARRAY_SIZE(words));
++}
++EXPORT_SYMBOL_GPL(an7552_npu_station_route);
++
++int an7552_npu_qos_map(struct an7552_npu *ctx, u8 bss, const u8 *map)
++{
++	u32 words[16];
++	unsigned int i;
++
++	if (!ctx || !ctx->running || ctx->stopping)
++		return 0;
++	if (ctx->faulted)
++		return -EIO;
++	if (!map)
++		return an7552_npu_policy_write(ctx,
++			ctx->ram + AN7552_QOS_HOST - CODE_BASE +
++			bss * AN7552_QOS_STRIDE, NULL, ARRAY_SIZE(words));
++	for (i = 0; i < 64; i++)
++		if (map[i] > 7)
++			return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(words); i++)
++		words[i] = (u32)map[i * 4] | (u32)map[i * 4 + 1] << 8 |
++			   (u32)map[i * 4 + 2] << 16 | (u32)map[i * 4 + 3] << 24;
++	return an7552_npu_policy_write(ctx,
++		ctx->ram + AN7552_QOS_HOST - CODE_BASE + bss * AN7552_QOS_STRIDE,
++		words, ARRAY_SIZE(words));
++}
++EXPORT_SYMBOL_GPL(an7552_npu_qos_map);
 +
 +static bool station_ready(struct an7552_npu *ctx, u32 band, u32 bss, u32 wcid)
 +{
@@ -278,6 +384,7 @@ station authorization, replay state and PPE queue teardown.
 +		band, base, physical, regs, start);
 +	return 0;
 +}
++
 +int an7552_npu_txfree_setup(struct an7552_npu *ctx, u32 band, u32 base,
 +			    u32 count, u32 regs, void (*notify)(void *),
 +			    void *context)
@@ -386,7 +493,7 @@ station authorization, replay state and PPE queue teardown.
 +	writel(ctx->ppe_saved[4] | 0x71, ctx->fe + 0xa04);
 +	/* Enable the DMA engine before handing work to the firmware. */
 +	wmb();
-+	writel(2, q);
++	writel(ctx->bridge_domains ? AN7552_PPE_MODE_BRIDGE : 2, q);
 +	ctx->ppe_enabled = true;
 +	return 0;
 +busy:
@@ -505,6 +612,8 @@ station authorization, replay state and PPE queue teardown.
 +		}
 +	}
 +	memset_io(q, 0, 128);
++	memset_io(ctx->ram + AN7552_PPE_DOMAIN_HOST - CODE_BASE, 0,
++		  AN7552_RX_BUFFER_COUNT * AN7552_PPE_DOMAIN_STRIDE);
 +	memset_io(ctx->ram + AN7552_RX_STATE_HOST - CODE_BASE, 0,
 +		  AN7552_RX_BUFFER_COUNT * 4);
 +	for (i = 0; i < AN7552_RX_BUFFER_COUNT; i++)
@@ -662,7 +771,7 @@ station authorization, replay state and PPE queue teardown.
 +	u32 value;
 +	int ret;
 +
-+	if (ctx->pn_failed)
++	if (ctx->pn_failed || ctx->faulted)
 +		return -EIO;
 +	if (!++ctx->pn_sequence)
 +		++ctx->pn_sequence;
@@ -713,6 +822,71 @@ station authorization, replay state and PPE queue teardown.
 +}
 +EXPORT_SYMBOL_GPL(an7552_npu_pn_check);
 +
++/* Called with pn_lock held, or while the firmware cores are parked. */
++static void __iomem *pn_domain_entry(struct an7552_npu *ctx, u32 handle, u32 key)
++{
++	void __iomem *domain;
++	u32 generation = handle >> PN_DOMAIN_INDEX_BITS;
++
++	if (!generation || key > 3)
++		return NULL;
++	domain = ctx->ram + PN_DOMAIN_HOST - CODE_BASE +
++		 (handle & (AN7552_STATION_COUNT - 1)) * 256;
++	if (!readl(domain) || readl(domain + 4) != generation ||
++	    readl(domain + 8) != key)
++		return NULL;
++	return domain;
++}
++
++u32 an7552_npu_pn_domain(struct an7552_npu *ctx, u32 wcid, u32 key)
++{
++	void __iomem *entry;
++	unsigned long flags;
++	u32 handle = 0, state;
++
++	if (!ctx || !ctx->running || ctx->stopping || ctx->failed ||
++	    ctx->pn_failed || ctx->faulted || wcid >= AN7552_STATION_COUNT || key > 3)
++		return 0;
++	spin_lock_irqsave(&ctx->pn_lock, flags);
++	entry = ctx->ram + PN_TABLE_HOST - CODE_BASE + wcid * 256;
++	state = 1 | (key << 8);
++	if (readl(entry) == state || readl(entry + 60 * 4) == state) {
++		handle = readl(entry + 8);
++		if (!pn_domain_entry(ctx, handle, key))
++			handle = 0;
++	}
++	spin_unlock_irqrestore(&ctx->pn_lock, flags);
++	return handle;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_pn_domain);
++
++int an7552_npu_pn_commit(struct an7552_npu *ctx, const u16 *wcids,
++			 unsigned int count, u32 key)
++{
++	void __iomem *staging;
++	unsigned long flags;
++	unsigned int i;
++	int ret;
++
++	if (!ctx)
++		return 0;
++	if (!ctx->running || ctx->stopping || ctx->failed || ctx->pn_failed)
++		return -EIO;
++	if (!wcids || !count || count > 16 || key > 3)
++		return -EINVAL;
++	for (i = 0; i < count; i++)
++		if (wcids[i] >= AN7552_STATION_COUNT)
++			return -EINVAL;
++	staging = ctx->ram + PN_STAGING_HOST - CODE_BASE;
++	spin_lock_irqsave(&ctx->pn_lock, flags);
++	for (i = 0; i < count; i++)
++		writel(wcids[i], staging + i * 4);
++	ret = pn_request(ctx, 4, count, 0, 0, 0, key);
++	spin_unlock_irqrestore(&ctx->pn_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_pn_commit);
++
 +/* Core 1 serializes snapshots with both packet and host replay checks. */
 +int an7552_npu_pn_get(struct an7552_npu *ctx, u32 wcid, u32 key, u8 *pn)
 +{
@@ -728,7 +902,21 @@ station authorization, replay state and PPE queue teardown.
 +
 +	initial = ctx->ram + PN_STAGING_HOST - CODE_BASE;
 +	spin_lock_irqsave(&ctx->pn_lock, flags);
-+	ret = pn_request(ctx, 3, wcid, 0, 0, 0, key);
++	if (ctx->faulted) {
++		void __iomem *entry = ctx->ram + PN_TABLE_HOST - CODE_BASE + wcid * 256;
++		void __iomem *domain;
++
++		ret = -EIO;
++		domain = ctx->fault_quiesced ?
++			pn_domain_entry(ctx, readl(entry + 8), key) : NULL;
++		if (domain && readl(entry) == (1 | (key << 8))) {
++			initial = domain + 16;
++			writel(0, entry);
++			ret = 0;
++		}
++	} else {
++		ret = pn_request(ctx, 3, wcid, 0, 0, 0, key);
++	}
 +	if (!ret) {
 +		for (i = 0; i < 17; i++) {
 +			u32 low = readl(initial + i * 8);
@@ -750,7 +938,7 @@ station authorization, replay state and PPE queue teardown.
 +EXPORT_SYMBOL_GPL(an7552_npu_pn_get);
 +
 +int an7552_npu_pn_key(struct an7552_npu *ctx, u32 wcid, u32 key, const u8 *pn,
-+		      bool enable)
++		      bool enable, u32 domain, bool prepare)
 +{
 +	unsigned long flags;
 +	unsigned int i;
@@ -777,7 +965,8 @@ station authorization, replay state and PPE queue teardown.
 +		writel(enable ? ((u32)p[1] | (u32)p[0] << 8) : 0,
 +		       initial + i * 8 + 4);
 +	}
-+	ret = pn_request(ctx, 2, wcid, 0, 0, 0, enable ? (1 | (key << 8)) : 0);
++	ret = pn_request(ctx, 2, wcid, domain, 0, 0,
++			 enable ? (1 | (prepare ? 2 : 0) | (key << 8)) : 0);
 +	spin_unlock_irqrestore(&ctx->pn_lock, flags);
 +	return ret;
 +}
@@ -869,6 +1058,119 @@ station authorization, replay state and PPE queue teardown.
 +}
 +EXPORT_SYMBOL_GPL(an7552_npu_tx_setup);
 +
++/* The consumer serializes health checks with reset and device teardown. */
++bool an7552_npu_healthy(struct an7552_npu *ctx)
++{
++	unsigned int i;
++
++	if (!ctx || !ctx->running || ctx->stopping)
++		return true;
++	if (ctx->faulted)
++		return false;
++	for (i = 0; i < AN7552_CORES; i++) {
++		void __iomem *state = ctx->regs + 0x3000 + i * AN7552_STRIDE;
++		u32 magic = readl(state), heartbeat = readl(state + 4);
++
++		if (magic == AN7552_MAGIC && heartbeat != ctx->heartbeat[i]) {
++			ctx->heartbeat[i] = heartbeat;
++			ctx->heartbeat_seen[i] = jiffies;
++			continue;
++		}
++		if (magic == AN7552_MAGIC &&
++		    time_before(jiffies, ctx->heartbeat_seen[i] + 3 * HZ))
++			continue;
++		ctx->faulted = true;
++		ctx->fault_count++;
++		dev_err(ctx->dev,
++			"core %u fault: magic=%08x cause=%08x pc=%08x heartbeat=%u\n",
++			i, magic, readl(state + 8), readl(state + 12), heartbeat);
++		return false;
++	}
++	return true;
++}
++EXPORT_SYMBOL_GPL(an7552_npu_healthy);
++
++bool an7552_npu_recovery_ready(struct an7552_npu *ctx)
++{
++	return !ctx || (!ctx->failed && (!ctx->faulted || ctx->fault_quiesced));
++}
++EXPORT_SYMBOL_GPL(an7552_npu_recovery_ready);
++
++/* No firmware mailbox can be trusted after a trap. Park both writers and
++ * stop TDMA before the consumer resets radio DMA. All packet storage remains
++ * reserved until that reset completes; only then may prepare() reuse it.
++ */
++static int fault_drain_ppe(struct an7552_npu *ctx)
++{
++	unsigned long deadline = jiffies + msecs_to_jiffies(100);
++
++	/* TX DMA is stopped and both software producers are parked. Consume
++	 * old completion tokens before the receive pool can be reinitialized.
++	 * Wait for the shared PPE pipeline as well as its completion FIFO.
++	 */
++	do {
++		if (readl(ctx->fe + 0xfe4) & 0xffff) {
++			u32 status = readl(ctx->fe + 0xfe0);
++
++			if (!(status & BIT(31)))
++				return -EIO;
++			readl(ctx->fe + 0xfdc);
++			writel(BIT(31), ctx->fe + 0xfe0);
++			ctx->discarded_completions++;
++		} else if (!(readl(ctx->fe + 0xe00) & BIT(31))) {
++			return 0;
++		}
++		usleep_range(10, 20);
++	} while (time_before(jiffies, deadline));
++	return -ETIMEDOUT;
++}
++
++static int fault_stop(struct an7552_npu *ctx)
++{
++	unsigned int i, band;
++	u32 value;
++	int ret;
++
++	ret = park_cores(ctx);
++	if (ret)
++		return ret;
++	writel(readl(ctx->fe + 0xa04) & ~(BIT(0) | BIT(2)), ctx->fe + 0xa04);
++	ret = readl_poll_timeout(ctx->fe + 0xa04, value,
++				 !(value & (BIT(1) | BIT(3))), 10, 100000);
++	if (ret)
++		return ret;
++	ret = fault_drain_ppe(ctx);
++	if (ret)
++		return ret;
++	for (band = 0; band < 2; band++) {
++		writel(0, ctx->regs + 0x30d034 + band * 4);
++		if (ctx->txfree_irqs[band]) {
++			free_irq(ctx->txfree_irqs[band], &ctx->txfree_bands[band]);
++			ctx->txfree_irqs[band] = 0;
++		}
++		ctx->txfree_notify[band] = NULL;
++		for (i = 0; i < 3; i++)
++			writel(ctx->saved_ring[band][i],
++			       ctx->fe + 0x900 + band * 16 + i * 4);
++	}
++	writel(0, ctx->regs + 0x30d03c);
++	if (ctx->rro_irq) {
++		free_irq(ctx->rro_irq, ctx);
++		ctx->rro_irq = 0;
++	}
++	ctx->rro_notify = NULL;
++	if (ctx->ppe_enabled) {
++		for (i = 0; i < 3; i++)
++			writel(ctx->ppe_saved[i], ctx->fe + 0x800 + i * 4);
++		writel(ctx->ppe_saved[5], ctx->fe + 0xa28);
++		writel(ctx->ppe_saved[6], ctx->fe + 0xa2c);
++	}
++	ctx->ppe_enabled = false;
++	ctx->tdma_enabled = false;
++	ctx->fault_quiesced = true;
++	return 0;
++}
++
 +void an7552_npu_stop(struct an7552_npu *ctx)
 +{
 +	unsigned int i;
@@ -876,7 +1178,16 @@ station authorization, replay state and PPE queue teardown.
 +
 +	if (!ctx || !ctx->running || ctx->stopping)
 +		return;
++	/* Teardown may precede the periodic health check after a trap. */
++	an7552_npu_healthy(ctx);
 +	ctx->stopping = true;
++	if (ctx->faulted) {
++		if (fault_stop(ctx)) {
++			ctx->failed = true;
++			dev_err(ctx->dev, "fault shutdown failed; DMA buffers retained\n");
++		}
++		return;
++	}
 +	native_rro_stop(ctx);
 +	tdma_stop(ctx);
 +	native_txfree_stop(ctx);
@@ -953,7 +1264,7 @@ station authorization, replay state and PPE queue teardown.
 +	if (!ctx)
 +		return false;
 +	control = ctx->regs + 0x3000 + AN7552_FORWARD_CONTROL;
-+	return ctx->running && !ctx->stopping &&
++	return ctx->running && !ctx->stopping && !ctx->faulted &&
 +	       station_ready(ctx, band, bss, wcid) && readl(control) &&
 +	       (readl(control + 4) == 2 ||
 +		(readl(control + 4) == band && readl(control + 8) == bss &&
@@ -962,33 +1273,78 @@ station authorization, replay state and PPE queue teardown.
 +}
 +EXPORT_SYMBOL_GPL(an7552_npu_forward_path);
 +
-+static void halt_cores(struct an7552_npu *ctx)
++static u32 recovery_timer_stop(struct an7552_npu *ctx)
 +{
-+	u32 value;
-+	unsigned int i;
++	u32 control = readl(ctx->timer) & 0x1e0001ee;
 +
-+	/* Drain RISC-V bus accesses before stopping the cluster. Otherwise a
-+	 * later CPU access to the local SRAM can stall the interconnect.
++	/* Preserve other timers' enables, and acknowledge only timer 0. */
++	writel(control | BIT(16), ctx->timer);
++	readl(ctx->timer);
++	return control;
++}
++
++static int wait_parked(struct an7552_npu *ctx)
++{
++	unsigned int i;
++	u32 value;
++	int ret;
++
++	for (i = 0; i < AN7552_CORES; i++) {
++		void __iomem *ack = ctx->regs + 0x3000 + AN7552_PARK_ACK + i * 4;
++
++		ret = readl_poll_timeout(ack, value, value == AN7552_PARK_MAGIC,
++					 100, 100000);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int park_cores(struct an7552_npu *ctx)
++{
++	unsigned int i;
++	u32 control;
++	int ret;
++
++	writel(1, ctx->regs + 0x3000 + AN7552_PARK_CONTROL);
++	ret = wait_parked(ctx);
++	if (!ret)
++		return 0;
++	for (i = 0; i < AN7552_CORES; i++)
++		if (readl(ctx->regs + 0x3000 + AN7552_FW_RECOVERY_READY + i * 4) != 1)
++			goto failed;
++
++	/* Interrupt a busy loop, then require the same fenced acknowledgment.
++	 * A blocked bus transaction may still fail; never reuse its buffers.
 +	 */
-+	if (ctx->running && !ctx->failed) {
-+		writel(1, ctx->regs + 0x3000 + AN7552_PARK_CONTROL);
-+		for (i = 0; i < AN7552_CORES; i++) {
-+			if (readl_poll_timeout(ctx->regs + 0x3000 +
-+						       AN7552_PARK_ACK + i * 4,
-+					       value,
-+					       value == AN7552_PARK_MAGIC, 100,
-+					       100000)) {
-+				ctx->failed = true;
-+				dev_err(ctx->dev,
-+					"core %u did not acknowledge shutdown\n",
-+					i);
-+				break;
-+			}
-+		}
++	control = recovery_timer_stop(ctx);
++	writel(25000, ctx->timer + 4);
++	writel(control | BIT(0), ctx->timer);
++	readl(ctx->timer);
++	ret = wait_parked(ctx);
++	recovery_timer_stop(ctx);
++	if (!ret) {
++		ctx->interrupt_parks++;
++		return 0;
++	}
++failed:
++	dev_err(ctx->dev, "cores did not acknowledge shutdown\n");
++	return ret;
++}
++
++static int halt_cores(struct an7552_npu *ctx)
++{
++	int ret = 0;
++
++	if (ctx->running) {
++		ret = park_cores(ctx);
++		if (ret)
++			ctx->failed = true;
 +	}
 +	writel(0x300, ctx->regs + BOOT_CONFIG);
 +	writel(2, ctx->regs + BOOT_TRIGGER);
 +	usleep_range(1000, 2000);
++	return ret;
 +}
 +
 +static int boot_firmware(struct an7552_npu *ctx)
@@ -1024,7 +1380,10 @@ station authorization, replay state and PPE queue teardown.
 +		goto release;
 +	}
 +	dev_dbg(ctx->dev, "boot: firmware obtained, halting cores\n");
-+	halt_cores(ctx);
++	ret = halt_cores(ctx);
++	if (ret)
++		goto release;
++	recovery_timer_stop(ctx);
 +	dev_dbg(ctx->dev, "boot: copying firmware\n");
 +	memcpy_toio(ctx->ram, fw->data, fw->size);
 +	dev_dbg(ctx->dev, "boot: clearing shared memory\n");
@@ -1032,9 +1391,26 @@ station authorization, replay state and PPE queue teardown.
 +	dev_dbg(ctx->dev, "boot: clearing replay table\n");
 +	memset_io(ctx->ram + PN_TABLE_HOST - CODE_BASE, 0,
 +		  AN7552_STATION_COUNT * 256);
++	/* Preserve slot generations across firmware recovery so stale host
++	 * handles cannot alias a newly allocated replay domain.
++	 */
++	if (!ctx->pn_domains_initialized) {
++		memset_io(ctx->ram + PN_DOMAIN_HOST - CODE_BASE, 0,
++			  AN7552_STATION_COUNT * 256);
++		ctx->pn_domains_initialized = true;
++	} else {
++		unsigned int index;
++
++		for (index = 0; index < AN7552_STATION_COUNT; index++)
++			writel(0, ctx->ram + PN_DOMAIN_HOST - CODE_BASE + index * 256);
++	}
++	memset_io(ctx->ram + PN_RADIO_STATE_HOST - CODE_BASE, 0,
++		  AN7552_STATION_COUNT * 256);
 +	dev_dbg(ctx->dev, "boot: clearing station table\n");
 +	memset_io(ctx->ram + AN7552_STATION_HOST - CODE_BASE, 0,
 +		  AN7552_STATION_COUNT * 32);
++	memset_io(ctx->ram + AN7552_QOS_HOST - CODE_BASE, 0,
++		  AN7552_QOS_COUNT * AN7552_QOS_STRIDE);
 +	/* Initialize shared memory before releasing either RISC-V core. */
 +	wmb();
 +	for (i = 0; i < AN7552_CORES; i++)
@@ -1064,6 +1440,12 @@ station authorization, replay state and PPE queue teardown.
 +		}
 +	}
 +	ctx->failed = false;
++	ctx->faulted = false;
++	ctx->fault_quiesced = false;
++	for (i = 0; i < AN7552_CORES; i++) {
++		ctx->heartbeat[i] = heartbeat[i];
++		ctx->heartbeat_seen[i] = jiffies;
++	}
 +	ctx->stopping = false;
 +	ctx->pn_failed = false;
 +	ctx->pn_sequence = 0;
@@ -1145,10 +1527,11 @@ station authorization, replay state and PPE queue teardown.
 +				 100000);
 +	if (!ret) {
 +		for (q = 0; q < 2; q++) {
-+			ret = readl_poll_timeout(
-+				control + AN7552_TDMA_CONTROL + 4 + q * 4,
-+				value, value == readl(ctx->fe + 0x90c + q * 16),
-+				100, 500000);
++			void __iomem *consumer = control + AN7552_TDMA_CONTROL + 4 + q * 4;
++
++			ret = readl_poll_timeout(consumer, value,
++						 value == readl(ctx->fe + 0x90c + q * 16),
++						 100, 500000);
 +			if (ret)
 +				break;
 +		}
@@ -1264,8 +1647,22 @@ station authorization, replay state and PPE queue teardown.
 + */
 +int an7552_npu_prepare(struct an7552_npu *ctx, bool full)
 +{
++	int ret;
++
 +	if (!ctx)
 +		return 0;
++	if (ctx->faulted) {
++		if (!full || !ctx->fault_quiesced || ctx->failed)
++			return -EIO;
++		ret = boot_firmware(ctx);
++		if (ret)
++			return ret;
++		ret = tdma_start(ctx);
++		if (ret)
++			return ret;
++		ctx->recovery_count++;
++		dev_info(ctx->dev, "source firmware recovered after core fault\n");
++	}
 +	if (!ctx->running || ctx->failed || ctx->pn_failed)
 +		return -EIO;
 +	ctx->queue_error = 0;
@@ -1328,15 +1725,18 @@ station authorization, replay state and PPE queue teardown.
 +
 +	seq_printf(seq, "running=%u attached=%u failed=%u stopping=%u\n",
 +		   ctx->running, ctx->attached, ctx->failed, ctx->stopping);
++	seq_printf(seq, "faulted=%u quiesced=%u faults=%u recoveries=%u\n",
++		   ctx->faulted, ctx->fault_quiesced, ctx->fault_count, ctx->recovery_count);
++	seq_printf(seq, "ppe=%u tdma=%u discarded_completions=%u interrupt_parks=%u\n",
++		   ctx->ppe_enabled, ctx->tdma_enabled, ctx->discarded_completions,
++		   ctx->interrupt_parks);
 +	if (!ctx->running)
 +		return 0;
 +	for (i = 0; i < 2; i++) {
 +		void __iomem *q = ctx->regs + 0x3000 + i * 64;
 +
-+		seq_printf(
-+			seq,
-+			"core%u magic=%08x heartbeat=%u cause=%08x pc=%08x\n",
-+			i, readl(q), readl(q + 4), readl(q + 8), readl(q + 12));
++		seq_printf(seq, "core%u magic=%08x heartbeat=%u cause=%08x pc=%08x\n",
++			   i, readl(q), readl(q + 4), readl(q + 8), readl(q + 12));
 +	}
 +	for (i = 0x200; i <= 0x700; i += 0x40) {
 +		void __iomem *q = ctx->regs + 0x3000 + i;
@@ -1369,6 +1769,8 @@ station authorization, replay state and PPE queue teardown.
 +	ctx->regs = devm_platform_ioremap_resource(pdev, 0);
 +	if (IS_ERR(ctx->regs))
 +		return PTR_ERR(ctx->regs);
++	/* Timer 0 is inside the NPU register aperture. */
++	ctx->timer = ctx->regs + 0x310100;
 +	ret = of_reserved_mem_region_to_resource(dev->of_node, 0, &resource);
 +	if (ret)
 +		return ret;
@@ -1436,11 +1838,9 @@ station authorization, replay state and PPE queue teardown.
 +MODULE_FIRMWARE("airoha/an7552.bin");
 +MODULE_LICENSE("GPL");
 +MODULE_DESCRIPTION("AN7552 source-built NPU acceleration");
-+
-+MODULE_DESCRIPTION("Airoha AN7552 network processor firmware and Wi-Fi offload");
 --- a/drivers/net/ethernet/airoha/an7552_npu_fw.h
 +++ b/drivers/net/ethernet/airoha/an7552_npu_fw.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,129 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef AN7552_PROTOCOL_H
 +#define AN7552_PROTOCOL_H
@@ -1456,7 +1856,20 @@ station authorization, replay state and PPE queue teardown.
 +#define AN7552_STATION_HOST 0x842a0000U
 +#define AN7552_STATION_NPU 0x442a0000U
 +#define AN7552_STATION_COUNT 2048U
++#define AN7552_STATION_AUTHORIZED 1U
++#define AN7552_STATION_MLO 2U
 +#define AN7552_STATION_CONTROL 0x380U
++#define AN7552_QOS_HOST 0x84290000U
++#define AN7552_QOS_NPU 0x44290000U
++#define AN7552_QOS_COUNT 256U
++#define AN7552_QOS_STRIDE 128U
++/* ABI 4: shared MLD counters and second-radio aggregate continuation. */
++#define AN7552_PN_DOMAIN_HOST 0x84300000U
++#define AN7552_PN_DOMAIN_NPU 0x44300000U
++#define AN7552_PN_RADIO_STATE_HOST 0x84380000U
++#define AN7552_PN_RADIO_STATE_NPU 0x44380000U
++#define AN7552_PN_DOMAIN_INDEX_BITS 11U
++#define AN7552_PN_ENTRY_SIZE 256U
 +#define AN7552_TXFREE_RING_HOST 0x842b0000U
 +#define AN7552_TXFREE_BUFFER_HOST 0x84c00000U
 +#define AN7552_TXFREE_COUNT 512U
@@ -1465,6 +1878,9 @@ station authorization, replay state and PPE queue teardown.
 +#define AN7552_RX_EMI_HOST 0x842d8000U
 +#define AN7552_RX_FREE_HOST 0x842e0000U
 +#define AN7552_RX_STATE_HOST 0x842e6000U
++#define AN7552_PPE_DOMAIN_HOST 0x841e0000U
++#define AN7552_PPE_DOMAIN_STRIDE 32U
++#define AN7552_PPE_MODE_BRIDGE 4U
 +#define AN7552_RX_BUFFER_HOST 0x84e00000U
 +#define AN7552_RX_BUFFER_COUNT 6144U
 +#define AN7552_RX_RING_COUNT 1536U
@@ -1493,6 +1909,31 @@ station authorization, replay state and PPE queue teardown.
 +#define AN7552_DIRECT_TOKENS (AN7552_TDMA_COUNT * AN7552_TDMA_BANDS)
 +#define AN7552_TDMA_BUFFER_SIZE 2048U
 +
++#if AN7552_PPE_DOMAIN_HOST + AN7552_RX_BUFFER_COUNT * AN7552_PPE_DOMAIN_STRIDE > AN7552_NATIVE_RING_HOST
++#error "Bridge domain state overlaps native rings"
++#endif
++
++#if AN7552_QOS_HOST < AN7552_FORWARD_WORK_HOST + AN7552_DIRECT_TOKENS * 16
++#error "QoS policy overlaps forwarding work"
++#endif
++#if AN7552_PPE_DOMAIN_HOST + AN7552_RX_BUFFER_COUNT * AN7552_PPE_DOMAIN_STRIDE > AN7552_NATIVE_RING_HOST
++#error "Bridge domain state overlaps native rings"
++#endif
++
++#if AN7552_QOS_HOST + AN7552_QOS_COUNT * AN7552_QOS_STRIDE > AN7552_STATION_HOST
++#error "QoS policy overlaps station state"
++#endif
++
++#if (1U << AN7552_PN_DOMAIN_INDEX_BITS) != AN7552_STATION_COUNT
++#error "Replay domain handle index does not cover the station table"
++#endif
++#if AN7552_PN_DOMAIN_HOST + AN7552_STATION_COUNT * AN7552_PN_ENTRY_SIZE > AN7552_PN_RADIO_STATE_HOST
++#error "Replay domains overlap radio continuation state"
++#endif
++#if AN7552_PN_RADIO_STATE_HOST + AN7552_STATION_COUNT * AN7552_PN_ENTRY_SIZE > AN7552_TDMA_RING_HOST
++#error "Radio continuation state overlaps TDMA memory"
++#endif
++
 +#endif
 +
 +#ifndef AN7552_FIRMWARE_ABI_H
@@ -1501,13 +1942,21 @@ station authorization, replay state and PPE queue teardown.
 +/* All on-disk fields are little-endian 32-bit words. */
 +#define AN7552_FW_MAGIC 0x3255504e
 +#define AN7552_FW_FORMAT_VERSION 1
-+#define AN7552_FW_ABI_VERSION 1
++#define AN7552_FW_ABI_VERSION 5
 +#define AN7552_FW_HEADER_SIZE 32
 +#define AN7552_FW_CORES 2
 +#define AN7552_FW_MAX_SIZE 0x10000
 +
 +/* Runtime ABI announcement, one word per core in shared SRAM. */
 +#define AN7552_FW_RUNTIME_ABI 0x1f0
++
++/* One word per core, published after enabling the recovery interrupt. */
++#define AN7552_FW_RECOVERY_READY 0x1d0
++
++/* Trap handlers drain stores and acknowledge parking before sleeping. */
++#define AN7552_FW_PARK_ACK 0x1e4
++#define AN7552_FW_PARK_MAGIC 0x7552a11d
++#define AN7552_FW_TRAP_MAGIC 0xdead7552
 +
 +/* Header: magic, format, ABI, header size, image size, entry offset,
 + * core count, reserved (must be zero).
@@ -1523,7 +1972,7 @@ station authorization, replay state and PPE queue teardown.
 +#endif
 --- a/include/linux/soc/airoha/an7552_npu.h
 +++ b/include/linux/soc/airoha/an7552_npu.h
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,237 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef _LINUX_SOC_AIROHA_AN7552_NPU_H
 +#define _LINUX_SOC_AIROHA_AN7552_NPU_H
@@ -1532,10 +1981,15 @@ station authorization, replay state and PPE queue teardown.
 +struct device;
 +struct an7552_npu;
 +#if IS_REACHABLE(CONFIG_NET_AIROHA_AN7552_NPU)
++void an7552_npu_set_bridge(struct an7552_npu *ctx, bool enable);
 +struct an7552_npu *an7552_npu_get(struct device *consumer);
++int an7552_npu_station_route(struct an7552_npu *ctx, u16 wcid,
++			     u16 primary, u16 secondary);
++int an7552_npu_qos_map(struct an7552_npu *ctx, u8 bss, const u8 *map);
 +void an7552_npu_put(struct an7552_npu *ctx);
 +int an7552_npu_station_set(struct an7552_npu *ctx, u32 wcid, u32 band, u32 bss,
-+			   const u8 *address, bool authorized);
++			   const u8 *address, bool authorized, bool mlo,
++			   bool encrypted);
 +void an7552_npu_txfree_irq_enable(struct an7552_npu *ctx, u32 band);
 +int an7552_npu_txfree_setup(struct an7552_npu *ctx, u32 band, u32 base,
 +			    u32 count, u32 regs, void (*notify)(void *),
@@ -1557,7 +2011,12 @@ station authorization, replay state and PPE queue teardown.
 +			const u8 *pn);
 +int an7552_npu_pn_get(struct an7552_npu *ctx, u32 wcid, u32 key, u8 *pn);
 +int an7552_npu_pn_key(struct an7552_npu *ctx, u32 wcid, u32 key, const u8 *pn,
-+		      bool enable);
++		      bool enable, u32 domain, bool prepare);
++u32 an7552_npu_pn_domain(struct an7552_npu *ctx, u32 wcid, u32 key);
++int an7552_npu_pn_commit(struct an7552_npu *ctx, const u16 *wcids,
++			 unsigned int count, u32 key);
++bool an7552_npu_healthy(struct an7552_npu *ctx);
++bool an7552_npu_recovery_ready(struct an7552_npu *ctx);
 +bool an7552_npu_active(struct an7552_npu *ctx);
 +u32 an7552_npu_tx_read(struct an7552_npu *ctx, unsigned int band, u32 offset);
 +void an7552_npu_tx_write(struct an7552_npu *ctx, unsigned int band, u32 offset,
@@ -1571,6 +2030,22 @@ station authorization, replay state and PPE queue teardown.
 +bool an7552_npu_forward_path(struct an7552_npu *ctx, u32 band, u32 bss,
 +			     u32 wcid);
 +#else
++static inline void an7552_npu_set_bridge(struct an7552_npu *ctx, bool enable)
++{
++}
++
++static inline int an7552_npu_station_route(struct an7552_npu *ctx, u16 wcid,
++					   u16 primary, u16 secondary)
++{
++	return 0;
++}
++
++static inline int an7552_npu_qos_map(struct an7552_npu *ctx, u8 bss,
++				     const u8 *map)
++{
++	return 0;
++}
++
 +static inline int an7552_npu_pn_get(struct an7552_npu *ctx, u32 wcid, u32 key,
 +				    u8 *pn)
 +{
@@ -1603,9 +2078,9 @@ station authorization, replay state and PPE queue teardown.
 +
 +static inline int an7552_npu_station_set(struct an7552_npu *ctx, u32 wcid,
 +					 u32 band, u32 bss, const u8 *address,
-+					 bool authorized)
++					 bool authorized, bool mlo, bool encrypted)
 +{
-+	return -EOPNOTSUPP;
++	return 0;
 +}
 +
 +static inline void an7552_npu_txfree_irq_enable(struct an7552_npu *ctx,
@@ -1676,9 +2151,31 @@ station authorization, replay state and PPE queue teardown.
 +}
 +
 +static inline int an7552_npu_pn_key(struct an7552_npu *ctx, u32 wcid, u32 key,
-+				    const u8 *pn, bool enable)
++				    const u8 *pn, bool enable, u32 domain,
++				    bool prepare)
 +{
 +	return 0;
++}
++
++static inline u32 an7552_npu_pn_domain(struct an7552_npu *ctx, u32 wcid, u32 key)
++{
++	return 0;
++}
++
++static inline int an7552_npu_pn_commit(struct an7552_npu *ctx, const u16 *wcids,
++				     unsigned int count, u32 key)
++{
++	return 0;
++}
++
++static inline bool an7552_npu_healthy(struct an7552_npu *ctx)
++{
++	return true;
++}
++
++static inline bool an7552_npu_recovery_ready(struct an7552_npu *ctx)
++{
++	return true;
 +}
 +
 +static inline bool an7552_npu_active(struct an7552_npu *ctx)
