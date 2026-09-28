@@ -1,0 +1,124 @@
+Subject: [PATCH] wifi: mt76: mt7996: preserve MLO forwarding identities on reset
+
+Hardware forwarding entries retain BSS indices and the selected station
+link across radio recovery. Recreating interfaces in a different order
+changes their BSS indices even when the station WCIDs remain stable.
+Packets from existing flows are then rejected until the flows expire.
+
+Reserve each active interface link's BSS index while rebuilding the radio,
+and recreate each station's previous default link first. Release unused
+BSS reservations when removing an interface.
+
+---
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -316,6 +316,7 @@
+ 	u8 deflink_id;
+ 	u8 seclink_id;
+ 	bool decap_offload;
++	u8 reset_deflink; /* Previous default link ID plus one. */
+ 	/* WCID plus one, reserved until the link is restored after reset. */
+ 	u16 reset_wcid[IEEE80211_MLD_MAX_NUM_LINKS];
+ 
+@@ -341,6 +342,7 @@
+ 
+ 	struct mt7996_vif_link_info link_info[IEEE80211_MLD_MAX_NUM_LINKS];
+ 
++	u8 reset_bss[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	u8 mld_group_idx;
+ 	u8 mld_remap_idx;
+ };
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -320,7 +320,10 @@
+ 					       msta_link, true);
+ 	}
+ 
+-	mlink->idx = __ffs64(~dev->mt76.vif_mask);
++	if (!mlink->offchannel && mvif->reset_bss[link_conf->link_id])
++		mlink->idx = mvif->reset_bss[link_conf->link_id] - 1;
++	else
++		mlink->idx = __ffs64(~dev->mt76.vif_mask);
+ 	if (mlink->idx >= mt7996_max_interface_num(dev))
+ 		return -ENOSPC;
+ 
+@@ -344,6 +347,8 @@
+ 		return ret;
+ 
+ 	dev->mt76.vif_mask |= BIT_ULL(mlink->idx);
++	if (!mlink->offchannel)
++		mvif->reset_bss[link_conf->link_id] = 0;
+ 	dev->mld_idx_mask |= BIT_ULL(link->mld_idx);
+ 	phy->omac_mask |= BIT_ULL(mlink->omac_idx);
+ 
+@@ -614,6 +619,12 @@
+ 	int i;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
++	for (i = 0; i < ARRAY_SIZE(mvif->reset_bss); i++) {
++		if (!mvif->reset_bss[i])
++			continue;
++		dev->mt76.vif_mask &= ~BIT_ULL(mvif->reset_bss[i] - 1);
++		mvif->reset_bss[i] = 0;
++	}
+ 
+ 	/* Remove all active links */
+ 	for_each_set_bit(link_id, &rem_links, IEEE80211_MLD_MAX_NUM_LINKS) {
+@@ -1379,7 +1390,21 @@
+ 	msta->deflink_id = IEEE80211_LINK_UNSPECIFIED;
+ 	msta->seclink_id = IEEE80211_LINK_UNSPECIFIED;
+ 	msta->vif = mvif;
+-	err = mt7996_mac_sta_add_links(dev, vif, sta, links);
++	if (msta->reset_deflink &&
++	    (links & BIT(msta->reset_deflink - 1))) {
++		unsigned long first = BIT(msta->reset_deflink - 1);
++
++		msta->reset_deflink = 0;
++		err = mt7996_mac_sta_add_links(dev, vif, sta, first);
++		if (!err)
++			err = mt7996_mac_sta_add_links(dev, vif, sta,
++						       links & ~first);
++		if (err)
++			mt7996_mac_sta_remove_links(dev, vif, sta, first, true);
++	} else {
++		msta->reset_deflink = 0;
++		err = mt7996_mac_sta_add_links(dev, vif, sta, links);
++	}
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2453,6 +2453,9 @@
+ 	struct mt7996_dev *dev = data;
+ 	int i;
+ 
++	if (msta->deflink_id != IEEE80211_LINK_UNSPECIFIED)
++		msta->reset_deflink = msta->deflink_id + 1;
++
+ 	for (i = 0; i < ARRAY_SIZE(msta->link); i++)
+ 		mt7996_mac_sta_remove_link(dev, sta, i, true);
+ }
+@@ -2476,6 +2479,7 @@
+ {
+ 	struct mt76_vif_link *mlink = (struct mt76_vif_link *)vif->drv_priv;
+ 	struct mt76_vif_data *mvif = mlink->mvif;
++	struct mt7996_vif *avif = (void *)vif->drv_priv;
+ 	struct mt7996_dev *dev = data;
+ 	int i;
+ 
+@@ -2483,7 +2487,13 @@
+ 	for (i = 0; i < ARRAY_SIZE(mvif->link); i++) {
+ 
+ 		mlink = mt76_dereference(mvif->link[i], &dev->mt76);
+-		if (!mlink || mlink == (struct mt76_vif_link *)vif->drv_priv)
++		if (!mlink)
++			continue;
++		if (mvif->valid_links & BIT(i)) {
++			avif->reset_bss[i] = mlink->idx + 1;
++			dev->mt76.vif_mask |= BIT_ULL(mlink->idx);
++		}
++		if (mlink == (struct mt76_vif_link *)vif->drv_priv)
+ 			continue;
+ 
+ 		rcu_assign_pointer(mvif->link[i], NULL);
