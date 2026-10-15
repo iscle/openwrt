@@ -253,7 +253,7 @@ static int native_rro_receive_one(struct rro_batch *b)
 							   0x780 +
 							   parsed_result *
 								   4))++;
-		/* Station and key state change only under core 1 handshakes. */
+		/* Classify using the currently authorized station identity. */
 		if (b->mode == 2 && (security & 15) == 1 &&
 		    parsed_result == RX_PARSE_OK &&
 		    parsed.wcid == (security >> 4) && parsed.band < 2) {
@@ -274,15 +274,15 @@ static int native_rro_receive_one(struct rro_batch *b)
 	} else {
 		offset = saved[6];
 		fast = saved[7];
-		if (fast) {
-			uint32_t wcid = saved[4] >> 4;
-			station = (void *)(uintptr_t)(AN7552_STATION_NPU +
-						      wcid * 32);
-			if (!station[0] || !pn_entry(wcid)[0] ||
-			    pn_entry(wcid)[1] != saved[5]) {
-				fast = 0;
-				saved[7] = 0;
-			}
+	}
+	/* Linux can revoke station eligibility before the core 1 handshake. */
+	if (fast) {
+		uint32_t wcid = saved[4] >> 4;
+		station = (void *)(uintptr_t)(AN7552_STATION_NPU + wcid * 32);
+		if (!station[0] || !pn_entry(wcid)[0] ||
+		    pn_entry(wcid)[1] != saved[5]) {
+			fast = 0;
+			saved[7] = 0;
 		}
 	}
 	if (fast) {
@@ -347,3 +347,4 @@ static void native_rro_receive(void)
 	}
 	native_rro_flush(&b);
 }
+
