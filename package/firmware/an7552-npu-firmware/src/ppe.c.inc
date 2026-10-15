@@ -1,29 +1,24 @@
 /* SPDX-License-Identifier: MIT */
-static int native_ppe_submit(uint32_t token, uint32_t address, uint32_t length)
+/* Single-frame submission through the batched queue; used by host tests. */
+__attribute__((unused)) static int
+native_ppe_submit(uint32_t token, uint32_t address, uint32_t length)
 {
 	volatile uint32_t *q = (void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
-	uint32_t producer = q[10], next = (producer + 1) % 64;
-	volatile uint32_t *descriptor = rx_words(0x842f0000 + producer * 32);
-	if (q[0] != 2 || q[3] || next == read32(0x1fb5080c) ||
-	    !(descriptor[1] & 0x80000000))
+	struct rro_batch b = { 0 };
+
+	b.mode = q[0];
+	b.ppe_producer = q[10];
+	b.ppe_hw = read32(0x1fb5080c);
+	if (!native_ppe_queue(&b, token, address, length))
 		return 0;
-	descriptor[2] = address;
-	descriptor[4] = 0x80000000 | (token << 14);
-	descriptor[5] = 0x7f4087ff;
-	barrier();
-	descriptor[1] = length;
-	barrier();
-	*(volatile uint32_t *)(uintptr_t)0x1fb50808 = next;
-	q[10] = next;
-	q[1]++;
-	q[12]++;
+	native_ppe_flush(&b);
 	return 1;
 }
 static void native_ppe_receive(void)
 {
 	volatile uint32_t *q = (void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
 	uint32_t status, metadata, token;
-	for (uint32_t budget = 0; budget < 32; budget++) {
+	for (uint32_t budget = 0; budget < 64; budget++) {
 		if (!(read32(0x1fb50fe4) & 65535))
 			return;
 		status = read32(0x1fb50fe0);

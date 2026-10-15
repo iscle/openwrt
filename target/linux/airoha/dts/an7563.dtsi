@@ -328,10 +328,11 @@
 		};
 
 		watchdog@1fbf0100 {
-			compatible = "airoha,en7523-wdt";
-			reg = <0x1fbf0100 0x38>;
+			compatible = "airoha,en7523-wdt", "airoha,en7581-wdt";
+			reg = <0x1fbf0100 0x3c>;
 
-			clocks = <&sys_hclk>;
+			/* The faster bus clock errs towards a longer timeout. */
+			clocks = <&scu EN7523_CLK_BUS>;
 			clock-names = "bus";
 		};
 

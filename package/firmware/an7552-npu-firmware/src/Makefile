@@ -37,7 +37,7 @@ build/an7552.bin: build/an7552.elf
 .PHONY: all
 
 HOSTCC ?= cc
-TESTS := pn rx-ownership rx-parse station-frame txfree
+TESTS := pn rx-batch rx-ownership rx-parse station-frame txfree
 
 build/test-%: tests/%.c $(wildcard *.h *.c.inc) | build
 	$(HOSTCC) -O2 -Wall -Wextra -Werror $< -o $@
@@ -46,3 +46,4 @@ check: $(addprefix build/test-,$(TESTS))
 	@set -e; for test in $^; do $$test; done
 
 .PHONY: check
+
