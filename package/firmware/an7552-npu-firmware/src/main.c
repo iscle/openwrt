@@ -13,6 +13,8 @@ static uint32_t read32(uint32_t address)
 	return *(volatile uint32_t *)(uintptr_t)address;
 }
 
+#define TDMA_BATCH 32U
+/* Reclaim and consume bounded batches with one doorbell write per batch. */
 static void tdma_receive(volatile uint32_t *state, uint32_t *consumer,
 			 uint32_t *reclaim, uint32_t band)
 {
@@ -22,7 +24,7 @@ static void tdma_receive(volatile uint32_t *state, uint32_t *consumer,
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_FORWARD_CONTROL);
 	volatile uint32_t *work;
 	volatile uint32_t *descriptor;
-	uint32_t control, length;
+	uint32_t control, length, last = 0, returned = 0, forwarding;
 	uint32_t registers = 0x1fb50900 + band * 16;
 
 	if (!*enable) {
@@ -36,12 +38,15 @@ static void tdma_receive(volatile uint32_t *state, uint32_t *consumer,
 		*reclaim = *consumer;
 	}
 	state[12] |= 1U << band;
-	if (forward[0] && (forward[1] == 2 || forward[1] == band)) {
-		work = (void *)(uintptr_t)(AN7552_FORWARD_WORK_NPU +
-					   (band * AN7552_TDMA_COUNT +
-					    *reclaim) *
-						   16);
-		if (work[0] == 3) {
+	forwarding = forward[0] && (forward[1] == 2 || forward[1] == band);
+	if (forwarding) {
+		for (uint32_t n = 0; n < TDMA_BATCH; n++) {
+			work = (void *)(uintptr_t)(AN7552_FORWARD_WORK_NPU +
+						   (band * AN7552_TDMA_COUNT +
+						    *reclaim) *
+							   16);
+			if (work[0] != 3)
+				break;
 			barrier();
 			descriptor =
 				(void *)(uintptr_t)(AN7552_TDMA_RING_NPU +
@@ -50,60 +55,65 @@ static void tdma_receive(volatile uint32_t *state, uint32_t *consumer,
 							    32);
 			descriptor[1] = AN7552_TDMA_BUFFER_SIZE;
 			work[0] = 0;
-			barrier();
-			*(volatile uint32_t *)(uintptr_t)(registers + 8) =
-				*reclaim;
+			last = *reclaim;
+			returned = 1;
 			*reclaim = (*reclaim + 1) % AN7552_TDMA_COUNT;
 			forward[9]++;
 		}
-		work = (void *)(uintptr_t)(AN7552_FORWARD_WORK_NPU +
-					   (band * AN7552_TDMA_COUNT +
-					    *consumer) *
-						   16);
-		if (work[0])
-			return;
 	}
-	descriptor =
-		(void *)(uintptr_t)(AN7552_TDMA_RING_NPU +
-				    (band * AN7552_TDMA_COUNT + *consumer) *
-					    32);
-	control = descriptor[1];
-	if (!(control & 0x80000000))
-		return;
-	barrier();
-	length = control & 0xffff;
-	if (!length || length > AN7552_TDMA_BUFFER_SIZE ||
-	    descriptor[2] != AN7552_TDMA_BUFFER_HOST +
-				     (band * AN7552_TDMA_COUNT + *consumer) *
-					     AN7552_TDMA_BUFFER_SIZE) {
-		state[14]++;
-		*enable = 0;
-		return;
-	}
-	state[5]++;
-	state[7] = length;
-	state[8] = descriptor[4];
-	state[9] = descriptor[5];
-	state[10] = descriptor[6];
-	state[11] = descriptor[7];
-	if (forward[0] && (forward[1] == 2 || forward[1] == band)) {
-		work = (void *)(uintptr_t)(AN7552_FORWARD_WORK_NPU +
-					   (band * AN7552_TDMA_COUNT +
-					    *consumer) *
-						   16);
-		work[1] = length;
-		work[2] = descriptor[4];
-		work[3] = descriptor[6] >> 24;
+	for (uint32_t n = 0; n < TDMA_BATCH; n++) {
+		if (forwarding) {
+			work = (void *)(uintptr_t)(AN7552_FORWARD_WORK_NPU +
+						   (band * AN7552_TDMA_COUNT +
+						    *consumer) *
+							   16);
+			if (work[0])
+				break;
+		}
+		descriptor =
+			(void *)(uintptr_t)(AN7552_TDMA_RING_NPU +
+					    (band * AN7552_TDMA_COUNT +
+					     *consumer) *
+						    32);
+		control = descriptor[1];
+		if (!(control & 0x80000000))
+			break;
 		barrier();
-		work[0] = 1;
-		forward[8]++;
+		length = control & 0xffff;
+		if (!length || length > AN7552_TDMA_BUFFER_SIZE ||
+		    descriptor[2] != AN7552_TDMA_BUFFER_HOST +
+					     (band * AN7552_TDMA_COUNT +
+					      *consumer) *
+						     AN7552_TDMA_BUFFER_SIZE) {
+			state[14]++;
+			*enable = 0;
+			break;
+		}
+		state[5]++;
+		state[7] = length;
+		if (forwarding) {
+			work[1] = length;
+			work[2] = descriptor[4];
+			work[3] = descriptor[6] >> 24;
+			barrier();
+			work[0] = 1;
+			forward[8]++;
+			*consumer = (*consumer + 1) % AN7552_TDMA_COUNT;
+			continue;
+		}
+		state[8] = descriptor[4];
+		state[9] = descriptor[5];
+		state[10] = descriptor[6];
+		state[11] = descriptor[7];
+		descriptor[1] = AN7552_TDMA_BUFFER_SIZE;
+		last = *consumer;
+		returned = 1;
 		*consumer = (*consumer + 1) % AN7552_TDMA_COUNT;
-		return;
 	}
-	descriptor[1] = AN7552_TDMA_BUFFER_SIZE;
-	barrier();
-	*(volatile uint32_t *)(uintptr_t)(registers + 8) = *consumer;
-	*consumer = (*consumer + 1) % AN7552_TDMA_COUNT;
+	if (returned) {
+		barrier();
+		*(volatile uint32_t *)(uintptr_t)(registers + 8) = last;
+	}
 }
 
 #include "station.c.inc"
