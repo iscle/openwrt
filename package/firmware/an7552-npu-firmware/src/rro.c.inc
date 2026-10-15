@@ -130,7 +130,7 @@ static int native_rx_deliver(uint32_t token, uint32_t ppe_info)
 }
 /* Per-batch copies of shared indexes and counters, published once per batch. */
 struct rro_batch {
-	uint32_t index, phase, mode, done, secure;
+	uint32_t index, phase, mode, done, secure, chain;
 	uint32_t ppe_producer, ppe_hw, ppe_pending;
 };
 
@@ -194,6 +194,7 @@ static void native_rro_flush(struct rro_batch *b)
 		b->index ? b->index - 1 : AN7552_RX_RING_COUNT - 1;
 	q[16] = b->index;
 	q[17] = b->phase;
+	q[30] = b->chain;
 	q[7] += b->done;
 	b->done = 0;
 }
@@ -244,6 +245,12 @@ static int native_rro_receive_one(struct rro_batch *b)
 		saved[1] = d1;
 		saved[2] = d2;
 		saved[3] = d3;
+		/* A buffer after a non-final one continues the previous MPDU and
+		 * starts with payload, not a receive descriptor: never parse it
+		 * or let its bytes update replay counters.
+		 */
+		if (b->chain)
+			reason = 1;
 		security = (reason == 1 || reason == 2) ?
 				   0 :
 				   native_rx_security(packet, length, &cookie);
@@ -259,8 +266,11 @@ static int native_rro_receive_one(struct rro_batch *b)
 							   0x780 +
 							   parsed_result *
 								   4))++;
-		/* Classify using the currently authorized station identity. */
+		/* Classify using the currently authorized station identity.
+		 * Only frames held entirely in this buffer can be forwarded.
+		 */
 		if (b->mode == 2 && (security & 15) == 1 &&
+		    (d1 & (1U << 30)) &&
 		    parsed_result == RX_PARSE_OK &&
 		    parsed.wcid == (security >> 4) && parsed.band < 2) {
 			station = (void *)(uintptr_t)(AN7552_STATION_NPU +
@@ -308,6 +318,8 @@ static int native_rro_receive_one(struct rro_batch *b)
 		if (!native_rx_deliver(token, 0))
 			return RRO_BLOCKED;
 	}
+	/* Data1 bit 30 marks the last buffer of an MPDU. */
+	b->chain = !(d1 & (1U << 30));
 	b->index++;
 	if (b->index == AN7552_RX_RING_COUNT) {
 		b->index = 0;
@@ -339,6 +351,7 @@ static void native_rro_receive(void)
 	native_rx_refill(1);
 	b.index = q[16];
 	b.phase = q[17];
+	b.chain = q[30];
 	b.mode = ppe[0];
 	b.done = 0;
 	b.secure = 0;

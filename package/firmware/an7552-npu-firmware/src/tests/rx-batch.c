@@ -151,7 +151,7 @@ static void packet(uint32_t token, int fragment)
 	if (fragment)
 		bytes[116] = 0x20;
 	ring[0] = AN7552_RX_BUFFER_HOST + token * 2048;
-	ring[1] = 160U << 16;
+	ring[1] = (160U << 16) | (1U << 30);
 	ring[2] = (AN7552_RX_TOKEN_BASE + token) << 16;
 	ring[3] = 0;
 	rx_words(AN7552_RX_STATE_HOST)[token] = 1;
@@ -235,6 +235,35 @@ static void test_security_accounting(int ppe_full)
 	assert(control()[23] == 1);
 }
 
+/* A buffer following a non-final one carries payload, not a descriptor:
+ * even if its bytes look like a valid secure frame, it must not be parsed,
+ * must not advance replay counters and must reach Linux in order.
+ */
+static void test_continuation(void)
+{
+	volatile uint32_t *ring = rx_words(AN7552_RX_COMPLETE_HOST);
+	uint32_t low, high;
+
+	reset();
+	ppe_ready = 1;
+	packet(0, 0);
+	packet(1, 0);
+	ring[1] = 160U << 16;			/* first buffer, more follows */
+	rx_words(AN7552_RX_BUFFER_HOST + 2048)[12] = 0x7fffffff;	/* bogus PN */
+	low = pn_entry(2)[4 + 5 * 2];
+	high = pn_entry(2)[5 + 5 * 2];
+	native_rro_receive();
+	native_ppe_service();
+	assert(control()[7] == 2 && !control()[6]);
+	assert(!ppe_control()[1]);		/* nothing went to the PPE */
+	assert(control()[2] == 2);		/* both delivered to Linux */
+	/* Only the first buffer's real PN (1) may be recorded. */
+	assert(pn_entry(2)[4 + 5 * 2] == 1 && pn_entry(2)[5 + 5 * 2] == 0);
+	(void)low;
+	(void)high;
+	assert(!control()[30]);			/* chain closed by the last buffer */
+}
+
 int main(void)
 {
 	for (unsigned int i = 0; i < sizeof(regions) / sizeof(regions[0]); i++) {
@@ -251,6 +280,7 @@ int main(void)
 	test_ordering(0, 1);
 	test_security_accounting(0);
 	test_security_accounting(1);
-	puts("PASS: RX batch revocation, ordering, backpressure and security accounting");
+	test_continuation();
+	puts("PASS: RX batch revocation, ordering, backpressure, security accounting and continuation buffers");
 	return 0;
 }
