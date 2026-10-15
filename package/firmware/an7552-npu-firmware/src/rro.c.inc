@@ -212,6 +212,9 @@ static int native_rro_receive_one(struct rro_batch *b)
 	uint32_t d0, d1, d2, d3, state, length, address, token, reason,
 		cookie = 0, security, band, offset = 0, fast = 0;
 
+	/* rx_parse() fills these only on success; keep gcc -Werror quiet. */
+	parsed.wcid = parsed.band = parsed.bss = 0;
+	parsed.offset = parsed.length = 0;
 	descriptor = rx_words(AN7552_RX_COMPLETE_HOST + b->index * 16);
 	d3 = descriptor[3];
 	if ((d3 >> 28) != b->phase)

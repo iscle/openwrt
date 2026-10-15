@@ -22,7 +22,7 @@ static void tdma_receive(volatile uint32_t *state, uint32_t *consumer,
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_TDMA_CONTROL);
 	volatile uint32_t *forward =
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_FORWARD_CONTROL);
-	volatile uint32_t *work;
+	volatile uint32_t *work = 0;
 	volatile uint32_t *descriptor;
 	uint32_t control, length, last = 0, returned = 0, forwarding;
 	uint32_t registers = 0x1fb50900 + band * 16;
