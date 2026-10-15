@@ -1,0 +1,83 @@
+From: Pavel Bragin <pabragin@yandex.ru>
+Subject: [PATCH] mt76: dma: drop every buffer of a discarded multi-buffer MPDU
+
+When the first buffer of a multi-buffer MPDU is discarded (-EAGAIN from
+the RRO completion path, an explicit drop or an oversized length), the
+remaining buffers were processed as new frames. Their payload was parsed
+as receive descriptors, and a middle buffer could become rx_head and absorb
+the next real frame. Undecryptable A-MSDUs during a key change arrive this
+way, so a 4-way handshake message could be lost.
+
+Skip buffers until the last one of the MPDU and free a partial rx_head.
+
+Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
+---
+diff --git a/dma.c b/dma.c
+index af7eb2c9..bdf2c84f 100644
+--- a/dma.c
++++ b/dma.c
+@@ -1001,6 +1001,7 @@ mt76_dma_rx_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+ 		dev_kfree_skb(q->rx_head);
+ 		q->rx_head = NULL;
+ 	}
++	q->rx_skip_frags = false;
+ 
+ 	spin_unlock_bh(&q->lock);
+ }
+@@ -1116,6 +1117,14 @@ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
+ 			break;
+ 
+ 		if (PTR_ERR(data) == -EAGAIN) {
++			/* Drop the whole MPDU: its remaining buffers must neither
++			 * complete a partial frame nor start new ones.
++			 */
++			if (q->rx_head) {
++				dev_kfree_skb(q->rx_head);
++				q->rx_head = NULL;
++			}
++			q->rx_skip_frags = more;
+ 			done++;
+ 			continue;
+ 		}
+@@ -1129,8 +1138,20 @@ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
+ 			continue;
+ 		}
+ 
+-		if (drop)
++		if (q->rx_skip_frags) {
++			/* Continuation of an MPDU whose first buffer was dropped. */
++			q->rx_skip_frags = more;
+ 			goto free_frag;
++		}
++
++		if (drop) {
++			if (q->rx_head) {
++				dev_kfree_skb(q->rx_head);
++				q->rx_head = NULL;
++			}
++			q->rx_skip_frags = more;
++			goto free_frag;
++		}
+ 
+ 		if (q->rx_head)
+ 			data_len = q->buf_size;
+@@ -1140,6 +1161,7 @@ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
+ 		if (data_len < len + q->buf_offset) {
+ 			dev_kfree_skb(q->rx_head);
+ 			q->rx_head = NULL;
++			q->rx_skip_frags = more;
+ 			goto free_frag;
+ 		}
+ 
+diff --git a/mt76.h b/mt76.h
+index 6d286fe5..aafca271 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -253,6 +253,7 @@ struct mt76_queue {
+ 	u16 first;
+ 	u16 head;
+ 	u16 tail;
++	bool rx_skip_frags;
+ 	u8 hw_idx;
+ 	u8 ep;
+ 	int ndesc;
