@@ -7,6 +7,7 @@
 #include "../protocol.h"
 
 static int revoke_during_identity_check;
+static int ppe_ready;
 
 static void barrier(void)
 {
@@ -15,6 +16,17 @@ static void barrier(void)
 
 static uint32_t read32(uint32_t address)
 {
+	/* A single token-0 PPE completion, optionally delayed by the test. */
+	if (address == 0x1fb50fe4) {
+		volatile uint32_t *ppe =
+			(void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
+
+		return ppe_ready && *(volatile uint32_t *)0x1fb50808 == 1 &&
+		       !ppe[2];
+	}
+	if (address == 0x1fb50fe0)
+		return 0x80000000;
+
 	return *(volatile uint32_t *)(uintptr_t)address;
 }
 
@@ -84,6 +96,7 @@ static void reset(void)
 	for (unsigned int i = 0; i < sizeof(regions) / sizeof(regions[0]); i++)
 		memset((void *)(uintptr_t)regions[i].address, 0, regions[i].length);
 	revoke_during_identity_check = 0;
+	ppe_ready = 0;
 	q[0] = 0x89010000;
 	q[1] = AN7552_RX_RING_COUNT;
 	q[4] = 1;
@@ -156,6 +169,46 @@ static void test_revocation(void)
 	assert(!control()[6] && !rx_words(AN7552_RX_STATE_HOST)[0]);
 }
 
+static void assert_ordered_delivery(void)
+{
+	assert(control()[2] == 2 && control()[7] == 2);
+	assert(ppe_control()[1] == 1 && ppe_control()[2] == 1);
+	assert(!ppe_control()[12] && !ppe_control()[3] && !control()[6]);
+	assert(rx_words(0x89200000)[12] == 1);
+	assert(rx_words(0x89200100)[12] == 2);
+	assert(!rx_words(AN7552_RX_STATE_HOST)[0]);
+	assert(!rx_words(AN7552_RX_STATE_HOST)[1]);
+	/* Retries must reuse saved security checks, not reject the same PN. */
+	assert((rx_words(0x842f9000)[0] & 15) == 1);
+	assert((rx_words(0x842f9010)[0] & 15) == 1);
+}
+
+static void test_ordering(int delayed, int host_full)
+{
+	reset();
+	packet(0, 0);
+	packet(1, 1);
+	ppe_ready = !delayed;
+	if (host_full)
+		data_control()[5] = 0;
+	native_rro_receive();
+	if (delayed || host_full) {
+		assert(!control()[2] && control()[16] == 1);
+		assert(ppe_control()[12] == 1);
+		assert((rx_words(AN7552_RX_STATE_HOST)[0] & 255) == 2);
+		assert((rx_words(AN7552_RX_STATE_HOST)[1] & 255) == 1);
+		/* No progress must remain bounded and leave both buffers owned. */
+		native_rro_receive();
+		assert(!control()[2] && ppe_control()[12] == 1);
+		ppe_ready = 1;
+		data_control()[5] = AN7552_RX_RING_COUNT - 2;
+		native_rro_receive();
+	}
+	/* A main-loop service also exposes overtaking in the unfixed code. */
+	native_ppe_service();
+	assert_ordered_delivery();
+}
+
 int main(void)
 {
 	for (unsigned int i = 0; i < sizeof(regions) / sizeof(regions[0]); i++) {
@@ -167,6 +220,9 @@ int main(void)
 	}
 	(void)native_pn_service;
 	test_revocation();
-	puts("PASS: RX batch station revocation");
+	test_ordering(0, 0);
+	test_ordering(1, 0);
+	test_ordering(0, 1);
+	puts("PASS: RX batch revocation, PPE ordering, delayed completion and host backpressure");
 	return 0;
 }

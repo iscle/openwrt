@@ -290,8 +290,15 @@ static int native_rro_receive_one(struct rro_batch *b)
 			return RRO_BLOCKED;
 		states[token] = 2 | (band << 8);
 	} else {
-		/* Keep frames ordered behind already queued PPE input. */
+		volatile uint32_t *ppe =
+			(void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
+
+		/* Earlier PPE input may still need delivery to the same host ring.
+		 * Publish outstanding work and let the bounded retry drain it.
+		 */
 		native_ppe_flush(b);
+		if (ppe[12])
+			return RRO_BLOCKED;
 		if (!native_rx_deliver(token, 0))
 			return RRO_BLOCKED;
 	}
@@ -338,7 +345,7 @@ static void native_rro_receive(void)
 			continue;
 		if (result == RRO_EMPTY || q[6])
 			break;
-		/* PPE input or host ring full: publish, drain once and retry. */
+		/* PPE input/completions or host ring blocked: drain once and retry. */
 		native_rro_flush(&b);
 		native_ppe_service();
 		b.ppe_hw = read32(0x1fb5080c);
