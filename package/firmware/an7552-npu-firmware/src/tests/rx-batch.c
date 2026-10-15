@@ -209,6 +209,32 @@ static void test_ordering(int delayed, int host_full)
 	assert_ordered_delivery();
 }
 
+static void test_security_accounting(int ppe_full)
+{
+	reset();
+	packet(0, !ppe_full);
+	if (ppe_full)
+		rx_words(0x842f0000)[1] = 0;
+	else
+		data_control()[5] = 0;
+	native_rro_receive();
+	assert(!control()[7] && !control()[2]);
+	assert(control()[23] == 1);
+	native_rro_receive();
+	assert(!control()[7] && control()[23] == 1);
+	/* Complete the cached packet without losing or doubling its count. */
+	rx_words(0x842f0000)[1] = 0x80000000;
+	data_control()[5] = AN7552_RX_RING_COUNT - 2;
+	native_rro_receive();
+	ppe_ready = 1;
+	native_ppe_service();
+	assert(control()[7] == 1 && control()[2] == 1);
+	assert(control()[23] == 1 && !control()[24] && !control()[6]);
+	assert((rx_words(0x842f9000)[0] & 15) == 1);
+	native_rro_receive();
+	assert(control()[23] == 1);
+}
+
 int main(void)
 {
 	for (unsigned int i = 0; i < sizeof(regions) / sizeof(regions[0]); i++) {
@@ -223,6 +249,8 @@ int main(void)
 	test_ordering(0, 0);
 	test_ordering(1, 0);
 	test_ordering(0, 1);
-	puts("PASS: RX batch revocation, PPE ordering, delayed completion and host backpressure");
+	test_security_accounting(0);
+	test_security_accounting(1);
+	puts("PASS: RX batch revocation, ordering, backpressure and security accounting");
 	return 0;
 }

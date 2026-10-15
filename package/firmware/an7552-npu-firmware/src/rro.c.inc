@@ -182,6 +182,11 @@ static void native_rro_flush(struct rro_batch *b)
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
 
 	native_ppe_flush(b);
+	/* Validation can succeed even when this batch cannot deliver a frame. */
+	if (b->secure) {
+		q[23] += b->secure;
+		b->secure = 0;
+	}
 	if (!b->done)
 		return;
 	barrier();
@@ -190,9 +195,7 @@ static void native_rro_flush(struct rro_batch *b)
 	q[16] = b->index;
 	q[17] = b->phase;
 	q[7] += b->done;
-	q[23] += b->secure;
 	b->done = 0;
-	b->secure = 0;
 }
 
 #define RRO_EMPTY 0
