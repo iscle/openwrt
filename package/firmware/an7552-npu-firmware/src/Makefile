@@ -13,7 +13,7 @@ CFLAGS := $(COMPILER_FLAGS) -march=rv32imc_zicsr_zifencei \
 	-mabi=ilp32 -mcmodel=medany -mno-relax -msmall-data-limit=0 \
 	-ffreestanding -fno-builtin -fno-pic -fno-pie -fno-strict-aliasing \
 	-fno-unwind-tables -fno-asynchronous-unwind-tables \
-	-ffile-prefix-map=$(CURDIR)=. -Os -g \
+	-ffile-prefix-map=$(CURDIR)=. -O2 -g \
 	-Wall -Wextra -Werror -ffunction-sections -fdata-sections
 
 all: build/an7552.bin
