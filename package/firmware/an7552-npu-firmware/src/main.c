@@ -124,6 +124,7 @@ static void tdma_receive(volatile uint32_t *state, uint32_t *consumer,
 #include "rx-parse.h"
 #include "rro.c.inc"
 #include "ppe.c.inc"
+#include "prof.h"
 
 void firmware_main(uint32_t core)
 {
@@ -142,7 +143,9 @@ void firmware_main(uint32_t core)
 		AN7552_FW_ABI_VERSION;
 	barrier();
 	state[0] = AN7552_MAGIC;
+	PROF_DECLARE(prof, core);
 	for (;;) {
+		PROF_TICK(prof, core);
 		if (read32(AN7552_NPU_BASE + AN7552_PARK_CONTROL)) {
 			barrier();
 			*(volatile uint32_t *)(uintptr_t)(AN7552_NPU_BASE +
@@ -155,8 +158,8 @@ void firmware_main(uint32_t core)
 		}
 		state[1] = ++heartbeat;
 		if (core) {
-			native_pn_service();
-			native_ppe_service();
+			PROF(prof, 1, native_pn_service());
+			PROF(prof, 2, native_ppe_service());
 			if (read32(AN7552_NPU_BASE + AN7552_STATION_CONTROL)) {
 				barrier();
 				*(volatile uint32_t
@@ -168,7 +171,7 @@ void firmware_main(uint32_t core)
 			*(volatile uint32_t
 				  *)(uintptr_t)(AN7552_NPU_BASE +
 						AN7552_STATION_CONTROL + 8) = 0;
-			native_rro_receive();
+			PROF(prof, 3, native_rro_receive());
 			for (uint32_t band = 0; band < 2; band++) {
 				tdma_receive(state, &consumer[band],
 					     &reclaim[band], band);
@@ -181,8 +184,7 @@ void firmware_main(uint32_t core)
 			}
 			continue;
 		}
-		native_txfree(0);
-		native_txfree(1);
+		PROF(prof, 1, native_txfree(0); native_txfree(1));
 		if (read32(AN7552_NPU_BASE + AN7552_STATION_CONTROL)) {
 			barrier();
 			*(volatile uint32_t
@@ -193,10 +195,10 @@ void firmware_main(uint32_t core)
 		*(volatile uint32_t *)(uintptr_t)(AN7552_NPU_BASE +
 						  AN7552_STATION_CONTROL + 4) =
 			0;
-		native_transmit(0);
-		native_transmit(1);
+		PROF(prof, 2, native_transmit(0); native_transmit(1));
 		for (uint32_t band = 0; band < 2; band++)
-			native_forward(&direct_consumer[band],
-				       &direct_active[band], band);
+			PROF(prof, 3,
+			     native_forward(&direct_consumer[band],
+					    &direct_active[band], band));
 	}
 }

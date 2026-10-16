@@ -72,6 +72,7 @@ static const struct {
 	size_t length;
 } regions[] = {
 	{ AN7552_NPU_BASE, 4096 },
+	{ 0x3e900000, 0x2000 },		/* local SRAM: PPE index cache */
 	{ 0x44110000, 0xa0000 },
 	{ 0x441b0000, 0x30000 },
 	{ 0x442a0000, 0x10000 },
@@ -275,6 +276,58 @@ static void test_continuation(void)
 	assert(!control()[30]);			/* chain closed by the last buffer */
 }
 
+/* Two stations in one batch: station identity words are cached per wcid,
+ * so the second frame must be checked against its own station.
+ */
+static void test_station_cache(void)
+{
+	volatile uint32_t *p = rx_words(AN7552_RX_BUFFER_HOST + 2048);
+	volatile uint32_t *station3 = rx_words(AN7552_STATION_HOST + 3 * 32);
+	volatile uint8_t *bytes = (void *)p;
+	struct rx_metadata parsed;
+	struct pkt_view view;
+
+	reset();
+	packet(0, 0);
+	packet(1, 0);
+	p[1] = 0x800f0003;
+	pn_entry(3)[0] = 1;
+	pn_entry(3)[1] = 9;
+	pv_init(&view, bytes, 160);
+	assert(rx_parse_view(&view, 160, 0, &parsed) == RX_PARSE_OK &&
+	       parsed.wcid == 3);
+	bytes[parsed.offset + 6] = 0x11;
+	bytes[parsed.offset + 7] = 0x22;
+	bytes[parsed.offset + 8] = 0x33;
+	bytes[parsed.offset + 9] = 0x44;
+	bytes[parsed.offset + 10] = 0x55;
+	bytes[parsed.offset + 11] = 0x66;
+	station3[1] = 0;
+	station3[2] = 0x44332211;
+	station3[3] = 0x6655;
+	station3[0] = 1;
+	rx_words(0x842f0000 + 32)[1] = 0x80000000;
+	native_rro_receive();
+	assert(control()[7] == 2 && !control()[6] && !control()[27]);
+	assert(ppe_control()[1] == 2 && ppe_control()[12] == 2);
+	/* The same frames with station 3 revoked: the second goes to Linux. */
+	reset();
+	packet(0, 0);
+	packet(1, 0);
+	p[1] = 0x800f0003;
+	pn_entry(3)[0] = 1;
+	pn_entry(3)[1] = 9;
+	for (uint32_t i = 0; i < 6; i++)
+		bytes[parsed.offset + 6 + i] = 0x11 * (i + 1);
+	station3[1] = 0;
+	station3[2] = 0x44332211;
+	station3[3] = 0x6655;
+	station3[0] = 0;
+	rx_words(0x842f0000 + 32)[1] = 0x80000000;
+	native_rro_receive();
+	assert(ppe_control()[1] == 1 && ppe_control()[12] == 1);
+}
+
 int main(void)
 {
 	for (unsigned int i = 0; i < sizeof(regions) / sizeof(regions[0]); i++) {
@@ -292,6 +345,7 @@ int main(void)
 	test_security_accounting(0);
 	test_security_accounting(1);
 	test_continuation();
-	puts("PASS: RX batch revocation, ordering, backpressure, security accounting and continuation buffers");
+	test_station_cache();
+	puts("PASS: RX batch revocation, ordering, backpressure, security accounting, continuation buffers and per-station identity cache");
 	return 0;
 }

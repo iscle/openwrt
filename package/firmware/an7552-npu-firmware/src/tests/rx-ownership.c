@@ -49,6 +49,7 @@ int main(void)
 	volatile uint32_t *q, *data, *ring, *host, *free_ids, *states;
 	volatile uint8_t *packet;
 	map(AN7552_NPU_BASE, 4096);
+	map(0x3e900000, 0x2000);	/* local SRAM: PPE index cache */
 	map(0x44010000, 0xf0000);
 	map(0x441b0000, 0x30000);
 	map(0x442c0000, 0x40000);
