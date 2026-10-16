@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+# JFFS2 on the SPI-NAND of the Xiaomi BE5000 corrupts pages it programs
+# twice (cleanmarker in OOB, then data), so the overlay lives in a UBI
+# volume. Format the "ubi" partition if it holds no UBI yet and create
+# the rootfs_data volume, with its /dev node, before mount_root looks
+# for it. An initramfs may run on a factory layout, where formatting
+# would destroy stock data: leave the flash alone there.
+
+. /lib/upgrade/nand.sh
+
+ubi_rootfs_data() {
+	local mtdnum ubidev
+
+	[ "$INITRAMFS" = "1" ] && return 0
+	case "$(board_name)" in
+	xiaomi,be5000) ;;
+	*) return 0 ;;
+	esac
+
+	mtdnum="$(find_mtd_index ubi)"
+	[ -n "$mtdnum" ] || return 0
+
+	ubidev="$(nand_find_ubi ubi)"
+	if [ -z "$ubidev" ]; then
+		echo "- formatting UBI on mtd$mtdnum -"
+		ubiformat "/dev/mtd$mtdnum" -y -q || return 0
+		ubiattach -m "$mtdnum" >/dev/null || return 0
+		ubidev="$(nand_find_ubi ubi)"
+		[ -n "$ubidev" ] || return 0
+	fi
+
+	[ -n "$(nand_find_volume "$ubidev" rootfs_data)" ] && return 0
+
+	echo "- creating rootfs_data UBI volume -"
+	ubimkvol "/dev/$ubidev" -N rootfs_data -m >/dev/null || return 0
+	# The node of the new volume does not exist yet in preinit, and
+	# mount_root opens the volume by it: nand_find_volume() creates it.
+	nand_find_volume "$ubidev" rootfs_data >/dev/null
+}
+
+boot_hook_add preinit_main ubi_rootfs_data
