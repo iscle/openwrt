@@ -30,7 +30,7 @@ static uint32_t read32(uint32_t address)
 	return *(volatile uint32_t *)(uintptr_t)address;
 }
 
-static uint32_t packet_word(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_word(volatile uint8_t *p)
 {
 	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
 	       (uint32_t)p[3] << 24;
@@ -40,12 +40,12 @@ static uint32_t packet_word(volatile uint8_t *p)
 #include "../rx-security.c.inc"
 #include "../rx-parse.h"
 
-static uint32_t packet_mac_low(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_mac_low(volatile uint8_t *p)
 {
 	return packet_word(p);
 }
 
-static uint32_t packet_mac_high(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_mac_high(volatile uint8_t *p)
 {
 	/* Model Linux revoking authorization after station[0] was read. */
 	if (revoke_during_identity_check)
@@ -53,6 +53,15 @@ static uint32_t packet_mac_high(volatile uint8_t *p)
 	return p[4] | (uint32_t)p[5] << 8;
 }
 
+/* Model Linux revoking authorization after the identity check passed. */
+#define RX_TEST_AFTER_IDENTITY_CHECK()                                        \
+	do {                                                                  \
+		if (revoke_during_identity_check)                             \
+			*(volatile uint32_t *)(uintptr_t)(AN7552_STATION_NPU + \
+							  64) = 0;            \
+	} while (0)
+/* Host tests only map the uncached alias. */
+#define RX_HEADER_ALIAS(host) ((volatile uint8_t *)rx_words(host))
 #include "../rro.c.inc"
 #include "../ppe.c.inc"
 
