@@ -9,6 +9,46 @@ static volatile uint32_t *rx_words(uint32_t host)
 #define RX_HEADER_ALIAS(host) ((volatile uint8_t *)(uintptr_t)(host))
 #endif
 
+#ifndef RX_STATE_MIRROR
+#define RX_STATE_MIRROR 1
+#endif
+/* Core 1 owns the receive buffer states after setup. Keep them as one byte
+ * per buffer in local SRAM (~14 cycles) instead of words in DDR (~80).
+ * Byte layout: bits 0-1 state, bit 2 band, bit 3 parsed.
+ */
+#define RX_STATE_SRAM 0x3e900000U
+static inline uint32_t st_get(uint32_t token)
+{
+#if RX_STATE_MIRROR
+	uint32_t b = ((volatile uint8_t *)(uintptr_t)RX_STATE_SRAM)[token];
+
+	return (b & 3) | ((b & 4) << 6) | ((b & 8) << 13);
+#else
+	return rx_words(AN7552_RX_STATE_HOST)[token];
+#endif
+}
+
+static inline void st_set(uint32_t token, uint32_t value)
+{
+#if RX_STATE_MIRROR
+	((volatile uint8_t *)(uintptr_t)RX_STATE_SRAM)[token] =
+		(value & 3) | ((value >> 6) & 4) | ((value >> 13) & 8);
+#else
+	rx_words(AN7552_RX_STATE_HOST)[token] = value;
+#endif
+}
+
+/* Linux initializes the DDR copy before enabling receive processing. */
+static void st_load(void)
+{
+#if RX_STATE_MIRROR
+	volatile uint32_t *ddr = rx_words(AN7552_RX_STATE_HOST);
+
+	for (uint32_t t = 0; t < AN7552_RX_BUFFER_COUNT; t++)
+		st_set(t, ddr[t]);
+#endif
+}
+
 static void native_rx_refill(uint32_t band)
 {
 	volatile uint32_t *q =
@@ -17,7 +57,6 @@ static void native_rx_refill(uint32_t band)
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RX_DATA_CONTROL +
 				    band * 64);
 	volatile uint32_t *free_ids = rx_words(AN7552_RX_FREE_HOST);
-	volatile uint32_t *states = rx_words(AN7552_RX_STATE_HOST);
 	uint32_t producer = data[6], consumer = read32(data[4] + 12), filled = 0;
 
 	data[8] = consumer;
@@ -32,13 +71,13 @@ static void native_rx_refill(uint32_t band)
 		if (next == consumer || !q[22])
 			break;
 		token = free_ids[q[20]];
-		if (token >= AN7552_RX_BUFFER_COUNT || states[token]) {
+		if (token >= AN7552_RX_BUFFER_COUNT || st_get(token)) {
 			q[6] = 2;
 			return;
 		}
 		q[20] = (q[20] + 1) % AN7552_RX_BUFFER_COUNT;
 		q[22]--;
-		states[token] = 1 | (band << 8);
+		st_set(token, 1 | (band << 8));
 		descriptor = rx_words(AN7552_RX_DATA_RING_HOST + band * 0x8000 +
 				      producer * 16);
 		descriptor[0] = AN7552_RX_BUFFER_HOST + token * 2048;
@@ -67,14 +106,13 @@ static void native_rx_release(uint32_t token)
 {
 	volatile uint32_t *q =
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
-	volatile uint32_t *states = rx_words(AN7552_RX_STATE_HOST),
-			  *free_ids = rx_words(AN7552_RX_FREE_HOST);
-	if (token >= AN7552_RX_BUFFER_COUNT || !states[token] ||
+	volatile uint32_t *free_ids = rx_words(AN7552_RX_FREE_HOST);
+	if (token >= AN7552_RX_BUFFER_COUNT || !st_get(token) ||
 	    q[22] >= AN7552_RX_BUFFER_COUNT) {
 		q[6] = 5;
 		return;
 	}
-	states[token] = 0;
+	st_set(token, 0);
 	free_ids[q[21]] = token;
 	q[21] = (q[21] + 1) % AN7552_RX_BUFFER_COUNT;
 	q[22]++;
@@ -86,7 +124,7 @@ static int native_rx_deliver(uint32_t token, uint32_t ppe_info)
 	volatile uint32_t *saved = rx_metadata(token), *data, *host,
 			  *completion, *sidecar;
 	volatile uint8_t *packet = (void *)rx_words(saved[0]), *destination;
-	uint32_t band = (rx_words(AN7552_RX_STATE_HOST)[token] >> 8) & 1;
+	uint32_t band = (st_get(token) >> 8) & 1;
 	uint32_t length = (saved[1] >> 16) & 16383, producer = q[2], host_index,
 		 info, copied = 0;
 	data = (void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RX_DATA_CONTROL +
@@ -211,7 +249,7 @@ static int native_rro_receive_one(struct rro_batch *b)
 {
 	volatile uint32_t *q =
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
-	volatile uint32_t *states = rx_words(AN7552_RX_STATE_HOST), *descriptor,
+	volatile uint32_t *descriptor,
 			  *saved, *station;
 	volatile uint8_t *packet;
 	struct rx_metadata parsed;
@@ -234,7 +272,7 @@ static int native_rro_receive_one(struct rro_batch *b)
 	address = d0;
 	token = (d2 >> 16) - AN7552_RX_TOKEN_BASE;
 	reason = (d2 >> 12) & 15;
-	state = token < AN7552_RX_BUFFER_COUNT ? states[token] : 0;
+	state = token < AN7552_RX_BUFFER_COUNT ? st_get(token) : 0;
 	if (token >= AN7552_RX_BUFFER_COUNT || (state & 255) != 1 ||
 	    length > 2048 || address != AN7552_RX_BUFFER_HOST + token * 2048) {
 		q[8] = length;
@@ -303,7 +341,7 @@ static int native_rro_receive_one(struct rro_batch *b)
 		}
 		saved[6] = offset;
 		saved[7] = fast;
-		states[token] = state | 0x10000;
+		st_set(token, state | 0x10000);
 	} else {
 		offset = saved[6];
 		fast = saved[7];
@@ -321,7 +359,7 @@ static int native_rro_receive_one(struct rro_batch *b)
 	if (fast) {
 		if (!native_ppe_queue(b, token, address + offset, fast))
 			return RRO_BLOCKED;
-		states[token] = 2 | (band << 8);
+		st_set(token, 2 | (band << 8));
 	} else {
 		volatile uint32_t *ppe =
 			(void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
@@ -361,6 +399,8 @@ static void native_rro_receive(void)
 		q[5] = 0;
 		return;
 	}
+	if (!q[5])
+		st_load();
 	q[5] = 1;
 	if (q[6])
 		return;
