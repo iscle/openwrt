@@ -33,6 +33,8 @@ __attribute__((unused)) static uint32_t packet_mac_high(volatile uint8_t *p)
 	return p[4] | (uint32_t)p[5] << 8;
 }
 /* Host tests only map the uncached alias. */
+/* Tests inspect the DDR state words directly. */
+#define RX_STATE_MIRROR 0
 #define RX_HEADER_ALIAS(host) ((volatile uint8_t *)rx_words(host))
 #include "../rro.c.inc"
 #include "../ppe.c.inc"
