@@ -171,7 +171,6 @@
 		partition@80000 {
 			label = "art";
 			reg = <0x80000 0x40000>;
-			read-only;
 
 			nvmem-layout {
 				compatible = "fixed-layout";

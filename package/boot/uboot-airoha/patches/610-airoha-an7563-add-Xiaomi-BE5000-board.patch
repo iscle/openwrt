@@ -14,7 +14,7 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/arch/arm/dts/an7563-xiaomi-be5000.dts
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,83 @@
 +// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 +/dts-v1/;
 +
@@ -84,7 +84,6 @@ index 0000000..1111111
 +		partition@2 {
 +			label = "art";
 +			reg = <0x80000 0x40000>;
-+			read-only;
 +		};
 +
 +		partition@3 {
