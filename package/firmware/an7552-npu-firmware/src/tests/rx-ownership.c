@@ -16,7 +16,7 @@ static uint32_t read32(uint32_t address)
 		return 0;
 	return *(volatile uint32_t *)(uintptr_t)address;
 }
-static uint32_t packet_word(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_word(volatile uint8_t *p)
 {
 	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
 	       ((uint32_t)p[3] << 24);
@@ -24,14 +24,16 @@ static uint32_t packet_word(volatile uint8_t *p)
 #include "../pn.c.inc"
 #include "../rx-security.c.inc"
 #include "../rx-parse.h"
-static uint32_t packet_mac_low(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_mac_low(volatile uint8_t *p)
 {
 	return packet_word(p);
 }
-static uint32_t packet_mac_high(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_mac_high(volatile uint8_t *p)
 {
 	return p[4] | (uint32_t)p[5] << 8;
 }
+/* Host tests only map the uncached alias. */
+#define RX_HEADER_ALIAS(host) ((volatile uint8_t *)rx_words(host))
 #include "../rro.c.inc"
 #include "../ppe.c.inc"
 static void map(uint32_t address, size_t length)

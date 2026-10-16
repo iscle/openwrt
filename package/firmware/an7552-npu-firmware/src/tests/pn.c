@@ -13,7 +13,7 @@ static uint32_t read32(uint32_t a)
 {
 	return *(volatile uint32_t *)(uintptr_t)a;
 }
-static uint32_t packet_word(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_word(volatile uint8_t *p)
 {
 	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
 	       (uint32_t)p[3] << 24;

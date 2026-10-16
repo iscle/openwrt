@@ -4,6 +4,11 @@ static volatile uint32_t *rx_words(uint32_t host)
 	return (void *)(uintptr_t)((host & 0x3fffffff) | 0x40000000);
 }
 
+#ifndef RX_HEADER_ALIAS
+/* Cached view of a receive buffer (host address as seen by the NPU). */
+#define RX_HEADER_ALIAS(host) ((volatile uint8_t *)(uintptr_t)(host))
+#endif
+
 static void native_rx_refill(uint32_t band)
 {
 	volatile uint32_t *q =
@@ -210,6 +215,7 @@ static int native_rro_receive_one(struct rro_batch *b)
 			  *saved, *station;
 	volatile uint8_t *packet;
 	struct rx_metadata parsed;
+	struct pkt_view view;
 	uint32_t d0, d1, d2, d3, state, length, address, token, reason,
 		cookie = 0, security, band, offset = 0, fast = 0;
 
@@ -238,6 +244,13 @@ static int native_rro_receive_one(struct rro_batch *b)
 		return RRO_EMPTY;
 	}
 	packet = (void *)rx_words(address);
+	/* Header words are read through the cached alias without invalidating
+	 * the cache first. The free list is a FIFO of AN7552_RX_BUFFER_COUNT
+	 * (6144) tokens, so a released buffer is reused only after every other
+	 * buffer has been; by then its old lines have long been evicted.
+	 */
+	pv_init(&view, RX_HEADER_ALIAS(address), length);
+	(void)packet;
 	saved = rx_metadata(token);
 	band = (state >> 8) & 1;
 	if (!(state & 0x10000)) {
@@ -253,14 +266,14 @@ static int native_rro_receive_one(struct rro_batch *b)
 			reason = 1;
 		security = (reason == 1 || reason == 2) ?
 				   0 :
-				   native_rx_security(packet, length, &cookie);
+				   native_rx_security_view(&view, length, &cookie);
 		saved[4] = security;
 		saved[5] = cookie;
 		b->secure += ((security & 15) == 1);
 		if ((security & 15) == 2)
 			q[24]++;
 		uint32_t parsed_result =
-			rx_parse(packet, length, reason, &parsed);
+			rx_parse_view(&view, length, reason, &parsed);
 		if ((security & 15) == 1 && parsed_result != RX_PARSE_OK)
 			(*(volatile uint32_t *)(uintptr_t)(AN7552_NPU_BASE +
 							   0x780 +
@@ -275,12 +288,16 @@ static int native_rro_receive_one(struct rro_batch *b)
 		    parsed.wcid == (security >> 4) && parsed.band < 2) {
 			station = (void *)(uintptr_t)(AN7552_STATION_NPU +
 						      parsed.wcid * 32);
-			volatile uint8_t *source = packet + parsed.offset + 6;
+			uint32_t source = parsed.offset + 6;
 			if (station[0] && (station[1] & 255) == parsed.band &&
-			    station[2] == packet_mac_low(source) &&
-			    station[3] == packet_mac_high(source)) {
+			    station[2] == pv_get32(&view, source) &&
+			    station[3] == (pv_byte(&view, source + 4) |
+					   (pv_byte(&view, source + 5) << 8))) {
 				offset = parsed.offset;
 				fast = parsed.length;
+#ifdef RX_TEST_AFTER_IDENTITY_CHECK
+				RX_TEST_AFTER_IDENTITY_CHECK();
+#endif
 			} else
 				q[27]++;
 		}
