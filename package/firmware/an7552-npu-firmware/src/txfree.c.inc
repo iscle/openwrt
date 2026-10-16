@@ -69,7 +69,8 @@ static void native_txfree(uint32_t band)
 				    band * 64);
 	volatile uint32_t *descriptor, *host;
 	volatile uint8_t *packet, *destination;
-	uint32_t index, producer, info, length, result, address, capacity;
+	uint32_t index, producer, info, length, result, address, capacity, words;
+	uint32_t event[512];
 	uint32_t hardware = AN7552_TXFREE_RING_HOST + band * 0x2000;
 
 	if (!q[4]) {
@@ -109,17 +110,30 @@ static void native_txfree(uint32_t band)
 		return;
 	}
 	packet = (void *)(uintptr_t)((address & 0x3fffffff) | 0x40000000);
-	result = txfree_walk(packet, length, q, 0);
+	/* One uncached pass copies the event into the cached stack; the two
+	 * walks and the copy to Linux read it from there.
+	 */
+	words = (length + 3) / 4;
+	for (uint32_t i = 0; i < words; i++)
+		event[i] = ((volatile uint32_t *)packet)[i];
+	result = txfree_walk((volatile uint8_t *)event, length, q, 0);
 	if (!result)
-		result = txfree_walk(packet, length, q, 1);
+		result = txfree_walk((volatile uint8_t *)event, length, q, 1);
 	if (result) {
 		q[6] = result;
 		return;
 	}
 	/* Preserve host completions and station statistics for the normal driver. */
 	destination = (void *)(uintptr_t)((host[0] & 0x3fffffff) | 0x40000000);
-	for (uint32_t i = 0; i < length; i++)
-		destination[i] = packet[i];
+	if (!((uintptr_t)destination & 3)) {
+		for (uint32_t i = 0; i < length / 4; i++)
+			((volatile uint32_t *)destination)[i] = event[i];
+		for (uint32_t i = length & ~3U; i < length; i++)
+			destination[i] = ((uint8_t *)event)[i];
+	} else {
+		for (uint32_t i = 0; i < length; i++)
+			destination[i] = ((uint8_t *)event)[i];
+	}
 	host[3] = descriptor[3];
 	barrier();
 	host[1] = info;

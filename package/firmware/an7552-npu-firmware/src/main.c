@@ -14,7 +14,10 @@ static uint32_t read32(uint32_t address)
 }
 
 #define TDMA_BATCH 32U
-/* Reclaim and consume bounded batches with one doorbell write per batch. */
+/* Reclaim and consume bounded batches with one doorbell write per batch.
+ * The status words live in the core 1 state block, where Linux reads them
+ * (the activity mask at word 12 in particular), whichever core runs this.
+ */
 static void tdma_receive(volatile uint32_t *state, uint32_t *consumer,
 			 uint32_t *reclaim, uint32_t band)
 {
@@ -130,6 +133,11 @@ void firmware_main(uint32_t core)
 {
 	volatile uint32_t *state =
 		(void *)(uintptr_t)(AN7552_NPU_BASE + core * AN7552_STRIDE);
+	/* TDMA status words 5..14 keep their Linux-visible home in the core 1
+	 * block; core 1 itself writes only words 0..4 there.
+	 */
+	volatile uint32_t *tdma_state =
+		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_STRIDE);
 	uint32_t heartbeat = 0;
 	uint32_t consumer[2] = { 0 }, reclaim[2] = { 0 };
 	uint32_t direct_consumer[2] = { 0 }, direct_active[2] = { 0 };
@@ -171,17 +179,8 @@ void firmware_main(uint32_t core)
 			*(volatile uint32_t
 				  *)(uintptr_t)(AN7552_NPU_BASE +
 						AN7552_STATION_CONTROL + 8) = 0;
+			/* Core 1 owns the whole Wi-Fi -> Ethernet direction. */
 			PROF(prof, 3, native_rro_receive());
-			for (uint32_t band = 0; band < 2; band++) {
-				tdma_receive(state, &consumer[band],
-					     &reclaim[band], band);
-				barrier();
-				*(volatile uint32_t
-					  *)(uintptr_t)(AN7552_NPU_BASE +
-							AN7552_TDMA_CONTROL +
-							4 + band * 4) =
-					consumer[band];
-			}
 			continue;
 		}
 		PROF(prof, 1, native_txfree(0); native_txfree(1));
@@ -196,9 +195,21 @@ void firmware_main(uint32_t core)
 						  AN7552_STATION_CONTROL + 4) =
 			0;
 		PROF(prof, 2, native_transmit(0); native_transmit(1));
-		for (uint32_t band = 0; band < 2; band++)
+		/* Core 0 owns the whole Ethernet -> Wi-Fi direction: TDMA
+		 * ingress, direct transmit and completion reclaim.
+		 */
+		for (uint32_t band = 0; band < 2; band++) {
 			PROF(prof, 3,
+			     tdma_receive(tdma_state, &consumer[band],
+					  &reclaim[band], band));
+			barrier();
+			*(volatile uint32_t *)(uintptr_t)(AN7552_NPU_BASE +
+							  AN7552_TDMA_CONTROL +
+							  4 + band * 4) =
+				consumer[band];
+			PROF(prof, 4,
 			     native_forward(&direct_consumer[band],
 					    &direct_active[band], band));
+		}
 	}
 }
