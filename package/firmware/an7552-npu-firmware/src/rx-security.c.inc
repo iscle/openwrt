@@ -1,8 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 /* Mirror the driver's replay domain before separating fast and slow delivery. */
 #include "pkt-view.h"
+#include "pn-cache.h"
+/* Replay entry word access, through the batch cache when one is given. */
+#define EG(i) (pc ? pc_get(pc, (i)) : entry[i])
+#define ES(i, value) do { if (pc) pc_set(pc, (i), (value)); else entry[i] = (value); } while (0)
 static uint32_t native_rx_security_view(struct pkt_view *v, uint32_t length,
-					uint32_t *cookie)
+					uint32_t *cookie, struct pn_cache *pc)
 {
 	uint32_t d0, d1, d2, d4, offset = 32, fc = 0, seq = 0, tid = 0, wcid,
 				 low, high, result, aggregate;
@@ -20,11 +24,17 @@ static uint32_t native_rx_security_view(struct pkt_view *v, uint32_t length,
 	if (wcid >= AN7552_STATION_COUNT)
 		return 0;
 	entry = pn_entry(wcid);
-	if (!entry[0] || read32(AN7552_NPU_BASE + PN_CONTROL + 36))
-		return 0;
-	*cookie = entry[1];
-	if (((d1 >> 21) & 3) != ((entry[0] >> 8) & 3))
-		return (wcid << 4) | 2;
+	{
+		uint32_t key = entry[0];
+
+		if (!key || read32(AN7552_NPU_BASE + PN_CONTROL + 36))
+			return 0;
+		if (pc)
+			pc_select(pc, wcid);
+		*cookie = EG(1);
+		if (((d1 >> 21) & 3) != ((key >> 8) & 3))
+			return (wcid << 4) | 2;
+	}
 	if (d1 & (1U << 19)) {
 		if (length < 48)
 			return 0;
@@ -58,24 +68,41 @@ static uint32_t native_rx_security_view(struct pkt_view *v, uint32_t length,
 		    (pv_byte(v, ethernet) == 0xaa && pv_byte(v, ethernet + 1) == 0xaa &&
 		     pv_byte(v, ethernet + 2) == 3 && !pv_byte(v, ethernet + 3) &&
 		     !pv_byte(v, ethernet + 4) && !pv_byte(v, ethernet + 5))) {
-			entry[40 + tid] = 0;
+			ES(40 + tid, 0);
 			return (wcid << 4) | 2;
 		}
 	}
 	if (aggregate && aggregate != 3) {
-		result = (entry[40 + tid] == (0x10000 | (seq >> 4)) &&
-			  entry[4 + tid * 2] == low &&
-			  entry[5 + tid * 2] == high) ?
+		result = (EG(40 + tid) == (0x10000 | (seq >> 4)) &&
+			  EG(4 + tid * 2) == low &&
+			  EG(5 + tid * 2) == high) ?
 				 1 :
 				 0;
 		if (aggregate == 1)
-			entry[40 + tid] = 0;
+			ES(40 + tid, 0);
 	} else {
-		result = pn_compare(wcid, tid, low, high);
+		if (pc) {
+			/* pn_compare() on the cached entry; key word checked above. */
+			uint32_t old_low = EG(4 + tid * 2), old_high = EG(5 + tid * 2);
+
+			if (tid > 16 || high > 65535)
+				result = 3;
+			else if (high < old_high ||
+				 (high == old_high && low <= old_low))
+				result = 0;
+			else {
+				ES(4 + tid * 2, low);
+				ES(5 + tid * 2, high);
+				ES(40 + tid, 0);
+				result = 1;
+			}
+		} else {
+			result = pn_compare(wcid, tid, low, high);
+		}
 		if (aggregate == 3 && result == 1)
-			entry[40 + tid] = 0x10000 | (seq >> 4);
+			ES(40 + tid, 0x10000 | (seq >> 4));
 	}
-	*cookie = entry[1];
+	*cookie = EG(1);
 	return (wcid << 4) | (result == 1 ? 1 : 2);
 }
 
@@ -85,5 +112,5 @@ native_rx_security(volatile uint8_t *packet, uint32_t length, uint32_t *cookie)
 	struct pkt_view v;
 
 	pv_init(&v, packet, length);
-	return native_rx_security_view(&v, length, cookie);
+	return native_rx_security_view(&v, length, cookie, 0);
 }

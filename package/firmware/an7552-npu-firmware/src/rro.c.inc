@@ -38,9 +38,21 @@ static inline void st_set(uint32_t token, uint32_t value)
 #endif
 }
 
+/* Last PPE hardware consumer index read by core 1 and the PPE producer it
+ * was read against ([0], [1]), in local SRAM right after the buffer states.
+ * The PPE only advances its index, so while nobody else moved the producer
+ * a stale copy can only make the 64-entry ring look fuller;
+ * native_ppe_queue() re-reads it when the ring looks full.
+ */
+#define RX_PPE_CACHE                                                        \
+	((volatile uint32_t *)(uintptr_t)(RX_STATE_SRAM +                   \
+					  AN7552_RX_BUFFER_COUNT))
+#define RX_PPE_STALE 0xffffffffU
+
 /* Linux initializes the DDR copy before enabling receive processing. */
 static void st_load(void)
 {
+	RX_PPE_CACHE[1] = RX_PPE_STALE;
 #if RX_STATE_MIRROR
 	volatile uint32_t *ddr = rx_words(AN7552_RX_STATE_HOST);
 
@@ -173,8 +185,14 @@ static int native_rx_deliver(uint32_t token, uint32_t ppe_info)
 }
 /* Per-batch copies of shared indexes and counters, published once per batch. */
 struct rro_batch {
+	struct pn_cache pn;
 	uint32_t index, phase, mode, done, secure, chain;
 	uint32_t ppe_producer, ppe_hw, ppe_pending;
+	/* Station identity words 1..3 of st_wcid. Linux rewrites them only
+	 * under the quiesce handshake, which never overlaps a batch. Word 0
+	 * (eligibility) can be revoked at any time and is always read live.
+	 */
+	uint32_t st_wcid, st1, st2, st3;
 };
 
 static int native_ppe_queue(struct rro_batch *b, uint32_t token,
@@ -225,6 +243,7 @@ static void native_rro_flush(struct rro_batch *b)
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
 
 	native_ppe_flush(b);
+	pc_flush(&b->pn);
 	/* Validation can succeed even when this batch cannot deliver a frame. */
 	if (b->secure) {
 		q[23] += b->secure;
@@ -240,6 +259,33 @@ static void native_rro_flush(struct rro_batch *b)
 	q[30] = b->chain;
 	q[7] += b->done;
 	b->done = 0;
+}
+
+/* A frame that cannot be handed on now keeps its verdict for the retry:
+ * security and replay checks must not run twice on the same buffer.
+ */
+static void rro_park(volatile uint32_t *saved, uint32_t token, uint32_t state,
+		     uint32_t offset, uint32_t fast)
+{
+	saved[6] = offset;
+	saved[7] = fast;
+	st_set(token, state | 0x10000);
+}
+
+static inline void rro_ppe_hw_load(struct rro_batch *b)
+{
+	volatile uint32_t *cache = RX_PPE_CACHE;
+
+	b->ppe_hw = cache[1] == b->ppe_producer ? cache[0] :
+						  read32(0x1fb5080c);
+}
+
+static inline void rro_ppe_hw_save(struct rro_batch *b)
+{
+	volatile uint32_t *cache = RX_PPE_CACHE;
+
+	cache[0] = b->ppe_hw;
+	cache[1] = b->ppe_producer;
 }
 
 #define RRO_EMPTY 0
@@ -304,7 +350,8 @@ static int native_rro_receive_one(struct rro_batch *b)
 			reason = 1;
 		security = (reason == 1 || reason == 2) ?
 				   0 :
-				   native_rx_security_view(&view, length, &cookie);
+				   native_rx_security_view(&view, length, &cookie,
+							   &b->pn);
 		saved[4] = security;
 		saved[5] = cookie;
 		b->secure += ((security & 15) == 1);
@@ -327,10 +374,18 @@ static int native_rro_receive_one(struct rro_batch *b)
 			station = (void *)(uintptr_t)(AN7552_STATION_NPU +
 						      parsed.wcid * 32);
 			uint32_t source = parsed.offset + 6;
-			if (station[0] && (station[1] & 255) == parsed.band &&
-			    station[2] == pv_get32(&view, source) &&
-			    station[3] == (pv_byte(&view, source + 4) |
-					   (pv_byte(&view, source + 5) << 8))) {
+			uint32_t eligible = station[0];
+
+			if (eligible && b->st_wcid != parsed.wcid) {
+				b->st1 = station[1];
+				b->st2 = station[2];
+				b->st3 = station[3];
+				b->st_wcid = parsed.wcid;
+			}
+			if (eligible && (b->st1 & 255) == parsed.band &&
+			    b->st2 == pv_get32(&view, source) &&
+			    b->st3 == (pv_byte(&view, source + 4) |
+				       (pv_byte(&view, source + 5) << 8))) {
 				offset = parsed.offset;
 				fast = parsed.length;
 #ifdef RX_TEST_AFTER_IDENTITY_CHECK
@@ -339,26 +394,39 @@ static int native_rro_receive_one(struct rro_batch *b)
 			} else
 				q[27]++;
 		}
-		saved[6] = offset;
-		saved[7] = fast;
-		st_set(token, state | 0x10000);
+		/* saved[6..7] and the parsed bit are written only if the
+		 * frame has to be retried (rro_park()).
+		 */
 	} else {
 		offset = saved[6];
 		fast = saved[7];
 	}
-	/* Linux can revoke station eligibility before the core 1 handshake. */
-	if (fast) {
+	/* Linux can revoke station eligibility before the core 1 handshake.
+	 * A frame parsed in this call compared its replay cookie against the
+	 * batch PN cache a moment ago, so only the two live words are re-read;
+	 * a retried frame checks everything against its saved verdict.
+	 */
+	if (fast && !(state & 0x10000)) {
+		uint32_t wcid = security >> 4;
+
+		station = (void *)(uintptr_t)(AN7552_STATION_NPU + wcid * 32);
+		if (!station[0] || !pn_entry(wcid)[0])
+			fast = 0;
+	} else if (fast) {
 		uint32_t wcid = saved[4] >> 4;
 		station = (void *)(uintptr_t)(AN7552_STATION_NPU + wcid * 32);
 		if (!station[0] || !pn_entry(wcid)[0] ||
-		    pn_entry(wcid)[1] != saved[5]) {
+		    (b->pn.wcid == wcid ? pc_get(&b->pn, 1) :
+					  pn_entry(wcid)[1]) != saved[5]) {
 			fast = 0;
 			saved[7] = 0;
 		}
 	}
 	if (fast) {
-		if (!native_ppe_queue(b, token, address + offset, fast))
+		if (!native_ppe_queue(b, token, address + offset, fast)) {
+			rro_park(saved, token, state, offset, fast);
 			return RRO_BLOCKED;
+		}
 		st_set(token, 2 | (band << 8));
 	} else {
 		volatile uint32_t *ppe =
@@ -368,10 +436,14 @@ static int native_rro_receive_one(struct rro_batch *b)
 		 * Publish outstanding work and let the bounded retry drain it.
 		 */
 		native_ppe_flush(b);
-		if (ppe[12])
+		if (ppe[12]) {
+			rro_park(saved, token, state, offset, fast);
 			return RRO_BLOCKED;
-		if (!native_rx_deliver(token, 0))
+		}
+		if (!native_rx_deliver(token, 0)) {
+			rro_park(saved, token, state, offset, fast);
 			return RRO_BLOCKED;
+		}
 	}
 	/* Data1 bit 30 marks the last buffer of an MPDU. */
 	b->chain = !(d1 & (1U << 30));
@@ -397,6 +469,7 @@ static void native_rro_receive(void)
 
 	if (!q[4]) {
 		q[5] = 0;
+		RX_PPE_CACHE[1] = RX_PPE_STALE;
 		return;
 	}
 	if (!q[5])
@@ -406,6 +479,7 @@ static void native_rro_receive(void)
 		return;
 	native_rx_refill(0);
 	native_rx_refill(1);
+	pc_reset(&b.pn);
 	b.index = q[16];
 	b.phase = q[17];
 	b.chain = q[30];
@@ -413,8 +487,9 @@ static void native_rro_receive(void)
 	b.done = 0;
 	b.secure = 0;
 	b.ppe_producer = ppe[10];
-	b.ppe_hw = read32(0x1fb5080c);
+	rro_ppe_hw_load(&b);
 	b.ppe_pending = 0;
+	b.st_wcid = 0xffffffff;
 	for (uint32_t n = 0; n < RRO_BATCH; n++) {
 		result = native_rro_receive_one(&b);
 		if (result == RRO_DONE)
@@ -429,5 +504,6 @@ static void native_rro_receive(void)
 			break;
 	}
 	native_rro_flush(&b);
+	/* ppe[10] now equals b.ppe_producer. */
+	rro_ppe_hw_save(&b);
 }
-
