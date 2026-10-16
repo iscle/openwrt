@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+# Without its Wi-Fi calibration in "art", mt7996 loads the MediaTek default
+# EEPROM, whose MAC address is the same on every unit. Give each radio a
+# random locally administered base once; it is kept in the config.
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+[ "$(board_name)" = xiaomi,be5000 ] || exit 0
+[ "$(cat /sys/class/ieee80211/phy0/macaddress 2>/dev/null)" = 00:0c:43:26:60:10 ] || exit 0
+
+# Idempotent: adds only the radios that have no wifi-device section yet.
+/sbin/wifi config
+
+base=$(macaddr_random)
+idx=0
+for radio in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"); do
+	[ -n "$(uci -q get wireless.$radio.macaddr_base)" ] && continue
+	uci set wireless.$radio.macaddr_base=$(macaddr_add "$base" $((idx * 16)))
+	idx=$((idx + 1))
+done
+uci commit wireless
+
+exit 0
