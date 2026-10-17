@@ -23,6 +23,7 @@ static uint32_t read32(uint32_t address)
 #include "rx-parse.h"
 #include "rro.c.inc"
 #include "ppe.c.inc"
+#include "upsplit.c.inc"
 #include "prof.h"
 
 void firmware_main(uint32_t core)
@@ -36,6 +37,7 @@ void firmware_main(uint32_t core)
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_STRIDE);
 	uint32_t heartbeat = 0;
 	struct tx_band download[2] = { { 0 } };
+	struct up_front upload = { 0 };
 
 	state[1] = 0;
 	state[2] = 0;
@@ -46,6 +48,7 @@ void firmware_main(uint32_t core)
 		AN7552_FW_ABI_VERSION;
 	if (!core)
 		tx_pool_boot();
+	up_init(core);
 	barrier();
 	state[0] = AN7552_MAGIC;
 	PROF_DECLARE(prof, core);
@@ -63,7 +66,7 @@ void firmware_main(uint32_t core)
 		}
 		state[1] = ++heartbeat;
 		if (core) {
-			PROF(prof, 1, native_pn_service());
+			/* PPE return pops and the single-submission mode. */
 			PROF(prof, 2, native_ppe_service());
 			if (read32(AN7552_NPU_BASE + AN7552_STATION_CONTROL)) {
 				barrier();
@@ -76,11 +79,20 @@ void firmware_main(uint32_t core)
 			*(volatile uint32_t
 				  *)(uintptr_t)(AN7552_NPU_BASE +
 						AN7552_STATION_CONTROL + 8) = 0;
-			/* Core 1 owns the whole Wi-Fi -> Ethernet direction. */
-			PROF(prof, 3, native_rro_receive());
+			/* Back half of the Wi-Fi -> Ethernet direction: buffer
+			 * ownership, PPE input, delivery to Linux, refill.
+			 */
+			PROF(prof, 3, native_up_back());
 			continue;
 		}
 		PROF(prof, 1, native_txfree(0); native_txfree(1));
+		/* Front half of the Wi-Fi -> Ethernet direction: replay
+		 * service, then at most UP_FRONT_BUDGET frames, then download.
+		 * It never reads the station table, so it also runs during a
+		 * station quiesce and an RRO stop never waits on that.
+		 */
+		PROF(prof, 6, up_pn_service());
+		PROF(prof, 5, native_up_front(&upload));
 		if (read32(AN7552_NPU_BASE + AN7552_STATION_CONTROL)) {
 			barrier();
 			*(volatile uint32_t
