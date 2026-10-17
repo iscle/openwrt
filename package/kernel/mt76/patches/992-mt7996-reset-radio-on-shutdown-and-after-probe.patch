@@ -1,0 +1,80 @@
+From: Pavel Bragin <pabragin@yandex.ru>
+Subject: [PATCH] wifi: mt76: mt7996: reset the radio on shutdown and before bus mastering
+
+A warm reboot on Airoha AN7563 does not reset the MT7992, which keeps
+running the DMA rings of the previous kernel. On the way down the radio
+can write into RAM while the bootloader loads the next image. On the way
+up the probe enabled bus mastering before mt7996_wfsys_reset(), so the
+stale rings were written into memory already owned by the new kernel; on
+AN7563 this ended in a reboot loop that only a power cycle cleared.
+
+Reset the radio and clear bus mastering from the shutdown hook, and in
+probe enable bus mastering on both interfaces only after the reset.
+
+Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
+---
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -119,7 +119,10 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	pci_set_master(pdev);
++	/* Bus mastering is enabled only after the radio has been reset. A
++	 * warm reboot leaves its DMA running with rings from the previous
++	 * kernel, which would otherwise write into memory now in use.
++	 */
+ 
+ 	ret = dma_set_mask(&pdev->dev, DMA_BIT_MASK(36));
+ 	if (ret)
+@@ -143,8 +146,11 @@
+ 
+ 	mdev = &dev->mt76;
+ 	mt7996_wfsys_reset(dev);
++	pci_set_master(pdev);
+ 	hif2 = mt7996_pci_init_hif2(pdev);
+ 	dev->hif2 = hif2;
++	if (hif2)
++		pci_set_master(to_pci_dev(hif2->dev));
+ 
+ 	ret = mt76_npu_init(mdev, pci_resource_start(pdev, 0),
+ 			    pci_domain_nr(pdev->bus) ? 3 : 2);
+@@ -249,11 +255,30 @@
+ 	mt7996_unregister_device(dev);
+ }
+ 
++/* Stop bus mastering on reboot: without a full SoC reset the radio could
++ * otherwise keep writing into RAM while the bootloader loads the next image.
++ */
++static void mt7996_hif_shutdown(struct pci_dev *pdev)
++{
++	pci_clear_master(pdev);
++}
++
++/* Reset the radio first so its DMA engines stop, then stop bus mastering. */
++static void mt7996_pci_shutdown(struct pci_dev *pdev)
++{
++	struct mt76_dev *mdev = pci_get_drvdata(pdev);
++
++	if (mdev)
++		mt7996_wfsys_reset(container_of(mdev, struct mt7996_dev, mt76));
++	pci_clear_master(pdev);
++}
++
+ struct pci_driver mt7996_hif_driver = {
+ 	.name		= KBUILD_MODNAME "_hif",
+ 	.id_table	= mt7996_hif_device_table,
+ 	.probe		= mt7996_pci_probe,
+ 	.remove		= mt7996_hif_remove,
++	.shutdown	= mt7996_hif_shutdown,
+ };
+ 
+ struct pci_driver mt7996_pci_driver = {
+@@ -261,6 +286,7 @@
+ 	.id_table	= mt7996_pci_device_table,
+ 	.probe		= mt7996_pci_probe,
+ 	.remove		= mt7996_pci_remove,
++	.shutdown	= mt7996_pci_shutdown,
+ };
+ 
+ MODULE_DEVICE_TABLE(pci, mt7996_pci_device_table);

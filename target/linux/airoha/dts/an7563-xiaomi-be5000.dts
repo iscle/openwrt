@@ -171,7 +171,6 @@
 		partition@80000 {
 			label = "art";
 			reg = <0x80000 0x40000>;
-			read-only;
 
 			nvmem-layout {
 				compatible = "fixed-layout";
@@ -187,7 +186,13 @@
 		partition@c0000 {
 			compatible = "denx,fit";
 			label = "firmware";
-			reg = <0xc0000 0x4000000>;
+			reg = <0xc0000 0x1800000>;
+		};
+
+		partition@18c0000 {
+			compatible = "linux,ubi";
+			label = "ubi";
+			reg = <0x18c0000 0x2800000>;
 		};
 	};
 };
