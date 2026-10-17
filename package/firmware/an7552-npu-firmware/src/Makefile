@@ -26,7 +26,7 @@ all: build/an7552.bin
 build:
 	mkdir -p $@
 
-build/%.o: %.c protocol.h firmware-abi.h native-tx.c.inc station.c.inc tdma.c.inc tx-pool.c.inc txfree.c.inc rro.c.inc ppe.c.inc pn.c.inc pn-cache.h rx-security.c.inc rx-parse.h pkt-view.h prof.h | build
+build/%.o: %.c protocol.h firmware-abi.h native-tx.c.inc station.c.inc tdma.c.inc tx-pool.c.inc txfree.c.inc rro.c.inc ppe.c.inc upsplit.c.inc pn.c.inc pn-cache.h rx-security.c.inc rx-parse.h pkt-view.h prof.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 build/start.o: start.S firmware-abi.h | build
@@ -39,15 +39,22 @@ build/an7552.elf: build/start.o build/main.o an7552.ld
 build/an7552.bin: build/an7552.elf
 	$(OBJCOPY) -O binary $< $@
 
-.PHONY: all
+clean:
+	rm -rf build
+
+.PHONY: all clean
 
 HOSTCC ?= cc
-TESTS := pn pn-cache rx-batch rx-ownership rx-parse station-frame txfree tx-pool ppe-cache
+TESTS := pn pn-cache rx-ownership rx-parse station-frame txfree tx-pool ppe-cache up-pipe up-split
 
 build/test-%: tests/%.c $(wildcard *.h *.c.inc) | build
-	$(HOSTCC) -O2 -Wall -Wextra -Werror $< -o $@
+	$(HOSTCC) -O2 -Wall -Wextra -Werror -pthread $< -o $@
 
 check: $(addprefix build/test-,$(TESTS))
 	@set -e; for test in $^; do $$test; done
 
-.PHONY: check
+# Mutation check of the upload pipeline tests (each mutant must fail).
+mutate:
+	python3 tests/mutate-upsplit.py
+
+.PHONY: check mutate

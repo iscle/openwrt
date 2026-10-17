@@ -6,13 +6,19 @@
  *
  *   [0] all loop cycles >> 8
  *   [1]..[4] cycles >> 8 of the profiled sections, see firmware_main
+ *       (core 0: txfree, transmit, download;
+ *        core 1: -, ppe_service, up_back)
  *   [5] loop iterations (raw count)
  *   [6] busy iterations (raw count): the activity marker changed
  *   [7] cycles >> 8 of busy iterations
  *   [8] activity counter snapshot taken with the same publish
  *       (core 0: forward[10], core 1: RRO q[7])
  *   [9], [10] cycles >> 8 of sections 5 and 6
+ *       (core 0: up_front, pn service)
  *   [15] PROF_MAGIC
+ *
+ * The core 0 activity marker also counts the upload records it produced
+ * (US_HEAD), so front-half iterations count as busy.
  *
  * Sums are kept in 64-bit locals and published every 256 iterations, so the
  * 32-bit words wrap after 2^40 cycles (~23 min at 800 MHz); use modular
@@ -50,7 +56,8 @@ static uint32_t prof_marker(uint32_t core)
 		return read32(AN7552_NPU_BASE + AN7552_RRO_CONTROL + 7 * 4);
 	return read32(AN7552_NPU_BASE + AN7552_FORWARD_CONTROL + 10 * 4) +
 	       read32(AN7552_NPU_BASE + AN7552_TXFREE_CONTROL + 7 * 4) +
-	       read32(AN7552_NPU_BASE + AN7552_TXFREE_CONTROL + 64 + 7 * 4);
+	       read32(AN7552_NPU_BASE + AN7552_TXFREE_CONTROL + 64 + 7 * 4) +
+	       up_ctrl()[US_HEAD];
 }
 
 static void prof_init(struct prof *p, uint32_t core)

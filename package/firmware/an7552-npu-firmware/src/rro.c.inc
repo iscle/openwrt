@@ -129,14 +129,22 @@ static void native_rx_release(uint32_t token)
 	q[21] = (q[21] + 1) % AN7552_RX_BUFFER_COUNT;
 	q[22]++;
 }
-static int native_rx_deliver(uint32_t token, uint32_t ppe_info)
+/* Copy one receive buffer to the Linux ring. saved[1..5] are the receive
+ * descriptor words 1..3, the security verdict and the replay cookie, read
+ * either from the DDR metadata of the token (frames returned by the PPE) or
+ * from an upload pipeline record in SRAM (upsplit.c.inc). The packet address
+ * is the token's buffer: every receive path checks that the descriptor
+ * address equals it before anything is saved or queued.
+ */
+static int rx_deliver_words(uint32_t token, uint32_t band,
+			    volatile uint32_t *saved, uint32_t ppe_info)
 {
 	volatile uint32_t *q =
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
-	volatile uint32_t *saved = rx_metadata(token), *data, *host,
-			  *completion, *sidecar;
-	volatile uint8_t *packet = (void *)rx_words(saved[0]), *destination;
-	uint32_t band = (st_get(token) >> 8) & 1;
+	volatile uint32_t *data, *host, *completion, *sidecar;
+	volatile uint8_t *packet = (void *)rx_words(AN7552_RX_BUFFER_HOST +
+						    token * 2048),
+			 *destination;
 	uint32_t length = (saved[1] >> 16) & 16383, producer = q[2], host_index,
 		 info, copied = 0;
 	data = (void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RX_DATA_CONTROL +
@@ -183,13 +191,20 @@ static int native_rx_deliver(uint32_t token, uint32_t ppe_info)
 	native_rx_release(token);
 	return 1;
 }
-/* Per-batch copies of shared indexes and counters, published once per batch. */
+
+static int native_rx_deliver(uint32_t token, uint32_t ppe_info)
+{
+	return rx_deliver_words(token, (st_get(token) >> 8) & 1,
+				rx_metadata(token), ppe_info);
+}
+/* Per-call copies of the PPE input state and counters, published once per
+ * call by native_ppe_flush().
+ */
 struct rro_batch {
-	struct pn_cache pn;
-	uint32_t index, phase, mode, done, secure, chain;
+	uint32_t mode, done;
 	uint32_t ppe_producer, ppe_hw, ppe_pending;
 	/* Station identity words 1..3 of st_wcid. Linux rewrites them only
-	 * under the quiesce handshake, which never overlaps a batch. Word 0
+	 * under the quiesce handshake, which never overlaps a call. Word 0
 	 * (eligibility) can be revoked at any time and is always read live.
 	 */
 	uint32_t st_wcid, st1, st2, st3;
@@ -237,41 +252,6 @@ static void native_ppe_flush(struct rro_batch *b)
 	b->ppe_pending = 0;
 }
 
-static void native_rro_flush(struct rro_batch *b)
-{
-	volatile uint32_t *q =
-		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
-
-	native_ppe_flush(b);
-	pc_flush(&b->pn);
-	/* Validation can succeed even when this batch cannot deliver a frame. */
-	if (b->secure) {
-		q[23] += b->secure;
-		b->secure = 0;
-	}
-	if (!b->done)
-		return;
-	barrier();
-	*rx_words(AN7552_RX_EMI_HOST) =
-		b->index ? b->index - 1 : AN7552_RX_RING_COUNT - 1;
-	q[16] = b->index;
-	q[17] = b->phase;
-	q[30] = b->chain;
-	q[7] += b->done;
-	b->done = 0;
-}
-
-/* A frame that cannot be handed on now keeps its verdict for the retry:
- * security and replay checks must not run twice on the same buffer.
- */
-static void rro_park(volatile uint32_t *saved, uint32_t token, uint32_t state,
-		     uint32_t offset, uint32_t fast)
-{
-	saved[6] = offset;
-	saved[7] = fast;
-	st_set(token, state | 0x10000);
-}
-
 static inline void rro_ppe_hw_load(struct rro_batch *b)
 {
 	volatile uint32_t *cache = RX_PPE_CACHE;
@@ -288,222 +268,5 @@ static inline void rro_ppe_hw_save(struct rro_batch *b)
 	cache[1] = b->ppe_producer;
 }
 
-#define RRO_EMPTY 0
-#define RRO_DONE 1
-#define RRO_BLOCKED 2
-static int native_rro_receive_one(struct rro_batch *b)
-{
-	volatile uint32_t *q =
-		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
-	volatile uint32_t *descriptor,
-			  *saved, *station;
-	volatile uint8_t *packet;
-	struct rx_metadata parsed;
-	struct pkt_view view;
-	uint32_t d0, d1, d2, d3, state, length, address, token, reason,
-		cookie = 0, security, band, offset = 0, fast = 0;
-
-	/* rx_parse() fills these only on success; keep gcc -Werror quiet. */
-	parsed.wcid = parsed.band = parsed.bss = 0;
-	parsed.offset = parsed.length = 0;
-	descriptor = rx_words(AN7552_RX_COMPLETE_HOST + b->index * 16);
-	d3 = descriptor[3];
-	if ((d3 >> 28) != b->phase)
-		return RRO_EMPTY;
-	barrier();
-	d0 = descriptor[0];
-	d1 = descriptor[1];
-	d2 = descriptor[2];
-	length = (d1 >> 16) & 16383;
-	address = d0;
-	token = (d2 >> 16) - AN7552_RX_TOKEN_BASE;
-	reason = (d2 >> 12) & 15;
-	state = token < AN7552_RX_BUFFER_COUNT ? st_get(token) : 0;
-	if (token >= AN7552_RX_BUFFER_COUNT || (state & 255) != 1 ||
-	    length > 2048 || address != AN7552_RX_BUFFER_HOST + token * 2048) {
-		q[8] = length;
-		q[9] = reason;
-		q[15] = token;
-		q[6] = 3;
-		return RRO_EMPTY;
-	}
-	packet = (void *)rx_words(address);
-	/* Header words are read through the cached alias without invalidating
-	 * the cache first. The free list is a FIFO of AN7552_RX_BUFFER_COUNT
-	 * (6144) tokens, so a released buffer is reused only after every other
-	 * buffer has been; by then its old lines have long been evicted.
-	 */
-	pv_init(&view, RX_HEADER_ALIAS(address), length);
-	(void)packet;
-	saved = rx_metadata(token);
-	band = (state >> 8) & 1;
-	if (!(state & 0x10000)) {
-		saved[0] = d0;
-		saved[1] = d1;
-		saved[2] = d2;
-		saved[3] = d3;
-		/* A buffer after a non-final one continues the previous MPDU and
-		 * starts with payload, not a receive descriptor: never parse it
-		 * or let its bytes update replay counters.
-		 */
-		if (b->chain)
-			reason = 1;
-		security = (reason == 1 || reason == 2) ?
-				   0 :
-				   native_rx_security_view(&view, length, &cookie,
-							   &b->pn);
-		saved[4] = security;
-		saved[5] = cookie;
-		b->secure += ((security & 15) == 1);
-		if ((security & 15) == 2)
-			q[24]++;
-		uint32_t parsed_result =
-			rx_parse_view(&view, length, reason, &parsed);
-		if ((security & 15) == 1 && parsed_result != RX_PARSE_OK)
-			(*(volatile uint32_t *)(uintptr_t)(AN7552_NPU_BASE +
-							   0x780 +
-							   parsed_result *
-								   4))++;
-		/* Classify using the currently authorized station identity.
-		 * Only frames held entirely in this buffer can be forwarded.
-		 */
-		if (b->mode == 2 && (security & 15) == 1 &&
-		    (d1 & (1U << 30)) &&
-		    parsed_result == RX_PARSE_OK &&
-		    parsed.wcid == (security >> 4) && parsed.band < 2) {
-			station = (void *)(uintptr_t)(AN7552_STATION_NPU +
-						      parsed.wcid * 32);
-			uint32_t source = parsed.offset + 6;
-			uint32_t eligible = station[0];
-
-			if (eligible && b->st_wcid != parsed.wcid) {
-				b->st1 = station[1];
-				b->st2 = station[2];
-				b->st3 = station[3];
-				b->st_wcid = parsed.wcid;
-			}
-			if (eligible && (b->st1 & 255) == parsed.band &&
-			    b->st2 == pv_get32(&view, source) &&
-			    b->st3 == (pv_byte(&view, source + 4) |
-				       (pv_byte(&view, source + 5) << 8))) {
-				offset = parsed.offset;
-				fast = parsed.length;
-#ifdef RX_TEST_AFTER_IDENTITY_CHECK
-				RX_TEST_AFTER_IDENTITY_CHECK();
-#endif
-			} else
-				q[27]++;
-		}
-		/* saved[6..7] and the parsed bit are written only if the
-		 * frame has to be retried (rro_park()).
-		 */
-	} else {
-		offset = saved[6];
-		fast = saved[7];
-	}
-	/* Linux can revoke station eligibility before the core 1 handshake.
-	 * A frame parsed in this call compared its replay cookie against the
-	 * batch PN cache a moment ago, so only the two live words are re-read;
-	 * a retried frame checks everything against its saved verdict.
-	 */
-	if (fast && !(state & 0x10000)) {
-		uint32_t wcid = security >> 4;
-
-		station = (void *)(uintptr_t)(AN7552_STATION_NPU + wcid * 32);
-		if (!station[0] || !pn_entry(wcid)[0])
-			fast = 0;
-	} else if (fast) {
-		uint32_t wcid = saved[4] >> 4;
-		station = (void *)(uintptr_t)(AN7552_STATION_NPU + wcid * 32);
-		if (!station[0] || !pn_entry(wcid)[0] ||
-		    (b->pn.wcid == wcid ? pc_get(&b->pn, 1) :
-					  pn_entry(wcid)[1]) != saved[5]) {
-			fast = 0;
-			saved[7] = 0;
-		}
-	}
-	if (fast) {
-		if (!native_ppe_queue(b, token, address + offset, fast)) {
-			rro_park(saved, token, state, offset, fast);
-			return RRO_BLOCKED;
-		}
-		st_set(token, 2 | (band << 8));
-	} else {
-		volatile uint32_t *ppe =
-			(void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
-
-		/* Earlier PPE input may still need delivery to the same host ring.
-		 * Publish outstanding work and let the bounded retry drain it.
-		 */
-		native_ppe_flush(b);
-		if (ppe[12]) {
-			rro_park(saved, token, state, offset, fast);
-			return RRO_BLOCKED;
-		}
-		if (!native_rx_deliver(token, 0)) {
-			rro_park(saved, token, state, offset, fast);
-			return RRO_BLOCKED;
-		}
-	}
-	/* Data1 bit 30 marks the last buffer of an MPDU. */
-	b->chain = !(d1 & (1U << 30));
-	b->index++;
-	if (b->index == AN7552_RX_RING_COUNT) {
-		b->index = 0;
-		b->phase = (b->phase + 1) & 15;
-	}
-	b->done++;
-	return RRO_DONE;
-}
-
+/* Records core 1 takes per call (upsplit.c.inc). */
 #define RRO_BATCH 32U
-/* Refill and publish shared state once per batch, not once per frame. */
-static void native_rro_receive(void)
-{
-	volatile uint32_t *q =
-		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
-	volatile uint32_t *ppe =
-		(void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
-	struct rro_batch b;
-	int result;
-
-	if (!q[4]) {
-		q[5] = 0;
-		RX_PPE_CACHE[1] = RX_PPE_STALE;
-		return;
-	}
-	if (!q[5])
-		st_load();
-	q[5] = 1;
-	if (q[6])
-		return;
-	native_rx_refill(0);
-	native_rx_refill(1);
-	pc_reset(&b.pn);
-	b.index = q[16];
-	b.phase = q[17];
-	b.chain = q[30];
-	b.mode = ppe[0];
-	b.done = 0;
-	b.secure = 0;
-	b.ppe_producer = ppe[10];
-	rro_ppe_hw_load(&b);
-	b.ppe_pending = 0;
-	b.st_wcid = 0xffffffff;
-	for (uint32_t n = 0; n < RRO_BATCH; n++) {
-		result = native_rro_receive_one(&b);
-		if (result == RRO_DONE)
-			continue;
-		if (result == RRO_EMPTY || q[6])
-			break;
-		/* PPE input/completions or host ring blocked: drain once and retry. */
-		native_rro_flush(&b);
-		native_ppe_service();
-		b.ppe_hw = read32(0x1fb5080c);
-		if (q[6] || native_rro_receive_one(&b) != RRO_DONE)
-			break;
-	}
-	native_rro_flush(&b);
-	/* ppe[10] now equals b.ppe_producer. */
-	rro_ppe_hw_save(&b);
-}

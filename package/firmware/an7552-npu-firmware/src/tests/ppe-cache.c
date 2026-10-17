@@ -33,6 +33,7 @@ static uint32_t read32(uint32_t address)
 #define RX_HEADER_ALIAS(host) ((volatile uint8_t *)rx_words(host))
 #include "../rro.c.inc"
 #include "../ppe.c.inc"
+#include "../upsplit.c.inc"
 
 static void map(uint32_t address, size_t length)
 {
@@ -63,7 +64,7 @@ static uint32_t hw_consume(uint32_t n)
 	return taken;
 }
 
-/* One receive batch as native_rro_receive() runs it: load, queue, save. */
+/* One core 1 call as native_up_back() runs it: load, queue, save. */
 static uint32_t batch(uint32_t frames, uint32_t *pending)
 {
 	struct rro_batch b;
@@ -95,7 +96,7 @@ int main(void)
 	(void)native_rx_security;
 	(void)native_ppe_submit;
 	map(AN7552_NPU_BASE, 4096);
-	map(0x3e900000, 0x2000);
+	map(0x3e900000, 0x3000);
 	map(0x442f0000, 0x10000);
 	map(0x1fb50000, 4096);
 	ppe()[0] = 2;
@@ -140,7 +141,7 @@ int main(void)
 			(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
 
 		q[4] = 0;
-		native_rro_receive();
+		native_up_back();
 		assert(RX_PPE_CACHE[1] == RX_PPE_STALE);
 	}
 	puts("PASS: PPE index cache: about one read per ring lap, re-read when full, never overruns");
