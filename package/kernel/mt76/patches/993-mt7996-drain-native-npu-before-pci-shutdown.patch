@@ -1,0 +1,228 @@
+Subject: [PATCH] wifi: mt76: drain native NPU before PCI radio shutdown
+
+Radio reset or clearing the companion bus master can remove completions
+needed by the NPU ownership fence. Drain the terminal NPU shutdown while
+both PCI functions are live. A permanent shutdown latch prevents recovery
+from restarting after work cancellation. Order the main PCI consumer before
+its companion supplier through a managed device link; release the acquired
+companion reference on every probe failure.
+
+---
+--- a/an7552_npu.h
++++ b/an7552_npu.h
+@@ -45,16 +45,17 @@
+ bool an7552_npu_active(struct an7552_npu *ctx);
+ u32 an7552_npu_tx_read(struct an7552_npu *ctx, unsigned int band, u32 offset);
+ void an7552_npu_tx_write(struct an7552_npu *ctx, unsigned int band, u32 offset,
+ 			 u32 value);
+ void an7552_npu_tx_setup(struct an7552_npu *ctx, unsigned int band, u32 base,
+ 			 u32 count);
+ void an7552_npu_stop(struct an7552_npu *ctx);
+ void an7552_npu_require_quiescent(struct an7552_npu *ctx);
++void an7552_npu_shutdown(struct an7552_npu *ctx);
+ int an7552_npu_prepare(struct an7552_npu *ctx, bool full);
+ int an7552_npu_queues_start(struct an7552_npu *ctx);
+ int an7552_npu_start(struct an7552_npu *ctx);
+ bool an7552_npu_forward_path(struct an7552_npu *ctx, u32 band, u32 bss,
+ 			     u32 wcid);
+ #else
+ static inline void an7552_npu_set_bridge(struct an7552_npu *ctx, bool enable)
+ {
+@@ -228,15 +229,19 @@
+ static inline void an7552_npu_stop(struct an7552_npu *ctx)
+ {
+ }
+ 
+ static inline void an7552_npu_require_quiescent(struct an7552_npu *ctx)
+ {
+ }
+ 
++static inline void an7552_npu_shutdown(struct an7552_npu *ctx)
++{
++}
++
+ static inline bool an7552_npu_forward_path(struct an7552_npu *ctx, u32 band,
+ 					   u32 bss, u32 wcid)
+ {
+ 	return false;
+ }
+ #endif
+ #endif
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2814,17 +2814,17 @@
+ 	struct mt7996_dev *dev;
+ 	struct mt7996_phy *phy;
+ 	int i, ret = 0;
+ 
+ 	dev = container_of(work, struct mt7996_dev, reset_work);
+ 	hw = mt76_hw(dev);
+ 
+ 	/* A failed ownership handshake deliberately leaves workers parked. */
+-	if (dev->recovery.hw_full_reset)
++	if (READ_ONCE(dev->recovery.shutdown) || dev->recovery.hw_full_reset)
+ 		return;
+ 
+ 	/* chip full reset */
+ 	if (dev->recovery.restart) {
+ 		/* disable WA/WM WDT */
+ 		mt76_clear(dev, MT_WFDMA0_MCU_HOST_INT_ENA,
+ 			   MT_MCU_CMD_WDT_MASK);
+ 
+@@ -3056,17 +3056,17 @@
+ 	queue_work(dev->mt76.wq, &dev->reset_work);
+ }
+ 
+ void mt7996_reset(struct mt7996_dev *dev)
+ {
+ 	if (!dev->recovery.hw_init_done)
+ 		return;
+ 
+-	if (dev->recovery.hw_full_reset)
++	if (READ_ONCE(dev->recovery.shutdown) || dev->recovery.hw_full_reset)
+ 		return;
+ 
+ 	/* wm/wa exception: do full recovery */
+ 	if (READ_ONCE(dev->recovery.state) & MT_MCU_CMD_WDT_MASK) {
+ 		dev->recovery.restart = true;
+ 		dev_info(dev->mt76.dev,
+ 			 "%s indicated firmware crash, attempting recovery\n",
+ 			 wiphy_name(dev->mt76.hw->wiphy));
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -525,16 +525,17 @@
+ 	struct work_struct rc_work;
+ 	struct work_struct dump_work;
+ 	struct work_struct reset_work;
+ 	wait_queue_head_t reset_wait;
+ 	struct {
+ 		u32 state;
+ 		u32 wa_reset_count;
+ 		u32 wm_reset_count;
++		bool shutdown;
+ 		bool hw_full_reset:1;
+ 		bool hw_init_done:1;
+ 		bool restart:1;
+ 	} recovery;
+ 
+ 	/* protects coredump data */
+ 	struct mutex dump_mutex;
+ #ifdef CONFIG_DEV_COREDUMP
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -97,16 +97,31 @@
+ 	spin_lock_bh(&hif_lock);
+ 	list_add(&hif->list, &hif_list);
+ 	spin_unlock_bh(&hif_lock);
+ 	pci_set_drvdata(pdev, hif);
+ 
+ 	return 0;
+ }
+ 
++/* Keep the companion bus master alive until the main radio has drained it.
++ * The driver core removes this managed link on failed probe or unbind.
++ */
++static int mt7996_pci_link_hif2(struct pci_dev *pdev, struct mt7996_hif *hif2)
++{
++	if (!hif2)
++		return 0;
++
++	if (!device_link_add(&pdev->dev, hif2->dev,
++			     DL_FLAG_AUTOREMOVE_CONSUMER))
++		return -ENOMEM;
++
++	return 0;
++}
++
+ static int mt7996_pci_probe(struct pci_dev *pdev,
+ 			    const struct pci_device_id *id)
+ {
+ 	struct pci_dev *hif2_dev;
+ 	struct mt7996_hif *hif2;
+ 	struct mt7996_dev *dev;
+ 	int irq, hif2_irq, ret;
+ 	struct mt76_dev *mdev;
+@@ -144,16 +159,19 @@
+ 	if (IS_ERR(dev))
+ 		return PTR_ERR(dev);
+ 
+ 	mdev = &dev->mt76;
+ 	mt7996_wfsys_reset(dev);
+ 	pci_set_master(pdev);
+ 	hif2 = mt7996_pci_init_hif2(pdev);
+ 	dev->hif2 = hif2;
++	ret = mt7996_pci_link_hif2(pdev, hif2);
++	if (ret)
++		goto free_device;
+ 	if (hif2)
+ 		pci_set_master(to_pci_dev(hif2->dev));
+ 
+ 	ret = mt76_npu_init(mdev, pci_resource_start(pdev, 0),
+ 			    pci_domain_nr(pdev->bus) ? 3 : 2);
+ 	if (ret && ret != -ENODEV && ret != -EOPNOTSUPP)
+ 		goto free_device;
+ 
+@@ -218,25 +236,24 @@
+ free_hif2_wed_irq_vector:
+ 	if (dev->hif2) {
+ 		if (mtk_wed_device_active(&dev->mt76.mmio.wed_hif2))
+ 			mtk_wed_device_detach(&dev->mt76.mmio.wed_hif2);
+ 		else
+ 			pci_free_irq_vectors(hif2_dev);
+ 	}
+ free_hif2:
+-	if (dev->hif2)
+-		put_device(dev->hif2->dev);
+ 	devm_free_irq(mdev->dev, irq, dev);
+ free_wed_or_irq_vector:
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
+ 		mtk_wed_device_detach(&dev->mt76.mmio.wed);
+ 	else
+ 		pci_free_irq_vectors(pdev);
+ free_device:
++	mt7996_put_hif2(dev->hif2);
+ 	mt76_free_device(&dev->mt76);
+ 
+ 	return ret;
+ }
+ 
+ static void mt7996_hif_remove(struct pci_dev *pdev)
+ {
+ 	struct mt7996_hif *hif = pci_get_drvdata(pdev);
+@@ -258,23 +275,33 @@
+ /* Stop bus mastering on reboot: without a full SoC reset the radio could
+  * otherwise keep writing into RAM while the bootloader loads the next image.
+  */
+ static void mt7996_hif_shutdown(struct pci_dev *pdev)
+ {
+ 	pci_clear_master(pdev);
+ }
+ 
+-/* Reset the radio first so its DMA engines stop, then stop bus mastering. */
++/* Preserve radio completions until the native NPU returns DMA ownership. */
+ static void mt7996_pci_shutdown(struct pci_dev *pdev)
+ {
+ 	struct mt76_dev *mdev = pci_get_drvdata(pdev);
+ 
+-	if (mdev)
+-		mt7996_wfsys_reset(container_of(mdev, struct mt7996_dev, mt76));
++	if (mdev) {
++		struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++
++		/* A running reset may finish; queued or later resets must not start.
++		 * This latch is permanent, unlike hw_full_reset cleared by recovery.
++		 */
++		WRITE_ONCE(dev->recovery.shutdown, true);
++		cancel_work_sync(&dev->dump_work);
++		cancel_work_sync(&dev->reset_work);
++		an7552_npu_shutdown(mdev->mmio.an7552);
++		mt7996_wfsys_reset(dev);
++	}
+ 	pci_clear_master(pdev);
+ }
+ 
+ struct pci_driver mt7996_hif_driver = {
+ 	.name		= KBUILD_MODNAME "_hif",
+ 	.id_table	= mt7996_hif_device_table,
+ 	.probe		= mt7996_pci_probe,
+ 	.remove		= mt7996_hif_remove,

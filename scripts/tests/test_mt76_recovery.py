@@ -7,6 +7,7 @@ DMA fencing and register behavior still require testing on a router.
 """
 
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -23,6 +24,32 @@ def new_file(patch, name):
     section = section.split("\n--- ", 1)[0]
     return "".join(line[1:] for line in section.splitlines(keepends=True)
                    if line.startswith("+") and not line.startswith("+++"))
+
+
+def apply_file_patch(source, patch, name):
+    """Apply one file's unified hunks to its exact preceding API header."""
+    section = patch.read_text().split("+++ b/" + name + "\n", 1)[1]
+    section = section.split("\n--- ", 1)[0]
+    for hunk in re.split(r"^@@[^\n]*\n", section, flags=re.M)[1:]:
+        lines = hunk.splitlines(keepends=True)
+        old = "".join(line[1:] for line in lines if line.startswith((" ", "-")))
+        new = "".join(line[1:] for line in lines if line.startswith((" ", "+")))
+        if source.count(old) != 1:
+            raise AssertionError("API hunk context is missing or ambiguous in " + name)
+        source = source.replace(old, new, 1)
+    return source
+
+
+def final_api_header(kernel=False):
+    if kernel:
+        name = "include/linux/soc/airoha/an7552_npu.h"
+        source = new_file(TRANSPORT, name)
+        patch = next((ROOT / "target/linux/airoha/patches-6.18").glob("962-*.patch"))
+    else:
+        name = "an7552_npu.h"
+        source = new_file(PATCH, name)
+        patch = next((ROOT / "package/kernel/mt76/patches").glob("993-*.patch"))
+    return apply_file_patch(source, patch, name)
 
 
 def compile_run(directory, source, flags=()):
@@ -313,8 +340,7 @@ int main(void){struct mt7996_dev d={0};
             compile_run(directory, harness + source[start:end] + cases)
 
     def test_portable_api_matches_transport(self):
-        self.assertEqual(new_file(PATCH, "an7552_npu.h").rstrip(),
-                         new_file(TRANSPORT, "include/linux/soc/airoha/an7552_npu.h").rstrip())
+        self.assertEqual(final_api_header().rstrip(), final_api_header(kernel=True).rstrip())
 
     def test_without_platform_kernel_header(self):
         with tempfile.TemporaryDirectory(prefix="mt76-api-") as directory:
@@ -325,7 +351,7 @@ int main(void){struct mt7996_dev d={0};
                 "typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;\n")
             (root / "linux/err.h").write_text(
                 "#include <errno.h>\n#define ERR_PTR(x) ((void *)(long)(x))\n")
-            (root / "an7552_npu.h").write_text(new_file(PATCH, "an7552_npu.h"))
+            (root / "an7552_npu.h").write_text(final_api_header())
             compile_run(directory, r'''
 #include <assert.h>
 #include <stddef.h>
@@ -333,6 +359,7 @@ int main(void){struct mt7996_dev d={0};
 #include "an7552_npu.h"
 int main(void)
 {
+    an7552_npu_shutdown(NULL);
     assert(!an7552_npu_active(NULL));
     assert(an7552_npu_recovery_ready(NULL));
     assert(an7552_npu_pn_check(NULL, 0, 0, NULL) == -EOPNOTSUPP);
