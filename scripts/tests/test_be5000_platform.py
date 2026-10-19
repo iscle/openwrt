@@ -32,7 +32,7 @@ def run_c(code):
         source, binary = Path(tmp) / 'test.c', Path(tmp) / 'test'
         source.write_text(code)
         subprocess.run(shlex.split(os.getenv('HOSTCC', 'cc')) +
-                       ['-std=gnu11', '-O2', '-Wall', str(source), '-o', str(binary)],
+                       ['-std=gnu11', '-O2', '-Wall', '-pthread', str(source), '-o', str(binary)],
                        check=True, capture_output=True)
         subprocess.run([str(binary)], check=True, capture_output=True)
 
@@ -385,6 +385,76 @@ int main(void) {
 }
 """
             run_c(code)
+
+    def test_kernel_serializes_entire_mapping_transactions(self):
+        source = postimage('target/linux/airoha/patches-6.18/961-mtd-airoha-serialize-remap-transactions.patch')
+        code = r"""
+#include <assert.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <unistd.h>
+typedef long loff_t;
+typedef uint64_t u64;
+struct mtd_info {int unused;};
+struct mtd_oob_ops {int unused;};
+struct erase_info {int unused;};
+static int airoha_bmt_ops;
+static struct {void *ops;} bmtd={&airoha_bmt_ops};
+static pthread_mutex_t airoha_bmt_lock=PTHREAD_MUTEX_INITIALIZER;
+#define mutex_lock(p) pthread_mutex_lock(p)
+#define mutex_unlock(p) pthread_mutex_unlock(p)
+static int active,calls;
+static int transaction(void) {
+    /* Represents resolve mapping -> copy/read/write -> metadata commit.
+     * A second caller entering while raw NAND sleeps must not mutate it. */
+    assert(__sync_add_and_fetch(&active,1)==1);
+    usleep(1);__sync_add_and_fetch(&calls,1);
+    assert(__sync_sub_and_fetch(&active,1)==0);
+    return -7;
+}
+static int mtk_bmt_read(struct mtd_info *m,loff_t o,struct mtd_oob_ops *p){return transaction();}
+static int mtk_bmt_write(struct mtd_info *m,loff_t o,struct mtd_oob_ops *p){return transaction();}
+static int mtk_bmt_mtd_erase(struct mtd_info *m,struct erase_info *p){return transaction();}
+static int mtk_bmt_block_isbad(struct mtd_info *m,loff_t o){return transaction();}
+static int mtk_bmt_block_markbad(struct mtd_info *m,loff_t o){return transaction();}
+static int mtk_bmt_debug_repair(void *d,u64 v){return transaction();}
+static int mtk_bmt_debug_mark_good(void *d,u64 v){return transaction();}
+static int mtk_bmt_debug_mark_bad(void *d,u64 v){return transaction();}
+static int mtk_bmt_debug(void *d,u64 v){return transaction();}
+"""
+        names = ('read', 'write', 'mtd_erase', 'block_isbad', 'block_markbad',
+                 'debug_repair', 'debug_mark_good', 'debug_mark_bad', 'debug')
+        for name in names:
+            code += function(source, 'static int airoha_locked_' + name + '(') + '\n'
+        code += r"""
+static void *worker(void *arg) {
+    for(int i=0;i<100;i++) {
+        assert(airoha_locked_read(0,0,0)==-7);
+        assert(airoha_locked_write(0,0,0)==-7);
+        assert(airoha_locked_mtd_erase(0,0)==-7);
+        assert(airoha_locked_block_isbad(0,0)==-7);
+        assert(airoha_locked_block_markbad(0,0)==-7);
+        assert(airoha_locked_debug_repair(0,0)==-7);
+        assert(airoha_locked_debug_mark_good(0,0)==-7);
+        assert(airoha_locked_debug_mark_bad(0,0)==-7);
+        assert(airoha_locked_debug(0,0)==-7);
+    }
+    return 0;
+}
+int main(void) {
+    pthread_t threads[4];
+    for(int i=0;i<4;i++)assert(!pthread_create(&threads[i],0,worker,0));
+    for(int i=0;i<4;i++)assert(!pthread_join(threads[i],0));
+    assert(calls==3600 && !active);
+    bmtd.ops=0;assert(airoha_locked_read(0,0,0)==-7);
+    assert(calls==3601);
+}
+"""
+        run_c(code)
+        # The production MTD and debugfs callbacks must use the guarded entries.
+        patch = (ROOT / 'target/linux/airoha/patches-6.18/961-mtd-airoha-serialize-remap-transactions.patch').read_text()
+        for name in names:
+            self.assertIn('airoha_locked_' + name, patch)
 
     def test_initial_tables_fail_closed(self):
         for path in ('target/linux/airoha/patches-6.18/900-airoha-bmt-support.patch',
