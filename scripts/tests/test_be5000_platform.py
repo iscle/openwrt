@@ -52,7 +52,7 @@ typedef uint8_t u8;
 #define pr_info(...) ((void)0)
 struct airoha_bmt_entry {u16 bad_index,mapped_index;};
 struct table {struct {u8 mapped_count;} header; struct airoha_bmt_entry entries[250];} table;
-struct {struct table *bmt;} ctx={&table};
+struct {struct table *bmt; int reserved_block;} ctx={&table, -1};
 static int copy_error, oob_error, save_error, marked, persisted;
 static int find_available_pool_block(bool end) {return 950;}
 static int bbt_nand_copy(int d,int s,int n) {return copy_error;}
@@ -195,7 +195,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 #define AIROHA_BBT_SIG_LEN 4
 struct airoha_bmt_table {char signature[4]; unsigned value; u8 pad[24];};
-struct {int system_blks,total_blks,bmt_block,bbt_block;u8 data_buf[2048];} ctx;
+struct {int system_blks,total_blks,bmt_block,bbt_block,reserved_block;u8 data_buf[2048];} ctx;
 static struct {u8 data_buf[2048];} bmtd;
 static struct airoha_bmt_table disk[8], before, next;
 static int writes, erases, write_error, erase_error, corrupt_write, fatal;
@@ -236,7 +236,7 @@ static void reset(int end) {
     memcpy(before.signature,"BMT",4);before.value=123;
     next=before;next.value=456;
     direction=end;ctx.system_blks=0;ctx.total_blks=8;
-    ctx.bbt_block=-1;ctx.bmt_block=end?5:2;disk[ctx.bmt_block]=before;
+    ctx.reserved_block=-1;ctx.bbt_block=-1;ctx.bmt_block=end?5:2;disk[ctx.bmt_block]=before;
     writes=erases=write_error=corrupt_write=fatal=event=cut=0;erase_error=-1;
     erase_fail_after_write=bad_oob=0;
 }
@@ -323,9 +323,9 @@ static struct airoha_bbt_table bbt;
 static struct {
     struct airoha_bmt_table *bmt;
     struct airoha_bbt_table *bbt;
-    int system_blks,total_blks,pool_blks,bmt_block,bbt_block;
+    int system_blks,total_blks,pool_blks,bmt_block,bbt_block,reserved_block;
     u8 data_buf[2048];
-} ctx={&bmt,&bbt,8,16,8,-1,-1};
+} ctx={&bmt,&bbt,8,16,8,-1,-1,-1};
 static struct {u8 data_buf[2048];} bmtd;
 static u8 disk[16][2048];
 static int cut,event,write_failure;

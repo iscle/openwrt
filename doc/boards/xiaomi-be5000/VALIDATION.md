@@ -3,6 +3,32 @@
 The following hardware results describe earlier tested revisions. They are
 retained as engineering evidence, not qualification of every later build.
 
+## Adversarial follow-up host checks (2026-10-19)
+
+The corrective series based on `512d90c50bcc` passed 52 Python-discovered host
+tests, including compiled production-function harnesses for BMT transactions,
+NPU startup/teardown, PPE admission and checksum controls. The BMT cases include
+pool exhaustion, copy/OOB/table errors, restart at persistence boundaries,
+unmapping, second-device admission, and negative controls against the original allocation defects.
+The image test executes OpenWrt's real size-check recipe below, at, and above
+U-Boot's fixed 5-MiB flash-read boundary.
+
+All 19 source NPU firmware host-test executables passed. The complete mt76
+patch series applies to its pinned revision; separate RX-fragmentation, probe
+unwind/IRQ lifetime and AP-VLAN QoS harnesses pass. BE5000 device-tree
+preprocessing passes against Linux 6.18.55 headers. Ethernet patches were
+applied to the matching Linux sources through the shutdown changes, and the
+Linux BMT patch stack applies through its cleanup patch. All 26 applicable
+pinctrl patch subsets apply without fuzz to Linux 6.18.55.
+
+The new `BE5000 regressions` workflow repeats host and mt76 checks, builds the
+RISC-V firmware, and compiles the BE5000 DTB. Local full OpenWrt, kernel and
+U-Boot builds were not performed: this environment lacks the complete build
+toolchain. Device-tree preprocessing is not a substitute for DTC/schema
+validation. CI results and any subsequent review corrections belong to the PR.
+No router was flashed or tested during this follow-up; the earlier hardware
+results below do not qualify these changes.
+
 ## External 2.5-Gbit Ethernet (2026-09-25)
 
 The missing port required three pieces: MDIO access to the EN8811H at address

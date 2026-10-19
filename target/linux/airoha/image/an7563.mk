@@ -7,15 +7,8 @@ define Build/an7563-uboot
   cat $(STAGING_DIR_IMAGE)/an7563_$1-u-boot.bin >> $@
 endef
 
-define Device/airoha_an7563-evb
-  DEVICE_VENDOR := Airoha
-  DEVICE_MODEL := AN7563 Evaluation Board
-  DEVICE_DTS := an7563-evb
-  KERNEL_LOADADDR := 0x80088000
-  ARTIFACT/u-boot.bin := an7563-uboot rfb
-  ARTIFACTS := u-boot.bin
-endef
-TARGET_DEVICES += airoha_an7563-evb
+# The EVB DTS is a bring-up skeleton with no validated Ethernet wiring.
+# Keep it out of supported images until its network devices are described.
 
 define Device/xiaomi_be5000
   DEVICE_VENDOR := Xiaomi
@@ -26,6 +19,8 @@ define Device/xiaomi_be5000
   DEVICE_COMPAT_VERSION := 1.1
   DEVICE_COMPAT_MESSAGE := UBI layout migration: RAM-boot the matching initramfs, then install with sysupgrade -n
   KERNEL_LOADADDR := 0x80088000
+  # Must match fitsize in U-Boot's an7563 environment (0x500000).
+  KERNEL_SIZE := 5120k
   IMAGE_SIZE := 24576k
   IMAGE/sysupgrade.bin := append-kernel | pad-to 128k | append-rootfs | \
 	pad-rootfs | append-metadata | check-size

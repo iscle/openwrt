@@ -16,11 +16,13 @@ scheduling on this implementation.
 ---
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -1980,12 +1980,11 @@
+@@ -1980,14 +1980,13 @@
  
  	if (eth->soc->version == 0x7563)
  		airoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM1_IDX),
- 			     GDM_PAD_EN_MASK);
+ 			     GDM_PAD_EN_MASK | GDM_TCP_CKSUM_MASK |
+ 			     GDM_UDP_CKSUM_MASK | GDM_IP4_CKSUM_MASK |
+ 			     GDM_DROP_CRC_ERR_MASK);
  
 -	if (eth->soc->version != 0x7563)
 -		err = airoha_ppe_init(eth);
@@ -562,7 +564,7 @@ scheduling on this implementation.
  static void airoha_ppe_foe_remove_l2_flow(struct airoha_ppe *ppe,
  					  struct airoha_flow_table_entry *e)
  {
-@@ -841,44 +950,469 @@
+@@ -841,44 +950,468 @@
  static void airoha_ppe_foe_flow_remove_entry(struct airoha_ppe *ppe,
  					     struct airoha_flow_table_entry *e)
  {
@@ -892,9 +894,8 @@ scheduling on this implementation.
 +		const struct ethhdr *eh = eth_hdr(skb);
 +		const u32 *key = hwe->bridge_an7563.key;
 +
-+		/* Native classification remains disabled until all key fields
-+		 * distinguish supported ingress domains. Check the MAC fields
-+		 * here as well, without claiming that they are the complete key.
++		/* Check the MACs here; native_bridge_match validates the
++		 * remaining ingress-domain qualifiers before the entry is bound.
 +		 */
 +		return key[0] == get_unaligned_be32(eh->h_dest) &&
 +		       key[1] >> 16 == get_unaligned_be16(eh->h_dest + 4) &&
@@ -1478,6 +1479,19 @@ scheduling on this implementation.
  	u16 addr_type = 0;
  
  	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
+@@ -1123,6 +1930,12 @@
+ 	} else {
+ 		return -EOPNOTSUPP;
+ 	}
++
++	/* Native classification cannot match routed tuples. Do not report
++	 * success to TC (especially skip_sw) or nftables for inert rules.
++	 */
++	if (airoha_is_7563(eth) && addr_type)
++		return -EOPNOTSUPP;
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
+ 		struct flow_match_basic match;
 @@ -1171,18 +1985,30 @@
  			break;
  		case FLOW_ACTION_CSUM:

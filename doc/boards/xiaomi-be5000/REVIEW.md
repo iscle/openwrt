@@ -8,6 +8,66 @@ Linux drivers and bindings, mt76/mac80211, bridger, source NPU firmware,
 packaging and provisioning documentation. This is a source review, not an
 independent security audit or a production qualification.
 
+## Adversarial follow-up to `512d90c50bcc`
+
+This pass reviewed all 98 branch commits since the current upstream base and
+compared the supplied Xiaomi 1.0.91 firmware where it provided useful evidence.
+Its SHA-256 is
+`27968aaa3efa56e7a90a6ef7da7a51f392f612d49b1948d5de20a9304f3e417b`.
+The requested REA workflow informed the decomposition and evidence checks;
+its engine could not run in this environment because process inspection was
+unavailable. The results below come from source inspection, static firmware
+analysis and ordinary host tests, not an REA engine run.
+
+The corrective series addresses these confirmed defects:
+
+* Linux and U-Boot BMT now reserve the old data block while saving a remap,
+  preventing metadata allocation or stale-table cleanup from destroying the
+  only recoverable copy. Linux unmapping holds the same reservation. Linux
+  also propagates BMT attachment errors instead of exposing raw NAND, while
+  allowing other devices that do not request BMT to retain their raw layout.
+* AN7563 restores checksum-error drop controls before marking received packets
+  checksum-verified. Stock `fe_core.ko` independently identifies the UDP, TCP
+  and IP error-drop bits as 20, 21 and 22.
+* Native PPE rejects routed flow rules before parsing them into bridge-only
+  entries. Software forwarding remains available. The existing PPE startup
+  already flushes SRAM and propagates errors; no duplicate flush is needed.
+* NPU core-start ownership is recorded before releasing reset, independently
+  of successful startup. Failed starts still require parking; a failed park
+  preserves the obligation and quarantines the context.
+* mt7996 registration errors unwind initialized DMA, NAPI and deferred work.
+  Native NPU drain precedes interrupt masking. Cleanup disables polling,
+  waits for poll tails, kills the tasklet, then releases DMA. Removal releases
+  both IRQ handlers before freeing their device state.
+* AP-VLAN QoS callbacks preserve software maps on non-native platforms. Native
+  per-VLAN maps are explicitly rejected before accessing uninitialized driver
+  state; the previous policy remains intact.
+* The BE5000 exposes its stock-described reset/mesh buttons and rejects flash
+  FITs larger than U-Boot's 5-MiB read. The incomplete EVB image profile is
+  withdrawn. Unreferenced AN7563 pinmux tables are removed without changing
+  active function descriptions.
+
+An independent adversarial reviewer checked the complete candidate. The review
+loop found the missing BMT unmap reservation and additional Wi-Fi NAPI-tail and
+IRQ-lifetime problems, plus second-device BMT admission; these were corrected
+and returned for re-review.
+The first published CI run also exposed Clang-generated memory-library calls
+with no freestanding implementation. The firmware now links small memory
+runtime helpers with guarded boundary/overlap tests, and the correction is
+subject to the same independent review loop.
+Host regression coverage and a dedicated CI workflow accompany the changes.
+See [VALIDATION.md](VALIDATION.md) for what was actually run.
+
+The unwind fix covers errors after DMA setup completes. The pinned upstream
+mt76 also has incomplete cleanup for allocation failures inside DMA setup;
+that inherited path needs allocation-stage tracking and is not fixed here.
+
+Remaining limitations include NAND data/OOB partial-program behavior on the
+actual flash, power-cut testing, live key renewal, warm reset and PCIe platform
+ownership. No speculative hardware sequence replaces those validation tasks.
+In particular, separate page-data and OOB programming requires device-level
+qualification; the BMT reservation tests do not establish NAND compatibility.
+
 ## October 19 upstream-main rebase
 
 The complete custom history, including its consolidation merges and inherited

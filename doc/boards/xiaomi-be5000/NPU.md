@@ -36,6 +36,12 @@ Linux. Per-interface DSCP maps use cfg80211 classification. MLO transmit
 selection follows mt76's default/secondary-link TID policy; it is not an
 adaptive link scheduler.
 
+Custom AP-VLAN QoS maps remain supported in software on non-native platforms.
+The native AN7552 path rejects those per-VLAN changes and retains the previous
+map: it does not yet implement the required per-station policy update and flow
+invalidation. MCU QoS-map submission is asynchronous; successful submission
+does not prove that the radio has applied the policy.
+
 ## Lifetime and isolation
 
 The host validates the firmware header, bounds, entry point and both cores'

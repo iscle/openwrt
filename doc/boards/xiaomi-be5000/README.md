@@ -32,6 +32,10 @@ OpenWrt is ready. This indicates system readiness, not Internet connectivity.
 Both colours expose standard LED brightness and trigger controls as
 `blue:status` and `orange:status`.
 
+The reset and mesh buttons use active-low GPIOs 5 and 12, respectively, as
+described by the stock 1.0.91 device tree. They expose the standard OpenWrt
+reset and WPS button events with 100-ms polling and debounce.
+
 See [CONSOLIDATION.md](CONSOLIDATION.md) for the October 2026 branch merge and
 PR #2 fixes. See [REVIEW.md](REVIEW.md) for the source-review findings and remaining
 upstream-integration concerns. This port is not production-qualified.
@@ -58,6 +62,10 @@ The output directory is `bin/targets/airoha/an7563/`. Use the
 `xiaomi_be5000-initramfs-kernel.bin` for a RAM-only test and
 `xiaomi_be5000-squashfs-sysupgrade.bin` for installation. Preserve the SHA-256
 manifest, build configuration and source/feeds revisions alongside the image.
+The installed FIT is limited to 5120 KiB, matching U-Boot's fixed `0x500000`
+flash read; oversized builds are rejected. The TFTP-loaded initramfs is not
+subject to that flash-read limit. The incomplete AN7563 EVB remains a bring-up
+device tree and is not advertised as a buildable OpenWrt image profile.
 
 ## Boot firmware
 

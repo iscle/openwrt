@@ -1,0 +1,223 @@
+Subject: [PATCH] wifi: mt76: unwind initialized DMA and pollers on probe errors
+
+Use the initialized-device teardown for failures after DMA startup, including
+native RRO startup. Keep the allocation until PCI releases the IRQ handlers.
+Initialize the RRO lists before any possible unwind, tolerate absent coredump
+state, and drain pollers before their final tasklet/interrupt barrier. Skip
+NAPI deletion for allocated RRO rings whose pollers were not registered yet.
+
+---
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -13,6 +13,8 @@
+ #include "mcu.h"
+ #include "coredump.h"
+ #include "eeprom.h"
++
++static void mt7996_cleanup_device(struct mt7996_dev *dev);
+ 
+ static const struct ieee80211_iface_limit if_limits_global = {
+ 	.max = MT7996_MAX_INTERFACES * MT7996_MAX_RADIOS,
+@@ -1316,6 +1318,9 @@
+ 	INIT_WORK(&dev->init_work, mt7996_init_work);
+ 	INIT_WORK(&dev->wed_rro.work, mt7996_wed_rro_work);
+ 	INIT_LIST_HEAD(&dev->wed_rro.poll_list);
++	INIT_LIST_HEAD(&dev->wed_rro.page_cache);
++	for (idx = 0; idx < ARRAY_SIZE(dev->wed_rro.page_map); idx++)
++		INIT_LIST_HEAD(&dev->wed_rro.page_map[idx]);
+ 	spin_lock_init(&dev->wed_rro.lock);
+ 
+ 	ret = mt7996_variant_type_init(dev);
+@@ -1329,17 +1334,8 @@
+ 	set_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
+ 
+ 	ret = mt7996_mcu_init(dev);
+-	if (ret) {
+-		clear_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
+-		mt7996_irq_disable(dev, ~0);
+-		tasklet_kill(&dev->mt76.irq_tasklet);
+-		mt76_for_each_q_rx(&dev->mt76, idx) {
+-			if (dev->mt76.napi[idx].poll_list.next)
+-				napi_disable(&dev->mt76.napi[idx]);
+-		}
+-		mt7996_dma_cleanup(dev);
++	if (ret)
+ 		return ret;
+-	}
+ 
+ 	ret = mt7996_wed_rro_init(dev);
+ 	if (ret)
+@@ -1817,30 +1813,30 @@
+ 
+ 	ret = mt7996_init_hardware(dev);
+ 	if (ret)
+-		return ret;
++		goto error;
+ 
+ 	mt7996_init_wiphy(hw, &dev->mt76.mmio.wed);
+ 
+ 	ret = mt7996_register_phy(dev, MT_BAND1);
+ 	if (ret)
+-		return ret;
++		goto error;
+ 
+ 	ret = mt7996_register_phy(dev, MT_BAND2);
+ 	if (ret)
+-		return ret;
++		goto error;
+ 
+ 	ret = mt7996_npu_hw_init(dev);
+ 	if (ret)
+-		return ret;
++		goto error;
+ 
+ 	ret = mt7996_dma_rro_start(dev);
+ 	if (ret)
+-		return ret;
++		goto error;
+ 
+ 	ret = mt76_register_device(&dev->mt76, true, mt76_rates,
+ 				   ARRAY_SIZE(mt76_rates));
+ 	if (ret)
+-		return ret;
++		goto error;
+ 
+ 	mt7996_for_each_phy(dev, phy)
+ 		mt7996_thermal_init(phy);
+@@ -1860,15 +1856,25 @@
+ 	return 0;
+ 
+ error:
++	mt7996_cleanup_device(dev);
++
++	return ret;
++}
++
++
++/* May also run before ieee80211_register_hw(), after DMA initialization.
++ * Keep the allocation alive until PCI has released its IRQ handlers.
++ */
++static void mt7996_cleanup_device(struct mt7996_dev *dev)
++{
++	int i;
++
++	if (!test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
++		return;
++
++	WRITE_ONCE(dev->recovery.shutdown, true);
++	dev->recovery.hw_init_done = false;
+ 	cancel_work_sync(&dev->init_work);
+-
+-	return ret;
+-}
+-
+-
+-void mt7996_unregister_device(struct mt7996_dev *dev)
+-{
+-	int i;
+ 
+ 	cancel_work_sync(&dev->dump_work);
+ 	cancel_work_sync(&dev->wed_rro.work);
+@@ -1884,17 +1890,34 @@
+ 	mt7996_npu_hw_stop(dev);
+ 	mt76_npu_stop(&dev->mt76);
+ 	an7552_npu_stop(dev->mt76.mmio.an7552);
++	clear_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
++	mt7996_irq_disable(dev, ~0);
++	synchronize_irq(dev->irq);
++	if (dev->hif2)
++		synchronize_irq(dev->hif2->irq);
+ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.napi); i++) {
+ 		if (dev->mt76.napi[i].dev &&
+ 		    !test_bit(i, &dev->recovery_napi_disabled))
+ 			napi_disable(&dev->mt76.napi[i]);
+ 	}
++	if (!dev->mt76.tx_napi_disabled) {
++		napi_disable(&dev->mt76.tx_napi);
++		dev->mt76.tx_napi_disabled = true;
++	}
++	/* napi_disable() releases ownership before the poll method returns.
++	 * Wait for completion callbacks which can still schedule the tasklet.
++	 */
++	synchronize_net();
++	tasklet_kill(&dev->mt76.irq_tasklet);
++	mt7996_irq_disable(dev, ~0);
+ 	mt7996_mcu_exit(dev);
+ 	mt7996_dma_disable(dev, true);
+ 	mt7996_tx_token_put(dev);
+ 	mt7996_dma_cleanup(dev);
+ 	mt7996_wed_rro_free(dev);
+-	tasklet_disable(&dev->mt76.irq_tasklet);
+-
+-	mt76_free_device(&dev->mt76);
+-}
++}
++
++void mt7996_unregister_device(struct mt7996_dev *dev)
++{
++	mt7996_cleanup_device(dev);
++}
+--- a/mt7996/coredump.c
++++ b/mt7996/coredump.c
+@@ -257,6 +257,9 @@
+ 
+ void mt7996_coredump_unregister(struct mt7996_dev *dev)
+ {
++	if (!dev->coredump.crash_data)
++		return;
++
+ 	if (dev->coredump.crash_data->memdump_buf) {
+ 		vfree(dev->coredump.crash_data->memdump_buf);
+ 		dev->coredump.crash_data->memdump_buf = NULL;
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -223,6 +223,10 @@
+ 		/* master switch of PCIe tnterrupt enable */
+ 		mt76_wr(dev, MT_PCIE1_MAC_INT_ENABLE, 0xff);
+ 	}
++
++	dev->irq = irq;
++	if (dev->hif2)
++		dev->hif2->irq = hif2_irq;
+ 
+ 	ret = mt7996_register_device(dev);
+ 	if (ret)
+@@ -268,8 +272,13 @@
+ 
+ 	mdev = pci_get_drvdata(pdev);
+ 	dev = container_of(mdev, struct mt7996_dev, mt76);
++	mt7996_unregister_device(dev);
++	/* Shared IRQs may fire even after our device masks its interrupts. */
++	devm_free_irq(mdev->dev, dev->irq, dev);
++	if (dev->hif2)
++		devm_free_irq(mdev->dev, dev->hif2->irq, dev);
+ 	mt7996_put_hif2(dev->hif2);
+-	mt7996_unregister_device(dev);
++	mt76_free_device(mdev);
+ }
+ 
+ /* Stop bus mastering on reboot: without a full SoC reset the radio could
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -501,6 +501,8 @@
+ 	struct wiphy_radio_freq_range radio_freqs[MT7996_MAX_RADIOS];
+ 	struct mac_address radio_addrs[MT7996_MAX_RADIOS];
+ 
++	/* Actual main IRQ, including a WED-provided interrupt. */
++	int irq;
+ 	struct mt7996_hif *hif2;
+ 	struct mt7996_reg_desc reg;
+ 	u8 q_id[MT7996_MAX_QUEUE];
+--- a/dma.c
++++ b/dma.c
+@@ -1321,7 +1321,9 @@
+ 	mt76_for_each_q_rx(dev, i) {
+ 		struct mt76_queue *q = &dev->q_rx[i];
+ 
+-		netif_napi_del(&dev->napi[i]);
++		/* RRO queues can exist before their NAPI is registered. */
++		if (dev->napi[i].dev)
++			netif_napi_del(&dev->napi[i]);
+ 		mt76_dma_rx_cleanup(dev, q);
+ 
+ 		page_pool_destroy(q->page_pool);

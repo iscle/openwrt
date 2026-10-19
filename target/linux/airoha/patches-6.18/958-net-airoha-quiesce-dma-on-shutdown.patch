@@ -220,7 +220,7 @@ Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
  		size = AIROHA_MAX_PACKET_SIZE * num_desc;
  		buf = dmam_alloc_coherent(eth->dev, size, &dma_addr,
  					  GFP_KERNEL);
-@@ -1836,171 +1848,171 @@
+@@ -1836,173 +1848,173 @@
  }
  
  static int airoha_qdma_init_irq_banks(struct platform_device *pdev,
@@ -369,7 +369,9 @@ Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
  
  	if (eth->soc->version == 0x7563)
  		airoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM1_IDX),
- 			     GDM_PAD_EN_MASK);
+ 			     GDM_PAD_EN_MASK | GDM_TCP_CKSUM_MASK |
+ 			     GDM_UDP_CKSUM_MASK | GDM_IP4_CKSUM_MASK |
+ 			     GDM_DROP_CRC_ERR_MASK);
  
  	err = airoha_ppe_init(eth);
  

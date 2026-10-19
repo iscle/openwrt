@@ -70,10 +70,13 @@ enum { HEAD = 1, CONTINUATION, NEXT_FRAME };
 struct event {
 	unsigned char bytes[256];
 	bool more;
+	bool drop, retry;
+	int length;
 };
 static struct event events[4];
 static unsigned int cursor, available, allocations, delivered, freed;
 static bool fail_first;
+static unsigned int head_freed;
 
 static unsigned char *
 mt76_dma_dequeue(struct mt76_dev *dev, struct mt76_queue *q, bool flush,
@@ -83,7 +86,13 @@ mt76_dma_dequeue(struct mt76_dev *dev, struct mt76_queue *q, bool flush,
 	if (cursor == available)
 		return NULL;
 	*more = events[cursor].more;
-	*len = 100;
+	*len = events[cursor].length ?: 100;
+	*drop = events[cursor].drop;
+	if (events[cursor].retry) {
+		cursor++;
+		freed++; /* RRO releases its rejected buffer before -EAGAIN. */
+		return (void *)(intptr_t)-EAGAIN;
+	}
 	return events[cursor++].bytes;
 }
 
@@ -103,6 +112,8 @@ static struct sk_buff *napi_build_skb(void *data, int size)
 
 static void dev_kfree_skb(struct sk_buff *skb)
 {
+	if (skb)
+		head_freed++;
 	free(skb);
 }
 
@@ -173,13 +184,52 @@ static void run(bool fail, bool multi, bool split)
 	assert(allocations == 2);
 }
 
+/* Exercise the other real RX-loop rejection branches at both a first
+ * buffer and a continuation, preserving skip state across poll calls.
+ */
+static void run_fault(unsigned int kind, bool partial, bool split)
+{
+	struct driver drv = { .rx_check = check, .rx_skb = receive };
+	struct mt76_dev dev = { .drv = &drv };
+	struct mt76_queue *q = &dev.q_rx[0];
+	unsigned int bad = partial ? 1 : 0;
+
+	memset(events, 0, sizeof(events));
+	cursor = allocations = delivered = freed = head_freed = 0;
+	fail_first = false;
+	q->buf_size = 256;
+	for (unsigned int i = 0; i < 3; i++) {
+		events[i].bytes[0] = i ? CONTINUATION : HEAD;
+		events[i].more = i < 2;
+	}
+	events[3].bytes[0] = NEXT_FRAME;
+	events[bad].retry = kind == 0;
+	events[bad].drop = kind == 1;
+	events[bad].length = kind == 2 ? 300 : 100;
+	available = split ? bad + 1 : 4;
+	mt76_dma_rx_process(&dev, q, 32);
+	if (split) {
+		assert(q->rx_skip_frags && !q->rx_head && !delivered);
+		available = 4;
+		mt76_dma_rx_process(&dev, q, 32);
+	}
+	assert(cursor == 4 && delivered == 1);
+	assert(freed == 3U - partial && head_freed == partial);
+	assert(allocations == 1U + partial);
+	assert(!q->rx_skip_frags && !q->rx_head);
+}
+
 int main(void)
 {
+	for (unsigned int kind = 0; kind < 3; kind++)
+		for (unsigned int partial = 0; partial < 2; partial++)
+			for (unsigned int split = 0; split < 2; split++)
+				run_fault(kind, partial, split);
 	run(false, false, false);
 	run(true, false, false);
 	run(true, true, false);
 	run(true, true, true);
-	puts("PASS: RX allocation failure, continuation skipping and poll boundaries");
+	puts("PASS: allocation, explicit drop, EAGAIN, oversize, partial heads and poll boundaries");
 	return 0;
 }
 '''
