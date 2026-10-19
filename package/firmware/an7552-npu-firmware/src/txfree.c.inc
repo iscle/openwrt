@@ -38,22 +38,24 @@ static int txfree_walk(volatile uint8_t *packet, uint32_t length,
 			continue;
 		for (uint32_t i = 0; i < 2; i++) {
 			uint32_t token = (info >> (15 * i)) & 32767;
+			volatile uint32_t *work;
 
 			if (token == 32767)
 				continue;
 			if (++count > total || token >= AN7552_TXWI_TOKENS)
 				return 4;
-			if (token >= AN7552_DIRECT_TOKENS) {
-				if (commit)
-					control[9]++;
-				continue;
-			}
-			if (!tx_pool_token_busy(token))
-				return 5;
 			if (!commit)
 				continue;
-			if (tx_pool_complete(token))
+			if (token >= AN7552_DIRECT_TOKENS) {
+				control[9]++;
+				continue;
+			}
+			work = (void *)(uintptr_t)(AN7552_FORWARD_WORK_NPU +
+						   token * 16);
+			if (work[0] != 2)
 				return 5;
+			barrier();
+			work[0] = 3;
 			control[8]++;
 		}
 	}
@@ -67,8 +69,7 @@ static void native_txfree(uint32_t band)
 				    band * 64);
 	volatile uint32_t *descriptor, *host;
 	volatile uint8_t *packet, *destination;
-	uint32_t index, producer, info, length, result, address, capacity, words;
-	uint32_t event[512];
+	uint32_t index, producer, info, length, result, address, capacity;
 	uint32_t hardware = AN7552_TXFREE_RING_HOST + band * 0x2000;
 
 	if (!q[4]) {
@@ -80,22 +81,17 @@ static void native_txfree(uint32_t band)
 		return;
 	index = q[12];
 	producer = q[2];
-	if (producer == q[15])
+	if (index == read32(q[3] + 12) || producer == q[15])
 		return;
 	descriptor =
 		(void *)(uintptr_t)(((hardware & 0x3fffffff) | 0x40000000) +
 				    index * 16);
-	/* An empty slot is the common case: test its done bit (DDR) before
-	 * paying for the radio's DMA index read (PCIe). Both must agree.
-	 */
 	info = descriptor[1];
-	if (!(info & (1U << 31)) || index == read32(q[3] + 12))
+	if (!(info & (1U << 31)))
 		return;
 	barrier();
 	length = (info >> 16) & 16383;
 	address = descriptor[0];
-	q[10] = info;
-	q[11] = length;
 	if (!(info & (1U << 30)) || !length || length > 2048 ||
 	    address != AN7552_TXFREE_BUFFER_HOST + band * 0x100000 +
 			       index * 2048) {
@@ -111,30 +107,17 @@ static void native_txfree(uint32_t band)
 		return;
 	}
 	packet = (void *)(uintptr_t)((address & 0x3fffffff) | 0x40000000);
-	/* One uncached pass into the (cached) stack; walk and copy from there. */
-	words = (length + 3) / 4;
-	for (uint32_t i = 0; i < words; i++)
-		event[i] = ((volatile uint32_t *)packet)[i];
-	result = txfree_walk((volatile uint8_t *)event, length, q, 0);
-	if (!result) {
-		result = txfree_walk((volatile uint8_t *)event, length, q, 1);
-		tx_pool_publish(tx_pool());
-	}
+	result = txfree_walk(packet, length, q, 0);
+	if (!result)
+		result = txfree_walk(packet, length, q, 1);
 	if (result) {
 		q[6] = result;
 		return;
 	}
 	/* Preserve host completions and station statistics for the normal driver. */
 	destination = (void *)(uintptr_t)((host[0] & 0x3fffffff) | 0x40000000);
-	if (!((uintptr_t)destination & 3)) {
-		for (uint32_t i = 0; i < length / 4; i++)
-			((volatile uint32_t *)destination)[i] = event[i];
-		for (uint32_t i = length & ~3U; i < length; i++)
-			destination[i] = ((uint8_t *)event)[i];
-	} else {
-		for (uint32_t i = 0; i < length; i++)
-			destination[i] = ((uint8_t *)event)[i];
-	}
+	for (uint32_t i = 0; i < length; i++)
+		destination[i] = packet[i];
 	host[3] = descriptor[3];
 	barrier();
 	host[1] = info;

@@ -37,7 +37,7 @@
 		ranges;
 
 		npu_firmware: npu-firmware@84000000 {
-			reg = <0x84000000 0x300000>;
+			reg = <0x84000000 0x400000>;
 			no-map;
 		};
 
@@ -105,7 +105,6 @@
 	status = "okay";
 };
 
-
 &pcie0 {
 	ranges = <0x82000000 0 0x20000000 0x20000000 0 0x4000000>;
 	status = "okay";
@@ -142,6 +141,8 @@
 };
 
 &gdm1 {
+	nvmem-cells = <&macaddr_lan>;
+	nvmem-cell-names = "mac-address";
 	status = "okay";
 };
 
@@ -171,6 +172,7 @@
 		partition@80000 {
 			label = "art";
 			reg = <0x80000 0x40000>;
+			read-only;
 
 			nvmem-layout {
 				compatible = "fixed-layout";
@@ -179,6 +181,14 @@
 
 				wifi_eeprom: eeprom@20000 {
 					reg = <0x20000 0x1e00>;
+				};
+
+				macaddr_lan: macaddr@22008 {
+					reg = <0x22008 0x6>;
+				};
+
+				macaddr_2p5g: macaddr@2200e {
+					reg = <0x2200e 0x6>;
 				};
 			};
 		};
@@ -212,6 +222,8 @@
 };
 
 &gdm2 {
+	nvmem-cells = <&macaddr_2p5g>;
+	nvmem-cell-names = "mac-address";
 	status = "okay";
 	phy-handle = <&phy_2p5g>;
 };
