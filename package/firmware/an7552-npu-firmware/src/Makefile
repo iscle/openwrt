@@ -29,7 +29,7 @@ build/%.o: %.c protocol.h firmware-abi.h native-tx.c.inc station.c.inc txfree.c.
 build/start.o: start.S firmware-abi.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
-build/an7552.elf: build/start.o build/main.o an7552.ld
+build/an7552.elf: build/start.o build/main.o build/runtime.o an7552.ld
 	$(CC) $(CFLAGS) -nostdlib $(LINKER_FLAGS) -Wl,--gc-sections,--no-relax \
 		-Wl,-T,an7552.ld,-Map,build/an7552.map $(filter %.o,$^) -o $@
 
@@ -39,10 +39,12 @@ build/an7552.bin: build/an7552.elf
 .PHONY: all
 
 HOSTCC ?= cc
-TESTS := up-sync pn-cache pkt-view up-pipe up-split tx-pool ppe-domain forward-drain mlo-forward pn pn-domain pn-mlo rx-batch rx-ownership rx-parse station-frame txfree tx-priority
+TESTS := runtime up-sync pn-cache pkt-view up-pipe up-split tx-pool ppe-domain forward-drain mlo-forward pn pn-domain pn-mlo rx-batch rx-ownership rx-parse station-frame txfree tx-priority
 
 build/test-%: tests/%.c $(wildcard *.h *.c.inc) | build
 	$(HOSTCC) -pthread -O2 -Wall -Wextra -Werror $< -o $@
+
+build/test-runtime: runtime.c
 
 check: $(addprefix build/test-,$(TESTS))
 	@set -e; for test in $^; do $$test; done

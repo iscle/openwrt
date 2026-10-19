@@ -13,7 +13,7 @@ unmapping, second-device admission, and negative controls against the original a
 The image test executes OpenWrt's real size-check recipe below, at, and above
 U-Boot's fixed 5-MiB flash-read boundary.
 
-All 18 source NPU firmware host-test executables passed. The complete mt76
+All 19 source NPU firmware host-test executables passed. The complete mt76
 patch series applies to its pinned revision; separate RX-fragmentation, probe
 unwind/IRQ lifetime and AP-VLAN QoS harnesses pass. BE5000 device-tree
 preprocessing passes against Linux 6.18.55 headers. Ethernet patches were

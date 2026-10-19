@@ -51,6 +51,10 @@ An independent adversarial reviewer checked the complete candidate. The review
 loop found the missing BMT unmap reservation and additional Wi-Fi NAPI-tail and
 IRQ-lifetime problems, plus second-device BMT admission; these were corrected
 and returned for re-review.
+The first published CI run also exposed Clang-generated memory-library calls
+with no freestanding implementation. The firmware now links small memory
+runtime helpers with guarded boundary/overlap tests, and the correction is
+subject to the same independent review loop.
 Host regression coverage and a dedicated CI workflow accompany the changes.
 See [VALIDATION.md](VALIDATION.md) for what was actually run.
 
