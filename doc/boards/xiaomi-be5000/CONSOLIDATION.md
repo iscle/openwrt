@@ -47,6 +47,9 @@ verify radio recovery, both bands, VLAN isolation and warm reboot on the device.
 
 ## Migration
 
+The board defaults and image metadata both declare compatibility version 1.1,
+so subsequent upgrades can preserve configuration after the layout migration.
+
 For an earlier iscle installation using the old single firmware partition,
 RAM-boot the matching initramfs, validate the sysupgrade image, then install
 with `sysupgrade -n`. See README.md for the replacement bootloader layout,
