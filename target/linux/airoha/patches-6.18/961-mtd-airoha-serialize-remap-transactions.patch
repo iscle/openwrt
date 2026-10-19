@@ -104,7 +104,7 @@
  }
  
  static int mtk_bmt_debug_repair(void *data, u64 val)
-@@ -366,10 +433,58 @@
+@@ -366,10 +433,56 @@
  }
  
  
@@ -114,14 +114,12 @@
 -DEFINE_DEBUGFS_ATTRIBUTE(fops_debug, NULL, mtk_bmt_debug, "%llu\n");
 +static int airoha_locked_debug_repair(void *data, u64 val)
 +{
-+	int ret;
-+
-+	if (bmtd.ops != &airoha_bmt_ops)
-+		return mtk_bmt_debug_repair(data, val);
-+	mutex_lock(&airoha_bmt_lock);
-+	ret = mtk_bmt_debug_repair(data, val);
-+	mutex_unlock(&airoha_bmt_lock);
-+	return ret;
++	/* Generic repair commits the unmap before copying data back. A cut
++	 * or copy failure would lose the only authoritative mapping.
++	 */
++	if (bmtd.ops == &airoha_bmt_ops)
++		return -EOPNOTSUPP;
++	return mtk_bmt_debug_repair(data, val);
 +}
 +
 +static int airoha_locked_debug_mark_good(void *data, u64 val)
