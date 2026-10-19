@@ -81,7 +81,7 @@ struct an7552_npu {
     int setup_wait;
     unsigned int setup_users;
     bool shutdown,shutdown_complete;
-    bool running,faulted,fault_quiesced,failed,stopping,pn_failed,defer_queues,tdma_enabled;
+    bool cores_started,running,faulted,fault_quiesced,failed,stopping,pn_failed,defer_queues,tdma_enabled;
     int queue_error,recovery_count;
     void *regs,*ram,*dev;
 };

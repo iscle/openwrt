@@ -345,7 +345,7 @@ callers. Retain the closed state across full recovery and reattachment.
 -void an7552_npu_require_quiescent(struct an7552_npu *ctx)
 +static void __an7552_npu_require_quiescent(struct an7552_npu *ctx)
  {
- 	if (!ctx || !ctx->running)
+ 	if (!ctx || (!ctx->running && !ctx->cores_started))
  		return;
 -	an7552_npu_stop(ctx);
 -	if (an7552_npu_recovery_ready(ctx) && !halt_cores(ctx))

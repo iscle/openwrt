@@ -47,7 +47,7 @@ typedef uint8_t u8;
 #define AN7552_STATION_MLO 2U
 struct an7552_npu {
 	void *regs, *ram, *dev, *fe;
-	bool running, stopping, faulted, failed, fault_quiesced, ppe_enabled, tdma_enabled, pn_failed;
+	bool cores_started, running, stopping, faulted, failed, fault_quiesced, ppe_enabled, tdma_enabled, pn_failed;
 	u32 fault_count, ppe_saved[7], heartbeat[AN7552_CORES];
 	unsigned long heartbeat_seen[AN7552_CORES];
 	int station_lock;

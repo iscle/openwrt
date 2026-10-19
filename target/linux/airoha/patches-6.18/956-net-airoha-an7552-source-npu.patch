@@ -32,7 +32,7 @@ station authorization, replay state and PPE queue teardown.
 +obj-$(CONFIG_NET_AIROHA_AN7552_NPU) += an7552_npu.o
 --- /dev/null
 +++ b/drivers/net/ethernet/airoha/an7552_npu.c
-@@ -0,0 +1,1893 @@
+@@ -0,0 +1,1903 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* AN7552 source-firmware transport and MT7992 DMA ownership. */
 +#include <linux/debugfs.h>
@@ -87,6 +87,8 @@ station authorization, replay state and PPE queue teardown.
 +	bool ppe_enabled, tdma_enabled;
 +	bool faulted, fault_quiesced;
 +	bool pn_domains_initialized;
++	/* A boot trigger creates an ownership obligation before readiness. */
++	bool cores_started;
 +	u32 heartbeat[AN7552_CORES], fault_count, recovery_count;
 +	u32 discarded_completions, interrupt_parks;
 +	unsigned long heartbeat_seen[AN7552_CORES];
@@ -1417,7 +1419,7 @@ station authorization, replay state and PPE queue teardown.
 +{
 +	int ret = 0;
 +
-+	if (ctx->running) {
++	if (ctx->cores_started || ctx->running) {
 +		ret = park_cores(ctx);
 +		if (ret)
 +			ctx->failed = true;
@@ -1425,6 +1427,10 @@ station authorization, replay state and PPE queue teardown.
 +	writel(0x300, ctx->regs + BOOT_CONFIG);
 +	writel(2, ctx->regs + BOOT_TRIGGER);
 +	usleep_range(1000, 2000);
++	if (!ret) {
++		ctx->cores_started = false;
++		ctx->running = false;
++	}
 +	return ret;
 +}
 +
@@ -1435,7 +1441,7 @@ station authorization, replay state and PPE queue teardown.
 + */
 +void an7552_npu_require_quiescent(struct an7552_npu *ctx)
 +{
-+	if (!ctx || !ctx->running)
++	if (!ctx || (!ctx->running && !ctx->cores_started))
 +		return;
 +	an7552_npu_stop(ctx);
 +	if (an7552_npu_recovery_ready(ctx) && !halt_cores(ctx))
@@ -1453,6 +1459,9 @@ station authorization, replay state and PPE queue teardown.
 +	unsigned int i;
 +	int ret;
 +
++	/* Failed parking quarantines the workspace, including a first boot. */
++	if (ctx->failed)
++		return -EIO;
 +	ret = request_firmware(&fw, "airoha/an7552.bin", ctx->dev);
 +	if (ret)
 +		return ret;
@@ -1510,6 +1519,7 @@ station authorization, replay state and PPE queue teardown.
 +	for (i = 0; i < AN7552_CORES; i++)
 +		writel(CODE_BASE + entry, ctx->regs + BOOT_PC(i));
 +	writel(3, ctx->regs + BOOT_CONFIG);
++	ctx->cores_started = true;
 +	writel(1, ctx->regs + BOOT_TRIGGER);
 +	for (i = 0; i < AN7552_CORES; i++) {
 +		ret = readl_poll_timeout(ctx->regs + 0x3000 + i * AN7552_STRIDE,
@@ -1700,8 +1710,8 @@ station authorization, replay state and PPE queue teardown.
 +	dev_dbg(ctx->dev, "firmware ready, starting TDMA\n");
 +	ret = tdma_start(ctx);
 +	if (ret) {
++		/* A failed park must retain the teardown obligation. */
 +		halt_cores(ctx);
-+		ctx->running = false;
 +		goto release_module;
 +	}
 +	dev_dbg(ctx->dev, "TDMA ready\n");
