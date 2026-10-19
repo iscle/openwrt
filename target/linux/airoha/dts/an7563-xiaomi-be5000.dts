@@ -31,6 +31,26 @@
 		reg = <0x80000000 0x20000000>;
 	};
 
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
+
+		/* RD18 stock 1.0.91: base-zero GPIO bank, active-low inputs. */
+		reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&an7563_pinctrl 5 GPIO_ACTIVE_LOW>;
+			debounce-interval = <100>;
+		};
+
+		mesh {
+			label = "mesh";
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&an7563_pinctrl 12 GPIO_ACTIVE_LOW>;
+			debounce-interval = <100>;
+		};
+	};
+
 	reserved-memory {
 		#address-cells = <1>;
 		#size-cells = <1>;

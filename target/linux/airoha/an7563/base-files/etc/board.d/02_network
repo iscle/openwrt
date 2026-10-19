@@ -11,9 +11,6 @@ an7563_setup_interfaces()
 	local board="$1"
 
 	case "$board" in
-	airoha,an7563-evb)
-		ucidef_set_interface_lan "eth0"
-		;;
 	xiaomi,be5000)
 		ucidef_set_interface_lan "lan1 lan2 lan3 eth1"
 		;;
