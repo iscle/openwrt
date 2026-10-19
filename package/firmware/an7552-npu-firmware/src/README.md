@@ -112,6 +112,12 @@ before forwarding resumes. Key removal revokes forwarding. Learning from an
 ordinary CPU data frame can fill an unknown policy but cannot overwrite an
 established policy; EAPOL frames never supply data encryption policy.
 
+There is no proved live radio/RRO drain for pairwise key replacement. The
+host rejects replacement and unsafe WCID reuse until a full radio recovery;
+removed-key tombstones prevent restarting counters under the same secret.
+Duplicate installed keys remain no-ops. This conservative policy can interrupt
+Wi-Fi and requires device testing of reconnection and periodic key renewal.
+
 Transmit key counters belong to the radio hardware. The MT7992 driver,
 not this firmware, saves and restores those counters across radio recovery.
 

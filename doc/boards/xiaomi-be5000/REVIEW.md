@@ -6,6 +6,56 @@ Linux drivers and bindings, mt76/mac80211, bridger, source NPU firmware,
 packaging and provisioning documentation. This is a source review, not an
 independent security audit or a production qualification.
 
+## October 19 consolidation and performance-port review
+
+Three adversarial reviewers examined the complete custom delta from the base
+above: NPU firmware/transport, Wi-Fi/mac80211, and platform/storage/networking.
+Reviewers then cross-reviewed fixes written by another reviewer. New findings
+were fixed and returned for another pass. The performance ports are also
+reviewed against ABI 5, rather than treating their original PR tests as proof.
+
+Confirmed issues addressed in this iteration include:
+
+* PPE drain and stop errors previously allowed DMA buffers to be reused.
+  Timeout failures now retain ownership, and destructive teardown requires a
+  quiescence proof before freeing memory. Unrecoverable teardown fails stopped.
+* Failed station/policy handshakes could reuse stale acknowledgments. A failed
+  mailbox is quarantined until recovery; later revocations still clear the
+  affected authorization and PN eligibility immediately.
+* Firmware queues could stop on a sticky error while their heartbeats remained
+  healthy. The host now detects those queue faults, including TDMA corruption.
+* L1 radio recovery could ignore reset failures and release live TX tokens.
+  All recovery phases must succeed before queues and DMA resume.
+* The mt76 NPU API depended on an Airoha-only kernel header even on other
+  targets. A matching local interface and disabled-platform stubs preserve
+  those builds.
+* NAND remapping ignored failed page copies and could retire the only good
+  source. Mapping tables now use verified copy-on-write persistence before
+  retiring the old copy. Ambiguous persistence fails stopped; table scan order
+  and on-flash format remain compatible with the existing bootloader.
+* U-Boot could reject corrected ECC reads, ignore short reads or expose raw
+  NAND after BMT attachment failed. Attachment and initial-table persistence
+  errors now prevent registration of an incorrectly mapped flash device.
+* Ethernet TX timed out and freed DMA-owned buffers. Queue completion now
+  owns reclamation; descriptor 255 is valid, and retrying a full queue cannot
+  mutate the caller's packet before returning BUSY.
+* Live pairwise key replacement lacked a proved old-frame receive drain.
+  Duplicate installed keys remain no-ops. Replacement or reused station
+  indices are rejected until full radio recovery; removed keys retain a
+  tombstone so reinstall cannot reset counters under the same secret.
+  This deliberately sacrifices seamless renewal and needs reconnect testing.
+* Splitting upload across cores introduced a PN-update/submission race.
+  A fenced pause/active handshake protects both PPE completions and new
+  submissions. Receive stop can also finish while a station pause is held.
+* The performance port preserves full cookie checks, uncached DMA backing,
+  complete-frame handling, write-through shared replay counters and bridge
+  domain restoration. A reused receive token starts with a fresh header view.
+
+The accompanying tests execute extracted production functions where practical;
+NPU tests compile the actual firmware includes. Failure models cover mailbox,
+DMA, memory ordering, NAND persistence, packet bounds and queue ownership.
+These are source/model results, not measurements on the router.
+
 ## Corrections
 
 * NPU station updates now revoke authorization and routing eligibility on
@@ -55,10 +105,11 @@ BE5000 dependency and no local feed modification is required.
 
 These are not resolved by rewriting commits or passing host tests:
 
-* **Key replacement:** there is no verified radio/RRO/DMA receive-drain
-  barrier for same-index key replacement. A software pause is not equivalent
-  to proving that all old-key frames have drained. Frequent MLO renewal and
-  intermittent discovery failures remain unqualified; see [NPU.md](NPU.md).
+* **Key replacement:** no live radio/RRO/DMA receive-drain barrier is claimed.
+  The conservative rejection/reset guard above prevents that unproved live
+  transition. Recovery and reconnection behavior under frequent MLO renewal,
+  as well as intermittent discovery failures, need device testing; see
+  [NPU.md](NPU.md).
 * **Reset and shutdown:** warm reset has stalled before U-Boot. Firmware
   recovery cannot guarantee progress through an interconnect hard lock.
   The safe response is to retain DMA-owned buffers; a cold boot may be needed.

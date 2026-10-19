@@ -99,9 +99,11 @@ the generic source and firmware images. This series is not production-qualified.
 
 ## Remaining implementation and qualification work
 
-* A verified hardware receive-drain barrier for same-index key replacement
-  is incomplete. Suspending software forwarding alone does not prove that
-  all old-key frames have left the radio, reorder engine and DMA queues.
+* A verified live receive-drain barrier is unavailable. Pairwise replacement
+  and unsafe station-index reuse are therefore rejected pending full radio
+  recovery; already installed identical keys remain no-ops. Removed-key
+  tombstones prevent counter reset under the same secret. This can interrupt
+  Wi-Fi and require clients to reconnect; seamless key renewal is not claimed.
 * Frequent MLO pairwise renewal failed intermittently, including with NPU
   offload disabled. Captures suggest an early client key switch, but do not
   establish a client-only cause or a verified fix.
