@@ -2,7 +2,7 @@
 
 # JFFS2 on the SPI-NAND of the Xiaomi BE5000 corrupts pages it programs
 # twice (cleanmarker in OOB, then data), so the overlay lives in a UBI
-# volume. Attach an existing or blank "ubi" partition and create
+# volume. Attach an existing "ubi" partition and create
 # the rootfs_data volume, with its /dev node, before mount_root looks
 # for it. An initramfs may run on a factory layout, where formatting
 # would destroy stock data: leave the flash alone there.
@@ -30,13 +30,13 @@ ubi_rootfs_data() {
 			return 1
 		}
 		ubidev="$(nand_find_ubi ubi)"
-		[ -n "$ubidev" ] || return 0
+		[ -n "$ubidev" ] || return 1
 	fi
 
 	[ -n "$(nand_find_volume "$ubidev" rootfs_data)" ] && return 0
 
 	echo "- creating rootfs_data UBI volume -"
-	ubimkvol "/dev/$ubidev" -N rootfs_data -m >/dev/null || return 0
+	ubimkvol "/dev/$ubidev" -N rootfs_data -m >/dev/null || return 1
 	# The node of the new volume does not exist yet in preinit, and
 	# mount_root opens the volume by it: nand_find_volume() creates it.
 	nand_find_volume "$ubidev" rootfs_data >/dev/null
