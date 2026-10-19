@@ -173,7 +173,9 @@ are superseded by source-built ABI 5 firmware and native bridge entries.
 
 ## Source review on current upstream
 
-The source cleanup starts from official OpenWrt commit
-`5dcf6a3b3da3cf9cfb2a0e73cbeac9a656a58cf6`. Hardware results above predate this
-rebase. A build or host-test pass does not extend those results to a new image;
-repeat hardware regression checks before installing or releasing it.
+The branch is rebased onto official OpenWrt commit
+`14423144a50d0af747dd3c63e47d86546a426cfb` (Linux 6.18.55). The preceding
+consolidation used `5dcf6a3b3da3cf9cfb2a0e73cbeac9a656a58cf6`.
+Hardware results above predate these rebases. A build or host-test pass does
+not extend those results to a new image; repeat hardware regression checks
+before installing or releasing it.

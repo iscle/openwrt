@@ -1,15 +1,44 @@
 # BE5000 source review
 
-Base: official OpenWrt `5dcf6a3b3da3cf9cfb2a0e73cbeac9a656a58cf6`.
+Current base: official OpenWrt `14423144a50d0af747dd3c63e47d86546a426cfb`.
+The original consolidation review below used
+`5dcf6a3b3da3cf9cfb2a0e73cbeac9a656a58cf6`.
 Scope: the cumulative AN7563/BE5000 changes, including bootloader support,
 Linux drivers and bindings, mt76/mac80211, bridger, source NPU firmware,
 packaging and provisioning documentation. This is a source review, not an
 independent security audit or a production qualification.
 
+## October 19 upstream-main rebase
+
+The complete custom history, including its consolidation merges and inherited
+authorship, is replayed onto upstream `14423144a5` (Linux 6.18.55). The source
+NPU firmware and its performance paths are retained. Upstream now contains the
+selected mt76 revision and the initramfs configuration-stamp fix; duplicate
+patches remain removed. The immutable `be5000-test-20261019-r2` tag still names
+the preceding build and is not retargeted by this rebase.
+
+Integration changes preserve upstream's new Ethernet DMA map types, queue
+flushing, BQL completion locking, RCU queue pointers, MTU calculation and PPE
+priority handling. AN7563 TX now records single-buffer mapping ownership and
+uses that state to reject duplicate completions. A full or flushing queue is
+checked before packet mutation. The AN7563 switch identifier moves past the
+new upstream EN7528 identifier. Shutdown now requires NPU quiescence, and an
+unresolved AN7563 QDMA idle timeout stops the system before freeing DMA memory
+or returning RAM to the bootloader.
+
+Nested package-selection guards exposed a dnsmasq Kconfig dependency cycle.
+The metadata generator now recognizes prerequisites already guaranteed by an
+enclosing selection guard, while retaining unrelated prerequisites and virtual
+provider selection. The regression includes the actual generated Kconfig with
+fatal recursive-dependency checks. A separate reviewer checked the metadata
+fix and the refreshed Wi-Fi stack; Ethernet integration receives a separate
+review from its implementation author.
+
 ## October 19 consolidation and performance-port review
 
-Three adversarial reviewers examined the complete custom delta from the base
-above: NPU firmware/transport, Wi-Fi/mac80211, and platform/storage/networking.
+Three adversarial reviewers examined the complete custom delta from the original
+consolidation base: NPU firmware/transport, Wi-Fi/mac80211, and
+platform/storage/networking.
 Reviewers then cross-reviewed fixes written by another reviewer. New findings
 were fixed and returned for another pass. The performance ports are also
 reviewed against ABI 5, rather than treating their original PR tests as proof.
