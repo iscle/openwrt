@@ -47,7 +47,7 @@ typedef uint8_t u8;
 #define AN7552_STATION_MLO 2U
 struct an7552_npu {
 	void *regs, *ram, *dev, *fe;
-	bool running, stopping, faulted, failed, fault_quiesced, ppe_enabled, tdma_enabled;
+	bool running, stopping, faulted, failed, fault_quiesced, ppe_enabled, tdma_enabled, pn_failed;
 	u32 fault_count, ppe_saved[7], heartbeat[AN7552_CORES];
 	unsigned long heartbeat_seen[AN7552_CORES];
 	int station_lock;
@@ -223,6 +223,14 @@ int main(void)
 	assert(an7552_npu_healthy(&ctx)); /* Host never owned this TDMA. */
 	ctx.tdma_enabled = true;
 	assert(!an7552_npu_healthy(&ctx) && ctx.faulted);
+
+	/* A timed-out replay mailbox cannot recover merely by heartbeating. */
+	ctx.faulted = false;
+	ctx.tdma_enabled = false;
+	ctx.pn_failed = true;
+	assert(!an7552_npu_healthy(&ctx) && ctx.faulted);
+	assert(!an7552_npu_recovery_ready(&ctx));
+	ctx.pn_failed = false;
 
 	/* Only destructors invoke the fatal guard, before memory reclamation. */
 	ctx.faulted = false;

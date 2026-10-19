@@ -192,11 +192,11 @@ struct airoha_bmt_table {char signature[4]; unsigned value; u8 pad[24];};
 struct {int system_blks,total_blks,bmt_block,bbt_block;} ctx;
 static struct airoha_bmt_table disk[8], before, next;
 static int writes, erases, write_error, erase_error, corrupt_write, fatal;
-static int cut, event, direction, erase_fail_after_write;
+static int cut, event, direction, erase_fail_after_write, bad_oob;
 static jmp_buf escape;
 static void point(void) {if (++event == cut) longjmp(escape, 1);}
-static int airoha_bad_markers(int b) {return 0;}
-static int airoha_read_oob_idx(int b,u16 *idx) {*idx=0xffff;return 0;}
+static int airoha_bad_markers(int b) {return writes && bad_oob==1;}
+static int airoha_read_oob_idx(int b,u16 *idx) {*idx=(writes && bad_oob==2)?7:0xffff;return 0;}
 static int bmt_find_by_mapped(int b) {return -1;}
 static int airoha_read_data(int b,void *out,size_t len){memcpy(out,&disk[b],len);return 0;}
 static int bbt_nand_erase(int b) {
@@ -231,7 +231,7 @@ static void reset(int end) {
     direction=end;ctx.system_blks=0;ctx.total_blks=8;
     ctx.bbt_block=-1;ctx.bmt_block=end?5:2;disk[ctx.bmt_block]=before;
     writes=erases=write_error=corrupt_write=fatal=event=cut=0;erase_error=-1;
-    erase_fail_after_write=0;
+    erase_fail_after_write=bad_oob=0;
 }
 """
             code += function(source, 'static int airoha_erase_metadata(')
@@ -246,6 +246,11 @@ int main(void) {
         reset(end);corrupt_write=1;
         assert(airoha_commit_table(&next,sizeof(next),3,&ctx.bmt_block,end)==-EIO);
         assert(disk[boot()].value==123 && !fatal);
+        for(int marker=1;marker<=2;marker++) {
+            reset(end);bad_oob=marker;
+            assert(airoha_commit_table(&next,sizeof(next),3,&ctx.bmt_block,end)==-EIO);
+            assert(disk[boot()].value==123 && !fatal);
+        }
         reset(end);old=ctx.bmt_block;erase_error=old;
         assert(setjmp(escape) || (airoha_commit_table(&next,sizeof(next),3,&ctx.bmt_block,end),0));
         assert(fatal && disk[old].value==123 && disk[boot()].value==456);
