@@ -8,7 +8,22 @@ based on a polling timeout.
 ---
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -1136,170 +1136,177 @@
+@@ -1129,218 +1129,224 @@
+ 		WRITE_ONCE(desc->msg1, 0);
+ 		WRITE_ONCE(desc->msg2, 0);
+ 		WRITE_ONCE(desc->msg3, 0);
+ 
+ 		q->tail = (q->tail + 1) % q->ndesc;
+ 		q->queued--;
+ 	}
+ 
+ 	q->head = q->tail;
+ 	/* Set RX_DMA_IDX to RX_CPU_IDX to notify the hw the QDMA RX ring is
+ 	 * empty.
+ 	 */
+ 	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
+ 			FIELD_PREP(RX_RING_CPU_IDX_MASK, q->head));
+ 	airoha_qdma_rmw(qdma, REG_RX_DMA_IDX(qid), RX_RING_DMA_IDX_MASK,
  			FIELD_PREP(RX_RING_DMA_IDX_MASK, q->tail));
  }
  
@@ -60,7 +75,7 @@ based on a polling timeout.
  			netdev = netdev_from_priv(dev);
  			for (j = 0; j < netdev->num_tx_queues; j++) {
 -				if (airoha_qdma_get_txq(qdma, j) != qid)
-+				if (eth->soc->version != 0x7563 &&
++				if (!airoha_is_7563(eth) &&
 +				    airoha_qdma_get_txq(qdma, j) != qid)
  					continue;
  
@@ -69,6 +84,25 @@ based on a polling timeout.
  		}
  	}
  	q->txq_stopped = false;
+ }
+ 
+ static void airoha_unmap_xmit_buf(struct airoha_eth *eth,
+ 				  struct airoha_queue_entry *e)
+ {
+ 	switch (e->dma_type) {
+ 	case AIROHA_DMA_MAP_PAGE:
+ 		dma_unmap_page(eth->dev, e->dma_addr, e->dma_len,
+ 			       DMA_TO_DEVICE);
+ 		break;
+ 	case AIROHA_DMA_MAP_SINGLE:
+ 		dma_unmap_single(eth->dev, e->dma_addr, e->dma_len,
+ 				 DMA_TO_DEVICE);
+ 		break;
+ 	case AIROHA_DMA_UNMAPPED:
+ 	default:
+ 		break;
+ 	}
+ 	e->dma_type = AIROHA_DMA_UNMAPPED;
  }
  
  static int airoha_qdma_tx_napi_poll(struct napi_struct *napi, int budget)
@@ -103,7 +137,7 @@ based on a polling timeout.
  			break;
  
 -		irq_q->q[head] = 0xff; /* mark as done */
-+		/* Order the DMA completion before descriptor ownership reads. */
++		/* Order completion before descriptor ownership reads. */
 +		dma_rmb();
 +		WRITE_ONCE(irq_q->q[head], U32_MAX); /* mark as done */
  		head = (head + 1) % irq_q->size;
@@ -135,15 +169,13 @@ based on a polling timeout.
  			goto unlock;
  
  		e = &q->entry[index];
-+		if (!e->dma_addr)
++		if (e->dma_type == AIROHA_DMA_UNMAPPED)
 +			goto unlock;
 +		dma_rmb();
  		skb = e->skb;
-+		e->skb = NULL;
+ 		e->skb = NULL;
  
- 		dma_unmap_single(eth->dev, e->dma_addr, e->dma_len,
- 				 DMA_TO_DEVICE);
- 		e->dma_addr = 0;
+ 		airoha_unmap_xmit_buf(eth, e);
  		list_add_tail(&e->list, &q->tx_list);
  
  		WRITE_ONCE(desc->msg0, 0);
@@ -151,10 +183,16 @@ based on a polling timeout.
  		q->queued--;
  
  		if (skb) {
+ 			struct airoha_gdm_dev *dev = netdev_priv(skb->dev);
+ 			u16 qidx = skb_get_queue_mapping(skb);
  			struct netdev_queue *txq;
  
  			txq = skb_get_tx_queue(skb->dev, skb);
+ 
+ 			spin_lock_bh(&dev->txq_lock[qidx]);
  			netdev_tx_completed_queue(txq, 1, skb->len);
+ 			spin_unlock_bh(&dev->txq_lock[qidx]);
+ 
  			dev_kfree_skb_any(skb);
  		}
  
@@ -190,7 +228,32 @@ based on a polling timeout.
  
  	return done;
  }
-@@ -2632,179 +2639,175 @@
+ 
+ static int airoha_qdma_init_tx_queue(struct airoha_queue *q,
+ 				     struct airoha_qdma *qdma, int size)
+ {
+ 	struct airoha_eth *eth = qdma->eth;
+ 	int i, qid = q - &qdma->q_tx[0];
+ 	dma_addr_t dma_addr;
+ 
+ 	spin_lock_init(&q->lock);
+@@ -2697,204 +2703,203 @@
+ 	xmit_tpid = tag >> 8;
+ 
+ 	switch (xmit_tpid) {
+ 	case MTK_HDR_XMIT_TAGGED_TPID_8100:
+ 		ehdr->h_proto = cpu_to_be16(ETH_P_8021Q);
+ 		tag &= ~(MTK_HDR_XMIT_TAGGED_TPID_8100 << 8);
+ 		break;
+ 	case MTK_HDR_XMIT_TAGGED_TPID_88A8:
+ 		ehdr->h_proto = cpu_to_be16(ETH_P_8021AD);
+ 		tag &= ~(MTK_HDR_XMIT_TAGGED_TPID_88A8 << 8);
+ 		break;
+ 	default:
+ 		/* PPE module requires untagged DSA packets to work properly,
+ 		 * so move DSA tag to DMA descriptor.
+ 		 */
+ 		memmove(skb->data + MTK_HDR_LEN, skb->data, 2 * ETH_ALEN);
  		__skb_pull(skb, MTK_HDR_LEN);
  		break;
  	}
@@ -217,7 +280,7 @@ based on a polling timeout.
  
  	qdma = airoha_qdma_deref(dev);
  	if (qdma->users > 1)
- 		features &= ~NETIF_F_GRO_HW;
+ 		features &= ~NETIF_F_LRO;
  
  	return features;
  }
@@ -225,31 +288,19 @@ based on a polling timeout.
  static int airoha_dev_set_features(struct net_device *netdev,
  				   netdev_features_t features)
  {
- 	netdev_features_t diff = netdev->features ^ features;
  	struct airoha_gdm_dev *dev = netdev_priv(netdev);
- 	struct airoha_qdma *qdma = airoha_qdma_deref(dev);
- 	int qdma_id = qdma - &dev->eth->qdma[0];
  
- 	if (!(diff & NETIF_F_GRO_HW))
- 		return 0;
- 
- 	if (features & NETIF_F_GRO_HW)
+ 	if (features & NETIF_F_LRO)
  		airoha_dev_lro_enable(dev);
  	else
- 		airoha_fe_lro_disable(dev->eth, qdma_id);
+ 		airoha_dev_lro_disable(dev);
  
  	return 0;
  }
  
-+/* Keep submitted buffers owned by QDMA until its completion interrupt.
-+ * All AN7563 netdev queues share hardware queue zero. A software polling
-+ * timeout is not proof that the DMA engine has stopped accessing memory.
-+ */
  static netdev_tx_t airoha_an7563_dev_xmit(struct sk_buff *skb,
--					  struct net_device *dev,
--					  struct airoha_qdma *qdma)
-+                                          struct net_device *dev,
-+                                          struct airoha_qdma *qdma)
+ 					  struct net_device *dev,
+ 					  struct airoha_qdma *qdma)
  {
  	struct airoha_queue *q = &qdma->q_tx[0];
 +	struct netdev_queue *txq = skb_get_tx_queue(dev, skb);
@@ -264,11 +315,13 @@ based on a polling timeout.
  	if (WARN_ON_ONCE(!q->ndesc))
  		goto drop;
 -
- 	if (skb_linearize(skb))
- 		goto drop;
- 	if (skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_help(skb))
- 		goto drop;
+-	if (skb_linearize(skb))
 +	spin_lock_bh(&q->lock);
++	if (q->flushing) {
++		spin_unlock_bh(&q->lock);
+ 		goto drop;
+-	if (skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_help(skb))
++	}
 +	/* Retain one unused descriptor as the hardware producer sentinel. */
 +	if (q->queued + 1 >= q->ndesc) {
 +		netif_tx_stop_queue(txq);
@@ -277,6 +330,12 @@ based on a polling timeout.
 +		return NETDEV_TX_BUSY;
 +	}
 +
++	/* These helpers may rewrite skb data; reserve capacity first. */
++	if (skb_linearize(skb) ||
++	    (skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_help(skb))) {
++		spin_unlock_bh(&q->lock);
+ 		goto drop;
++	}
 +	/* DSA tag extraction mutates skb; never do it before a BUSY exit. */
  	tag = airoha_get_dsa_tag(skb, dev);
 -	len = skb->len;
@@ -299,6 +358,7 @@ based on a polling timeout.
 +	list_del_init(&e->list);
 +	next = list_first_entry(&q->tx_list, struct airoha_queue_entry, list);
 +	e->skb = skb;
++	e->dma_type = AIROHA_DMA_MAP_SINGLE;
 +	e->dma_addr = dma_addr;
 +	e->dma_len = skb->len;
  
@@ -379,8 +439,8 @@ based on a polling timeout.
  	struct netdev_queue *txq;
  	struct airoha_queue *q;
  	LIST_HEAD(tx_list);
+ 	dma_addr_t addr;
  	int i = 0, qid;
- 	void *data;
  	u16 index;
  	u8 fport;
  
@@ -411,3 +471,18 @@ based on a polling timeout.
  			goto error;
  
  		if (skb_shinfo(skb)->gso_type & (SKB_GSO_TCPV4 |
+ 						 SKB_GSO_TCPV6)) {
+ 			__be16 csum = cpu_to_be16(skb_shinfo(skb)->gso_size);
+ 
+ 			tcp_hdr(skb)->check = (__force __sum16)csum;
+ 			msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_TSO_MASK, 1);
+ 		}
+ 	}
+ 
+ 	fport = airoha_get_fe_port(dev);
+ 	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK, dev->nbq) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, fport) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
+ 
+ 	q = &qdma->q_tx[qid];
+ 	if (WARN_ON_ONCE(!q->ndesc))

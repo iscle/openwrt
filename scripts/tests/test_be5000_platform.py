@@ -119,15 +119,17 @@ static void add_tail(struct list_head *h,struct list_head *n) {n->prev=h->prev;n
 struct netdev_queue {int stopped,sent;};
 struct net_device {struct {void *parent;} dev;struct {int tx_packets,tx_bytes,tx_dropped;} stats;struct netdev_queue tx;};
 struct sk_buff {void *data;unsigned len;int ip_summed;struct net_device *dev;};
-struct airoha_queue_entry {struct list_head list;struct sk_buff *skb;dma_addr_t dma_addr;unsigned dma_len;};
+enum airoha_dma_map_type {AIROHA_DMA_UNMAPPED,AIROHA_DMA_MAP_SINGLE,AIROHA_DMA_MAP_PAGE};
+struct airoha_queue_entry {struct list_head list;struct sk_buff *skb;dma_addr_t dma_addr;unsigned dma_len;enum airoha_dma_map_type dma_type;};
 struct airoha_qdma_desc {u32 ctrl,addr,data,msg0,msg1,msg2,msg3;};
-struct airoha_queue {int lock,queued,ndesc,free_thr;bool txq_stopped;struct list_head tx_list;struct airoha_queue_entry *entry;struct airoha_qdma_desc *desc;};
+struct airoha_queue {int lock,queued,ndesc,free_thr;bool txq_stopped,flushing;struct list_head tx_list;struct airoha_queue_entry *entry;struct airoha_qdma_desc *desc;};
 struct airoha_qdma {struct airoha_queue q_tx[1];};
 struct port {int id;};
-struct airoha_gdm_dev {struct port *port;} gdm;
+struct airoha_gdm_dev {struct port *port;int txq_lock[1];} gdm;
 static int frees,maps,notify, map_error;
 static void *netdev_priv(struct net_device *dev) {return &gdm;}
 static struct netdev_queue *skb_get_tx_queue(struct net_device *d,struct sk_buff *s){return &d->tx;}
+static int skb_get_queue_mapping(struct sk_buff *s){return 0;}
 static int skb_linearize(struct sk_buff *s){return 0;}
 static int skb_checksum_help(struct sk_buff *s){return 0;}
 static int airoha_get_dsa_tag(struct sk_buff *s,struct net_device *d){s->len-=4;return 0;}
@@ -161,6 +163,10 @@ int main(void) {
     e[1].dma_addr=0;e[1].skb=0;add_tail(&q->tx_list,&e[1].list);q->queued--;
     map_error=1;assert(airoha_an7563_dev_xmit(&skb[4],&dev,&dma)==NETDEV_TX_OK);
     assert(frees==1 && q->queued==2 && notify==4);
+    assert(e[2].dma_type==AIROHA_DMA_MAP_SINGLE && e[3].dma_type==AIROHA_DMA_MAP_SINGLE);
+    q->flushing=true;map_error=0;int oldmaps=maps;skb[4].len=100;
+    assert(airoha_an7563_dev_xmit(&skb[4],&dev,&dma)==NETDEV_TX_OK);
+    assert(maps==oldmaps && skb[4].len==100 && frees==2 && q->queued==2 && notify==4);
 }
 '''
 
@@ -538,16 +544,17 @@ struct airoha_qdma {struct airoha_queue q_tx[1];struct airoha_tx_irq_queue q_tx_
 #define QDMA_INT_REG_IDX0 0
 #define TX_DONE_INT_MASK(x) 1
 #define list_add_tail(n,h) add_tail(h,n)
-static int unmapped,completed;
+static int unmapped,completed,page_unmapped;
 static u32 irq_status;
 static u32 airoha_qdma_rr(struct airoha_qdma *q,int r){return irq_status;}
 static void dma_unmap_single(void *d,dma_addr_t a,unsigned n,int dir){unmapped++;}
+static void dma_unmap_page(void *d,dma_addr_t a,unsigned n,int dir){page_unmapped++;}
 static void netdev_tx_completed_queue(struct netdev_queue *q,int n,unsigned len){completed+=n;}
 static void airoha_qdma_wake_netdev_txqs(struct airoha_queue *q){q->txq_stopped=false;}
 static bool napi_complete(struct napi_struct *n){return true;}
 static void airoha_qdma_irq_enable(int *b,int r,int m){}
 '''
-        run_c(harness + function(source, 'static int airoha_qdma_tx_napi_poll(') + r'''
+        run_c(harness + function(source, 'static void airoha_unmap_xmit_buf(') + function(source, 'static int airoha_qdma_tx_napi_poll(') + r'''
 int main(void){
     struct airoha_qdma dma={};struct airoha_eth eth={};
     struct airoha_queue_entry e[1024]={};struct airoha_qdma_desc d[1024]={};
@@ -556,16 +563,98 @@ int main(void){
     dma.eth=&eth;iq->qdma=&dma;iq->size=4;iq->q=irq;
     q->entry=e;q->desc=d;q->ndesc=1024;q->queued=2;q->free_thr=2;
     q->tx_list.next=q->tx_list.prev=&q->tx_list;
-    e[255].skb=&skb;e[255].dma_addr=0x80000000;e[255].dma_len=100;d[255].ctrl=QDMA_DESC_DONE_MASK;
+    e[255].dma_type=AIROHA_DMA_MAP_SINGLE;e[255].skb=&skb;e[255].dma_addr=0x80000000;e[255].dma_len=100;d[255].ctrl=QDMA_DESC_DONE_MASK;
     irq_status=1U<<16;
     assert(airoha_qdma_tx_napi_poll(&iq->napi,8)==1);
     assert(unmapped==1 && frees==1 && completed==1 && q->queued==1 && irq[0]==U32_MAX);
+    assert(e[255].dma_type==AIROHA_DMA_UNMAPPED && e[255].dma_addr);
     irq[0]=255;assert(airoha_qdma_tx_napi_poll(&iq->napi,8)==1);
     assert(unmapped==1 && frees==1 && completed==1 && q->queued==1);
     irq[0]=U32_MAX;int old_notify=notify;
     assert(!airoha_qdma_tx_napi_poll(&iq->napi,8) && notify==old_notify);
+    e[256].dma_type=AIROHA_DMA_MAP_PAGE;e[256].dma_addr=0x90000000;
+    airoha_unmap_xmit_buf(&eth,&e[256]);
+    assert(page_unmapped==1 && unmapped==1 && e[256].dma_type==AIROHA_DMA_UNMAPPED);
+    airoha_unmap_xmit_buf(&eth,&e[256]);assert(page_unmapped==1);
 }
 ''')
+
+    def test_qdma_teardown_timeout_never_releases_owned_dma(self):
+        source = postimage('target/linux/airoha/patches-6.18/958-net-airoha-quiesce-dma-on-shutdown.patch')
+        dma_source = postimage('target/linux/airoha/patches-6.18/960-net-airoha-retain-an7563-tx-dma-ownership.patch')
+        harness = TX.replace('struct airoha_qdma {struct airoha_queue q_tx[1];};', r"""
+struct airoha_eth {void *dev;};
+struct airoha_qdma {struct airoha_queue q_tx[1];struct airoha_eth *eth;};
+""")
+        harness += r"""
+#include <setjmp.h>
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
+#define REG_QDMA_GLOBAL_CFG 0
+#define GLOBAL_CFG_TX_DMA_EN_MASK 1
+#define GLOBAL_CFG_TX_DMA_BUSY_MASK 2
+#define REG_TX_DMA_IDX(q) 0
+#define TX_RING_DMA_IDX_MASK 1
+#define USEC_PER_MSEC 1000
+#define list_add_tail(n,h) add_tail(h,n)
+#define list_empty(h) ((h)->next==(h))
+#define dev_warn(...) ((void)0)
+#define read_poll_timeout(...) (timeout)
+static int timeout,panic_timeout,panicked,unmapped,completed;
+static jmp_buf escape;
+static int airoha_is_7563(struct airoha_eth *eth){return 1;}
+static __attribute__((noreturn)) void panic(const char *message,...) {panicked++;longjmp(escape,1);}
+static void airoha_qdma_clear(struct airoha_qdma *qdma,int r,int mask){}
+static void dma_unmap_single(void *d,dma_addr_t a,unsigned n,int dir){unmapped++;}
+static void dma_unmap_page(void *d,dma_addr_t a,unsigned n,int dir){unmapped++;}
+static void netdev_tx_completed_queue(struct netdev_queue *q,int n,unsigned len){completed+=n;}
+"""
+        run_c(harness + function(source, 'static void airoha_dma_timeout(') +
+              function(dma_source, 'static void airoha_unmap_xmit_buf(') +
+              function(source, 'static void airoha_qdma_tx_cleanup(') + r"""
+int main(void) {
+    struct airoha_eth eth={};struct airoha_qdma dma={.eth=&eth};
+    struct airoha_queue_entry e[2]={};struct airoha_qdma_desc d[2]={};
+    struct net_device dev={};struct sk_buff skb={.dev=&dev,.len=100};
+    struct airoha_queue *q=&dma.q_tx[0];
+    q->ndesc=2;q->queued=1;q->entry=e;q->desc=d;
+    q->tx_list.next=q->tx_list.prev=&q->tx_list;add_tail(&q->tx_list,&e[1].list);
+    e[0].dma_type=AIROHA_DMA_MAP_SINGLE;e[0].dma_addr=0x80000000;e[0].dma_len=100;e[0].skb=&skb;
+    timeout=1;panic_timeout=3;
+    if(!setjmp(escape)){airoha_qdma_tx_cleanup(&dma);assert(0);}
+    assert(panicked==1 && !panic_timeout && !unmapped && !completed && !frees);
+    assert(q->queued==1 && e[0].skb==&skb && e[0].dma_type==AIROHA_DMA_MAP_SINGLE);
+    timeout=0;airoha_qdma_tx_cleanup(&dma);
+    assert(unmapped==1 && completed==1 && frees==1 && !q->queued && q->flushing);
+    assert(!e[0].skb && e[0].dma_type==AIROHA_DMA_UNMAPPED);
+    airoha_qdma_tx_cleanup(&dma);assert(unmapped==1 && completed==1 && frees==1);
+}
+""")
+
+    def test_shutdown_requires_quiescence_before_reboot(self):
+        source = postimage('target/linux/airoha/patches-6.18/958-net-airoha-quiesce-dma-on-shutdown.patch')
+        run_c(r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <setjmp.h>
+struct an7552_npu {int attach_lock;bool running;} ctx;
+struct platform_device {int unused;};
+static int failed,guards,locked;
+static jmp_buf escape;
+static struct an7552_npu *platform_get_drvdata(struct platform_device *p){return &ctx;}
+static void mutex_lock(int *lock){locked=1;}
+static void mutex_unlock(int *lock){locked=0;}
+static void an7552_npu_require_quiescent(struct an7552_npu *n) {
+    assert(locked);guards++;if(failed)longjmp(escape,1);
+}
+""" + function(source, 'static void an7552_npu_shutdown(') + r"""
+int main(void) {
+    ctx.running=true;failed=1;
+    if(!setjmp(escape)){an7552_npu_shutdown(0);assert(0);}
+    assert(guards==1 && ctx.running);
+    failed=0;an7552_npu_shutdown(0);
+    assert(guards==2 && !ctx.running && !locked);
+}
+""")
 
     def test_uboot_table_corrected_ecc_and_short_read(self):
         source = postimage('package/boot/uboot-airoha/patches/600-mtd-spi-nand-add-airoha-bmt-support.patch')

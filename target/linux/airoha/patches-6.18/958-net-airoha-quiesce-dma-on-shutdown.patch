@@ -9,13 +9,473 @@ relocated itself.
 
 Drop every GDM port, disable both QDMA engines and wait until they report
 idle. Stop the NPU queues and the TDMA and park the two cores the way
-an7552_npu_put() does.
+an7552_npu_put() does. Refuse to continue on unresolved AN7563 DMA
+ownership during shutdown or cleanup; a warm reset cannot safely release it.
 
 Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
 ---
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -4618,9 +4618,39 @@
+@@ -8,6 +8,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/platform_device.h>
++#include <linux/panic.h>
+ #include <linux/regmap.h>
+ #include <linux/tcp.h>
+ #include <linux/pcs/pcs.h>
+@@ -1358,182 +1358,194 @@
+ 	if (!q->desc)
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < size; i++) {
+ 		u32 val = FIELD_PREP(QDMA_DESC_DONE_MASK, 1);
+ 
+ 		list_add_tail(&q->entry[i].list, &q->tx_list);
+ 		WRITE_ONCE(q->desc[i].ctrl, cpu_to_le32(val));
+ 	}
+ 	q->ndesc = size;
+ 
+ 	/* xmit ring drop default setting */
+ 	airoha_qdma_set(qdma, REG_TX_RING_BLOCKING(qid),
+ 			TX_RING_IRQ_BLOCKING_TX_DROP_EN_MASK);
+ 
+ 	if (eth->soc->version == 0x7563) {
+ 		q->desc_dma = dma_addr;
+ 
+ 		memset(q->desc, 0, size * sizeof(*q->desc));
+ 		dma_sync_single_for_device(eth->dev, q->desc_dma,
+ 					   size * sizeof(*q->desc), DMA_TO_DEVICE);
+ 
+ 		airoha_qdma_clear(qdma, REG_TX_RING_BLOCKING(qid),
+ 				  TX_RING_IRQ_BLOCKING_TX_DROP_EN_MASK |
+ 				  TX_RING_IRQ_BLOCKING_CFG_MASK);
+ 	}
+ 
+ 	airoha_qdma_wr(qdma, REG_TX_RING_BASE(qid), dma_addr);
+ 	airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(qid), TX_RING_CPU_IDX_MASK,
+ 			FIELD_PREP(TX_RING_CPU_IDX_MASK, 0));
+ 	airoha_qdma_rmw(qdma, REG_TX_DMA_IDX(qid), TX_RING_DMA_IDX_MASK,
+ 			FIELD_PREP(TX_RING_DMA_IDX_MASK, 0));
+ 
+ 	return 0;
+ }
+ 
+ static int airoha_qdma_tx_irq_init(struct airoha_tx_irq_queue *irq_q,
+ 				   struct airoha_qdma *qdma, int size)
+ {
+ 	int id = irq_q - &qdma->q_tx_irq[0];
+ 	struct airoha_eth *eth = qdma->eth;
+ 	dma_addr_t dma_addr;
+ 
+ 	irq_q->q = dmam_alloc_coherent(eth->dev, size * sizeof(u32),
+ 				       &dma_addr, GFP_KERNEL);
+ 	if (!irq_q->q)
+ 		return -ENOMEM;
+ 
+ 	memset(irq_q->q, 0xff, size * sizeof(u32));
+ 	irq_q->size = size;
+ 	irq_q->qdma = qdma;
+ 
+ 	netif_napi_add_tx(eth->napi_dev, &irq_q->napi,
+ 			  airoha_qdma_tx_napi_poll);
+ 
+ 	airoha_qdma_wr(qdma, REG_TX_IRQ_BASE(id), dma_addr);
+ 	airoha_qdma_rmw(qdma, REG_TX_IRQ_CFG(id), TX_IRQ_DEPTH_MASK,
+ 			FIELD_PREP(TX_IRQ_DEPTH_MASK, size));
+ 	airoha_qdma_rmw(qdma, REG_TX_IRQ_CFG(id), TX_IRQ_THR_MASK,
+ 			FIELD_PREP(TX_IRQ_THR_MASK, 1));
+ 
+ 	return 0;
+ }
+ 
+ static int airoha_qdma_init_tx(struct airoha_qdma *qdma)
+ {
+ 	int i, err;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++) {
+ 		err = airoha_qdma_tx_irq_init(&qdma->q_tx_irq[i], qdma,
+ 					      IRQ_QUEUE_LEN(i));
+ 		if (err)
+ 			return err;
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
+ 		err = airoha_qdma_init_tx_queue(&qdma->q_tx[i], qdma,
+ 						TX_DSCP_NUM);
+ 		if (err)
+ 			return err;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++/* AN7563 does not reset DMA on a warm reboot. A failed idle proof must
++ * not return into freeing DMA buffers or handing DDR to the bootloader.
++ */
++static void airoha_dma_timeout(struct airoha_eth *eth, const char *engine)
++{
++	if (airoha_is_7563(eth)) {
++		WRITE_ONCE(panic_timeout, 0);
++		panic("AN7563 %s DMA ownership unresolved; power cycle required", engine);
++	}
++	dev_warn(eth->dev, "%s DMA busy timeout\n", engine);
++}
++
+ static void airoha_qdma_tx_cleanup(struct airoha_qdma *qdma)
+ {
+ 	u32 status;
+ 	int i;
+ 
+ 	airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
+ 			  GLOBAL_CFG_TX_DMA_EN_MASK);
+ 	if (read_poll_timeout(airoha_qdma_rr, status,
+ 			      !(status & GLOBAL_CFG_TX_DMA_BUSY_MASK),
+ 			      USEC_PER_MSEC, 50 * USEC_PER_MSEC, true,
+ 			      qdma, REG_QDMA_GLOBAL_CFG))
+-		dev_warn(qdma->eth->dev, "QDMA TX DMA busy timeout\n");
++		airoha_dma_timeout(qdma->eth, "QDMA TX");
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
+ 		struct airoha_queue *q = &qdma->q_tx[i];
+ 		u16 index = 0;
+ 		int j;
+ 
+ 		if (!q->ndesc)
+ 			continue;
+ 
+ 		spin_lock_bh(&q->lock);
+ 
+ 		q->flushing = true;
+ 		for (j = 0; j < q->ndesc; j++) {
+ 			struct airoha_queue_entry *e = &q->entry[j];
+ 			struct airoha_qdma_desc *desc = &q->desc[j];
+ 			struct sk_buff *skb = e->skb;
+ 
+ 			if (e->dma_type == AIROHA_DMA_UNMAPPED)
+ 				continue;
+ 
+ 			airoha_unmap_xmit_buf(qdma->eth, e);
+ 			list_add_tail(&e->list, &q->tx_list);
+ 
+ 			WRITE_ONCE(desc->ctrl, 0);
+ 			WRITE_ONCE(desc->addr, 0);
+ 			WRITE_ONCE(desc->data, 0);
+ 			WRITE_ONCE(desc->msg0, 0);
+ 			WRITE_ONCE(desc->msg1, 0);
+ 			WRITE_ONCE(desc->msg2, 0);
+ 
+ 			if (skb) {
+ 				struct netdev_queue *txq;
+ 
+ 				txq = skb_get_tx_queue(skb->dev, skb);
+ 				netdev_tx_completed_queue(txq, 1, skb->len);
+ 				dev_kfree_skb_any(skb);
+ 				e->skb = NULL;
+ 			}
+ 
+ 			q->queued--;
+ 		}
+ 
+ 		if (!list_empty(&q->tx_list)) {
+ 			struct airoha_queue_entry *e;
+ 
+ 			e = list_first_entry(&q->tx_list,
+ 					     struct airoha_queue_entry, list);
+ 			index = e - q->entry;
+ 		}
+ 		airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(i), TX_RING_CPU_IDX_MASK,
+ 				FIELD_PREP(TX_RING_CPU_IDX_MASK, index));
+ 		airoha_qdma_rmw(qdma, REG_TX_DMA_IDX(i), TX_RING_DMA_IDX_MASK,
+ 				FIELD_PREP(TX_RING_DMA_IDX_MASK, index));
+ 
+ 		spin_unlock_bh(&q->lock);
+ 	}
+ }
+ 
+ static int airoha_qdma_init_hfwd_queues(struct airoha_qdma *qdma)
+ {
+ 	int size, index, num_desc = HW_DSCP_NUM;
+ 	struct airoha_eth *eth = qdma->eth;
+ 	int id = qdma - &eth->qdma[0];
+ 	u32 status, buf_size;
+ 	dma_addr_t dma_addr;
+ 	void *buf;
+ 	const char *name;
+ 
+ 	if (eth->soc->version == 0x7563) {
+ 		num_desc = 32;
+ 
+ 		size = num_desc * sizeof(struct airoha_qdma_fwd_desc);
+ 		buf = dmam_alloc_coherent(eth->dev, size, &dma_addr,
+ 					  GFP_KERNEL);
+ 		if (!buf)
+ 			return -ENOMEM;
+ 
+ 		memset(buf, 0, size);
+ 		dma_sync_single_for_device(eth->dev, dma_addr, size,
+ 					   DMA_TO_DEVICE);
+ 		airoha_qdma_wr(qdma, REG_FWD_DSCP_BASE, dma_addr);
+ 
+ 		size = AIROHA_MAX_PACKET_SIZE * num_desc;
+ 		buf = dmam_alloc_coherent(eth->dev, size, &dma_addr,
+ 					  GFP_KERNEL);
+@@ -1836,171 +1848,171 @@
+ }
+ 
+ static int airoha_qdma_init_irq_banks(struct platform_device *pdev,
+ 				      struct airoha_qdma *qdma)
+ {
+ 	struct airoha_eth *eth = qdma->eth;
+ 	int i, id = qdma - &eth->qdma[0];
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->irq_banks); i++) {
+ 		struct airoha_irq_bank *irq_bank = &qdma->irq_banks[i];
+ 		int err, irq_index = 4 * id + i;
+ 		const char *name;
+ 
+ 		spin_lock_init(&irq_bank->irq_lock);
+ 		irq_bank->qdma = qdma;
+ 
+ 		irq_bank->irq = platform_get_irq(pdev, irq_index);
+ 		if (irq_bank->irq < 0)
+ 			return irq_bank->irq;
+ 
+ 		name = devm_kasprintf(eth->dev, GFP_KERNEL,
+ 				      KBUILD_MODNAME ".%d", irq_index);
+ 		if (!name)
+ 			return -ENOMEM;
+ 
+ 		err = devm_request_irq(eth->dev, irq_bank->irq,
+ 				       airoha_irq_handler, IRQF_SHARED, name,
+ 				       irq_bank);
+ 		if (err)
+ 			return err;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+ static int airoha_qdma_init(struct platform_device *pdev,
+ 			    struct airoha_eth *eth,
+ 			    struct airoha_qdma *qdma)
+ {
+ 	int err, id = qdma - &eth->qdma[0];
+ 	const char *res;
+ 
+ 	qdma->eth = eth;
+ 	res = devm_kasprintf(eth->dev, GFP_KERNEL, "qdma%d", id);
+ 	if (!res)
+ 		return -ENOMEM;
+ 
+ 	qdma->regs = devm_platform_ioremap_resource_byname(pdev, res);
+ 	if (IS_ERR(qdma->regs))
+ 		return dev_err_probe(eth->dev, PTR_ERR(qdma->regs),
+ 				     "failed to iomap qdma%d regs\n", id);
+ 
+ 	err = airoha_qdma_init_irq_banks(pdev, qdma);
+ 	if (err)
+ 		return err;
+ 
+ 	err = airoha_qdma_init_rx(qdma);
+ 	if (err)
+ 		return err;
+ 
+ 	err = airoha_qdma_init_tx(qdma);
+ 	if (err)
+ 		return err;
+ 
+ 	err = airoha_qdma_init_hfwd_queues(qdma);
+ 	if (err)
+ 		return err;
+ 
+ 	return airoha_qdma_hw_init(qdma);
+ }
+ 
+ static void airoha_qdma_cleanup(struct airoha_eth *eth,
+ 				struct airoha_qdma *qdma)
+ {
+ 	int i;
+ 
+ 	if (test_bit(DEV_STATE_INITIALIZED, &eth->state)) {
+ 		u32 status;
+ 
+ 		airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
+ 				  GLOBAL_CFG_RX_DMA_EN_MASK);
+ 		if (read_poll_timeout(airoha_qdma_rr, status,
+ 				      !(status & GLOBAL_CFG_RX_DMA_BUSY_MASK),
+ 				      USEC_PER_MSEC, 50 * USEC_PER_MSEC, true,
+ 				      qdma, REG_QDMA_GLOBAL_CFG))
+-			dev_warn(eth->dev, "QDMA RX DMA busy timeout\n");
++			airoha_dma_timeout(eth, "QDMA RX");
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+ 		if (!qdma->q_rx[i].ndesc)
+ 			continue;
+ 
+ 		netif_napi_del(&qdma->q_rx[i].napi);
+ 		airoha_qdma_cleanup_rx_queue(&qdma->q_rx[i]);
+ 		if (qdma->q_rx[i].page_pool) {
+ 			page_pool_destroy(qdma->q_rx[i].page_pool);
+ 			qdma->q_rx[i].page_pool = NULL;
+ 		}
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++) {
+ 		if (!qdma->q_tx_irq[i].size)
+ 			continue;
+ 
+ 		netif_napi_del(&qdma->q_tx_irq[i].napi);
+ 	}
+ 
+ }
+ 
+ static int airoha_hw_init(struct platform_device *pdev,
+ 			  struct airoha_eth *eth)
+ {
+ 	int err, i;
+ 
+ 	/* disable xsi */
+ 	err = reset_control_bulk_assert(eth->soc->num_xsi_rsts, eth->xsi_rsts);
+ 	if (err)
+ 		return err;
+ 
+ 	err = reset_control_bulk_assert(ARRAY_SIZE(eth->rsts), eth->rsts);
+ 	if (err)
+ 		return err;
+ 
+ 	if (eth->soc->version != 0x7563) {
+ 		err = reset_control_bulk_deassert(eth->soc->num_xsi_rsts, eth->xsi_rsts);
+ 		if (err)
+ 			return err;
+ 	}
+ 
+ 	msleep(20);
+ 	err = reset_control_bulk_deassert(ARRAY_SIZE(eth->rsts), eth->rsts);
+ 	if (err)
+ 		return err;
+ 
+ 	msleep(20);
+ 	err = airoha_fe_init(eth);
+ 	if (err)
+ 		return err;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
+ 		err = airoha_qdma_init(pdev, eth, &eth->qdma[i]);
+ 		if (err)
+ 			goto error;
+ 	}
+ 
+ 	if (eth->soc->version == 0x7563)
+ 		airoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM1_IDX),
+ 			     GDM_PAD_EN_MASK);
+ 
+ 	err = airoha_ppe_init(eth);
+ 
+ 	if (err)
+ 		goto error;
+ 
+ 	set_bit(DEV_STATE_INITIALIZED, &eth->state);
+ 
+ 	return 0;
+ error:
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+ 		airoha_qdma_cleanup(eth, &eth->qdma[i]);
+ 
+ 	return err;
+ }
+ 
+ static void airoha_hw_cleanup(struct airoha_eth *eth)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+ 		airoha_qdma_cleanup(eth, &eth->qdma[i]);
+ 	airoha_ppe_deinit(eth);
+@@ -4651,98 +4663,129 @@
+ 		*port = 0; /* GDM1 */
+ 		break;
+ 	case 0x2 ... 0x4:
+ 		*port = sport - 1;
+ 		break;
+ 	case HSGMII_LAN_7583_ETH_SRCPORT:
+ 		*port = 2; /* GDM3 */
+ 		break;
+ 	case HSGMII_LAN_7583_USB_SRCPORT:
+ 		*dev = 1;
+ 		fallthrough;
+ 	case HSGMII_LAN_7583_PCIE_SRCPORT:
+ 		*port = 3; /* GDM4 */
+ 		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+ static const struct airoha_eth_soc_data en7581_soc_data = {
+ 	.version = 0x7581,
+ 	.xsi_rsts_names = en7581_xsi_rsts_names,
+ 	.num_xsi_rsts = ARRAY_SIZE(en7581_xsi_rsts_names),
+ 	.num_ppe = 2,
+ 	.ops = {
+ 		.get_sport = airoha_en7581_get_sport,
+ 		.get_vip_port = airoha_en7581_get_vip_port,
+ 		.get_dev_from_sport = airoha_en7581_get_dev_from_sport,
+ 	},
+ };
+ 
+ static const struct airoha_eth_soc_data an7583_soc_data = {
+ 	.version = 0x7583,
+ 	.xsi_rsts_names = an7583_xsi_rsts_names,
+ 	.num_xsi_rsts = ARRAY_SIZE(an7583_xsi_rsts_names),
+ 	.num_ppe = 1,
+ 	.ops = {
+ 		.get_sport = airoha_an7583_get_sport,
+ 		.get_vip_port = airoha_an7583_get_vip_port,
+ 		.get_dev_from_sport = airoha_an7583_get_dev_from_sport,
+ 	},
+ };
+ 
+ static int airoha_an7563_get_dev_from_sport(struct airoha_qdma_desc *desc,
+ 					    u16 *port, u16 *dev)
+ {
+ 	u32 sport = FIELD_GET(QDMA_ETH_RXMSG_SPORT_MASK,
+ 			      le32_to_cpu(READ_ONCE(desc->msg1)));
+ 
+ 	if (sport >= 0x18 && sport <= 0x1c) {
+ 		*port = 0;
+ 		*dev = 0;
+ 		return 0;
+ 	}
+ 	return airoha_an7583_get_dev_from_sport(desc, port, dev);
+ }
+ 
+ static const char * const an7563_xsi_rsts_names[] = {
+ 	"hsi0-mac",
+ 	"hsi1-mac",
+ 	"hsi-mac",
+ };
+ 
+ static const struct airoha_eth_soc_data an7563_soc_data = {
+ 	.version = 0x7563,
+ 	.xsi_rsts_names = an7563_xsi_rsts_names,
+ 	.num_xsi_rsts = ARRAY_SIZE(an7563_xsi_rsts_names),
+ 	.num_ppe = 1,
+ 	.ops = {
+ 		.get_sport = airoha_an7583_get_sport,
+ 		.get_dev_from_sport = airoha_an7563_get_dev_from_sport,
+ 		.get_vip_port = airoha_an7583_get_vip_port,
+ 	},
+ };
+ 
+ static const struct of_device_id of_airoha_match[] = {
+ 	{ .compatible = "airoha,an7563-eth", .data = &an7563_soc_data },
+ 	{ .compatible = "airoha,en7581-eth", .data = &en7581_soc_data },
+ 	{ .compatible = "airoha,an7583-eth", .data = &an7583_soc_data },
+ 	{ /* sentinel */ }
  };
  MODULE_DEVICE_TABLE(of, of_airoha_match);
  
@@ -43,8 +503,9 @@ Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
 +		airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
 +				  GLOBAL_CFG_TX_DMA_EN_MASK |
 +				  GLOBAL_CFG_RX_DMA_EN_MASK);
-+		readl_poll_timeout(qdma->regs + REG_QDMA_GLOBAL_CFG, val,
-+				   !(val & busy), 10, 10000);
++		if (readl_poll_timeout(qdma->regs + REG_QDMA_GLOBAL_CFG, val,
++				       !(val & busy), 10, 10000))
++			airoha_dma_timeout(eth, "QDMA shutdown");
 +	}
 +}
 +
@@ -55,15 +516,103 @@ Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
  	.driver = {
  		.name = KBUILD_MODNAME,
  		.of_match_table = of_airoha_match,
+ 	},
+ };
+ module_platform_driver(airoha_driver);
+ 
+ MODULE_LICENSE("GPL v2");
+ MODULE_AUTHOR("Lorenzo Bianconi <lorenzo@kernel.org>");
+ MODULE_DESCRIPTION("Ethernet driver for Airoha SoC");
 --- a/drivers/net/ethernet/airoha/an7552_npu.c
 +++ b/drivers/net/ethernet/airoha/an7552_npu.c
-@@ -1383,6 +1383,25 @@
- 		halt_cores(ctx);
+@@ -1791,103 +1791,119 @@
+ 	if (!ctx->running)
+ 		return 0;
+ 	for (i = 0; i < 2; i++) {
+ 		void __iomem *q = ctx->regs + 0x3000 + i * 64;
+ 
+ 		seq_printf(seq, "core%u magic=%08x heartbeat=%u cause=%08x pc=%08x\n",
+ 			   i, readl(q), readl(q + 4), readl(q + 8), readl(q + 12));
+ 	}
+ 
+ 	seq_printf(seq, "ppe_mode=%u error=%u submitted=%u completed=%u inflight=%u\n",
+ 		   readl(ppe), readl(ppe + 12), readl(ppe + 4),
+ 		   readl(ppe + 8), readl(ppe + 48));
+ 	seq_printf(seq, "ppe_forwarded=%u cpu_delivered=%u\n",
+ 		   readl(ppe + 56), readl(ppe + 60));
+ 	return 0;
+ }
+ DEFINE_SHOW_ATTRIBUTE(an7552_npu_debug);
+ 
+ static int an7552_npu_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct device_node *eth_node;
+ 	struct resource resource;
+ 	struct an7552_npu *ctx;
+ 	int ret;
+ 
+ 	ctx = devm_kzalloc(dev, sizeof(*ctx), GFP_KERNEL);
+ 	if (!ctx)
+ 		return -ENOMEM;
+ 	ctx->dev = dev;
+ 	mutex_init(&ctx->attach_lock);
+ 	spin_lock_init(&ctx->station_lock);
+ 	spin_lock_init(&ctx->pn_lock);
+ 	ctx->regs = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(ctx->regs))
+ 		return PTR_ERR(ctx->regs);
+ 	/* Timer 0 is inside the NPU register aperture. */
+ 	ctx->timer = ctx->regs + 0x310100;
+ 	ret = of_reserved_mem_region_to_resource(dev->of_node, 0, &resource);
+ 	if (ret)
+ 		return ret;
+ 	if (resource.start != CODE_BASE || resource_size(&resource) < CODE_SIZE)
+ 		return dev_err_probe(dev, -EINVAL,
+ 				     "invalid firmware workspace\n");
+ 	ctx->ram = devm_ioremap(dev, resource.start, CODE_SIZE);
+ 	if (!ctx->ram)
+ 		return -ENOMEM;
+ 	ret = of_reserved_mem_region_to_resource(dev->of_node, 1, &resource);
+ 	if (ret)
+ 		return ret;
+ 	if (resource.start != AN7552_TDMA_RING_HOST ||
+ 	    resource_size(&resource) < PACKET_SIZE)
+ 		return dev_err_probe(dev, -EINVAL,
+ 				     "invalid packet workspace\n");
+ 	ctx->pool = devm_ioremap(dev, resource.start, 0x420000);
+ 	if (!ctx->pool)
+ 		return -ENOMEM;
+ 	eth_node = of_parse_phandle(dev->of_node, "airoha,eth", 0);
+ 	if (!eth_node)
+ 		return -EINVAL;
+ 	ret = of_address_to_resource(eth_node, 0, &resource);
+ 	of_node_put(eth_node);
+ 	if (ret)
+ 		return ret;
+ 	/* TDMA shares the frame engine aperture; Ethernet owns the other ports. */
+ 	if (resource.start != 0x1fb50000 || resource_size(&resource) < 0x1000)
+ 		return -EINVAL;
+ 	ctx->fe = devm_ioremap(dev, resource.start, 0x1000);
+ 	if (!ctx->fe)
+ 		return -ENOMEM;
+ 	platform_set_drvdata(pdev, ctx);
+ 	ctx->debugfs = debugfs_create_dir(dev_name(dev), NULL);
+ 	debugfs_create_file("status", 0400, ctx->debugfs, ctx,
+ 			    &an7552_npu_debug_fops);
+ 	return 0;
  }
  
-+/* A warm reboot resets neither the NPU cores nor the TDMA. Stop the queues
-+ * and park the cores the way an7552_npu_put() does, so that nothing writes
-+ * into RAM while the bootloader loads the next image.
+ static void an7552_npu_remove(struct platform_device *pdev)
+ {
+ 	struct an7552_npu *ctx = platform_get_drvdata(pdev);
+ 
+ 	debugfs_remove_recursive(ctx->debugfs);
+ 	an7552_npu_require_quiescent(ctx);
+ }
+ 
++/* A warm reboot must satisfy the same ownership proof as removal before
++ * the bootloader can reuse DDR. Failed parking/draining is terminal.
 + */
 +static void an7552_npu_shutdown(struct platform_device *pdev)
 +{
@@ -72,18 +621,17 @@ Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
 +	if (!ctx)
 +		return;
 +	mutex_lock(&ctx->attach_lock);
-+	if (ctx->running) {
-+		an7552_npu_stop(ctx);
-+		halt_cores(ctx);
-+		ctx->running = false;
-+	}
++	an7552_npu_require_quiescent(ctx);
++	ctx->running = false;
 +	mutex_unlock(&ctx->attach_lock);
 +}
 +
  static const struct of_device_id an7552_npu_match[] = {
  	{ .compatible = "airoha,an7552-npu" },
  	{}
-@@ -1392,6 +1411,7 @@
+ };
+ MODULE_DEVICE_TABLE(of, an7552_npu_match);
+ 
  static struct platform_driver an7552_npu_driver = {
  	.probe = an7552_npu_probe,
  	.remove = an7552_npu_remove,
@@ -91,3 +639,9 @@ Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
  	.driver = {
  		.name = "an7552-npu",
  		.of_match_table = an7552_npu_match,
+ 	},
+ };
+ module_platform_driver(an7552_npu_driver);
+ MODULE_FIRMWARE("airoha/an7552.bin");
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("AN7552 source-built NPU acceleration");

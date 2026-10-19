@@ -7,29 +7,54 @@ MAC driver exchanges port tags through the frame-engine descriptors.
 
 Signed-off-by: Iscle <albertiscle9@gmail.com>
 ---
---- a/drivers/net/dsa/mt7530.h
-+++ b/drivers/net/dsa/mt7530.h
-@@ -21,6 +21,7 @@
- 	ID_MT7988 = 3,
- 	ID_EN7581 = 4,
- 	ID_AN7583 = 5,
-+	ID_AN7563 = 6,
- };
+--- a/Documentation/devicetree/bindings/net/dsa/mediatek,mt7530.yaml
++++ b/Documentation/devicetree/bindings/net/dsa/mediatek,mt7530.yaml
+@@ -89,10 +89,14 @@
+         const: mediatek,mt7621
  
- #define	NUM_TRGMII_CTRL			5
+       - description:
+           Built-in switch of the MT7988 SoC
+         const: mediatek,mt7988-switch
++
++      - description:
++          Built-in switch of the Airoha AN7563 SoC
++        const: airoha,an7563-switch
+ 
+       - description:
+           Built-in switch of the Airoha EN7581 SoC
+         const: airoha,en7581-switch
+ 
+@@ -314,10 +318,11 @@
+   - if:
+       properties:
+         compatible:
+           enum:
+             - mediatek,mt7988-switch
++            - airoha,an7563-switch
+             - airoha,en7581-switch
+             - airoha,an7583-switch
+     then:
+       $ref: "#/$defs/builtin-dsa-port"
+       properties:
 --- a/drivers/net/dsa/mt7530-mmio.c
 +++ b/drivers/net/dsa/mt7530-mmio.c
-@@ -11,6 +11,7 @@
+@@ -9,10 +9,11 @@
+ #include <net/dsa.h>
+ 
  #include "mt7530.h"
  
  static const struct of_device_id mt7988_of_match[] = {
 +	{ .compatible = "airoha,an7563-switch", .data = &mt753x_table[ID_AN7563], },
  	{ .compatible = "airoha,an7583-switch", .data = &mt753x_table[ID_AN7583], },
  	{ .compatible = "airoha,en7581-switch", .data = &mt753x_table[ID_EN7581], },
+ 	{ .compatible = "econet,en7528-switch", .data = &mt753x_table[ID_EN7528], },
  	{ .compatible = "mediatek,mt7988-switch", .data = &mt753x_table[ID_MT7988], },
+ 	{ /* sentinel */ },
 --- a/drivers/net/dsa/mt7530.c
 +++ b/drivers/net/dsa/mt7530.c
-@@ -1287,7 +1287,8 @@
+@@ -1335,11 +1335,12 @@
+ 	/* Add the CPU port to the CPU port bitmap for MT7531 and the switch on
+ 	 * the MT7988 SoC. Trapped frames will be forwarded to the CPU port that
  	 * is affine to the inbound user port.
  	 */
  	if (priv->id == ID_MT7531 || priv->id == ID_MT7988 ||
@@ -39,7 +64,11 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  		mt7530_set(priv, MT7531_CFC, MT7531_CPU_PMAP(BIT(port)));
  
  	/* CPU port gets connected to all user ports of
-@@ -2607,7 +2608,8 @@
+ 	 * the switch.
+ 	 */
+@@ -2670,11 +2671,12 @@
+ 
+ 	/* Allow mirroring frames received on the local port (monitor port). */
  	mt7530_set(priv, MT753X_AGC, LOCAL_EN);
  
  	/* Enable Special Tag for rx frames */
@@ -49,7 +78,11 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  		mt7530_write(priv, MT753X_CPORT_SPTAG_CFG,
  			     CPORT_SW2FE_STAG_EN | CPORT_FE2SW_STAG_EN);
  
-@@ -2813,6 +2815,28 @@
+ 	/* Flush the FDB table */
+ 	ret = mt7530_fdb_cmd(priv, MT7530_FDB_FLUSH, NULL);
+@@ -2876,10 +2878,32 @@
+ 				     struct phylink_config *config)
+ {
  	switch (port) {
  	/* Ports which are connected to switch PHYs. There is no MII pinout. */
  	case 0 ... 4:
@@ -78,7 +111,11 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
  			  config->supported_interfaces);
  
-@@ -3357,6 +3381,16 @@
+ 		config->mac_capabilities |= MAC_10 | MAC_100 | MAC_1000FD;
+ 		break;
+@@ -3468,10 +3492,20 @@
+ 		.phy_write_c22 = mt7531_ind_c22_phy_write,
+ 		.phy_read_c45 = mt7531_ind_c45_phy_read,
  		.phy_write_c45 = mt7531_ind_c45_phy_write,
  		.mac_port_get_caps = en7581_mac_port_get_caps,
  	},
@@ -95,24 +132,19 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  	[ID_AN7583] = {
  		.id = ID_AN7583,
  		.pcs_ops = &mt7530_pcs_ops,
---- a/Documentation/devicetree/bindings/net/dsa/mediatek,mt7530.yaml
-+++ b/Documentation/devicetree/bindings/net/dsa/mediatek,mt7530.yaml
-@@ -91,6 +91,10 @@
-       - description:
-           Built-in switch of the MT7988 SoC
-         const: mediatek,mt7988-switch
-+
-+      - description:
-+          Built-in switch of the Airoha AN7563 SoC
-+        const: airoha,an7563-switch
+ 		.sw_setup = mt7988_setup,
+ 		.phy_read_c22 = mt7531_ind_c22_phy_read,
+--- a/drivers/net/dsa/mt7530.h
++++ b/drivers/net/dsa/mt7530.h
+@@ -20,10 +20,11 @@
+ 	ID_MT7531 = 2,
+ 	ID_MT7988 = 3,
+ 	ID_EN7581 = 4,
+ 	ID_AN7583 = 5,
+ 	ID_EN7528 = 6,
++	ID_AN7563 = 7,
+ };
  
-       - description:
-           Built-in switch of the Airoha EN7581 SoC
-@@ -316,6 +320,7 @@
-         compatible:
-           enum:
-             - mediatek,mt7988-switch
-+            - airoha,an7563-switch
-             - airoha,en7581-switch
-             - airoha,an7583-switch
-     then:
+ #define	NUM_TRGMII_CTRL			5
+ 
+ #define TRGMII_BASE(x)			(0x10000 + (x))
