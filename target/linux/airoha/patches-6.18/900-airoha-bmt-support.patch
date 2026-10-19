@@ -29,7 +29,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  obj-$(CONFIG_MTD_NAND_QCOM) += qpic_common.o
 --- /dev/null
 +++ b/drivers/mtd/nand/airoha_bmt.c
-@@ -0,0 +1,917 @@
+@@ -0,0 +1,929 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Airoha NAND Bad Block Management Table driver
@@ -133,6 +133,8 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	u32			logic_blks;
 +	int			bmt_block;
 +	int			bbt_block;
++	/* Still selected by the durable table until remap commit completes. */
++	int reserved_block;
 +};
 +
 +static struct airoha_bmt_ctx ctx;
@@ -383,7 +385,8 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	for (i = 0; i < (int)ctx.pool_blks; i++) {
 +		int block = start + dir * i;
 +
-+		if (block == ctx.bmt_block || block == ctx.bbt_block)
++		if (block == ctx.bmt_block || block == ctx.bbt_block ||
++		    block == ctx.reserved_block)
 +			continue;
 +		if (airoha_isbad_any(block))
 +			continue;
@@ -536,7 +539,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +
 +	for (block = ctx.system_blks; block < ctx.total_blks; block++) {
 +		if (block == ctx.bmt_block || block == ctx.bbt_block ||
-+		    bmt_find_by_mapped(block) >= 0)
++		    block == ctx.reserved_block || bmt_find_by_mapped(block) >= 0)
 +			continue;
 +		ret = airoha_bad_markers(block);
 +		if (ret < 0)
@@ -743,6 +746,10 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +		 */
 +		orig_bad = le16_to_cpu(ctx.bmt->entries[idx].bad_index);
 +		saved = ctx.bmt->entries[idx];
++		/* Keep the old replacement out of metadata allocation and cleanup
++		 * while the on-flash table can still select it.
++		 */
++		ctx.reserved_block = mapped_block;
 +		ctx.bmt->entries[idx].mapped_index = cpu_to_le16((u16)new_block);
 +	} else {
 +		if (ctx.bmt->header.mapped_count >= AIROHA_MAX_BMT_ENTRIES) {
@@ -762,6 +769,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	if (airoha_write_oob_idx(new_block, orig_bad) || airoha_save_bmt()) {
 +		ctx.bmt->entries[idx] = saved;
 +		ctx.bmt->header.mapped_count = saved_count;
++		ctx.reserved_block = -1;
 +		pr_err("airoha-bmt: replacement was not committed\n");
 +		return false;
 +	}
@@ -770,6 +778,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	 */
 +	if (airoha_markbad(mapped_block))
 +		pr_err("airoha-bmt: cannot mark retired block %u bad\n", mapped_block);
++	ctx.reserved_block = -1;
 +
 +	pr_info("airoha-bmt: remapped block %u -> %d\n",
 +		mapped_block, new_block);
@@ -787,6 +796,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +
 +	header = ctx.bmt->header;
 +	saved = ctx.bmt->entries[idx];
++	ctx.reserved_block = le16_to_cpu(saved.mapped_index);
 +	ctx.bmt->header.mapped_count--;
 +	memmove(&ctx.bmt->entries[idx],
 +		&ctx.bmt->entries[idx + 1],
@@ -801,6 +811,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +		ctx.bmt->entries[idx] = saved;
 +		ctx.bmt->header = header;
 +	}
++	ctx.reserved_block = -1;
 +}
 +
 +static int airoha_debug(void *data, u64 val)
@@ -881,6 +892,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	ctx.total_blks  = bmtd.total_blks;
 +	ctx.bmt_block   = -1;
 +	ctx.bbt_block   = -1;
++	ctx.reserved_block = -1;
 +
 +	if (of_property_read_u8(np, "airoha,bmt-oob-offset", &bmtd.oob_offset))
 +		bmtd.oob_offset = 0;
@@ -949,7 +961,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +};
 --- a/drivers/mtd/nand/mtk_bmt.c
 +++ b/drivers/mtd/nand/mtk_bmt.c
-@@ -289,6 +289,12 @@ mtk_bmt_block_markbad(struct mtd_info *mtd, loff_t ofs)
+@@ -289,6 +289,12 @@
  	if (block < 0)
  		return -EIO;
  
@@ -962,15 +974,45 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  	mtk_bmt_remap_block(orig_block, block, bmtd.blk_size);
  
  	return bmtd._block_markbad(mtd, (loff_t)block << bmtd.blk_shift);
-@@ -421,6 +421,8 @@ int mtk_bmt_attach(struct mtd_info *mtd)
- 		bmtd.ops = &mtk_bmt_nmbm_ops;
- 	else if (of_property_read_bool(np, "mediatek,bbt"))
- 		bmtd.ops = &mtk_bmt_bbt_ops;
-+	else if (of_property_read_bool(np, "airoha,bmt"))
-+		bmtd.ops = &airoha_bmt_ops;
- 	else
+@@ -404,25 +410,32 @@
+ 
+ int mtk_bmt_attach(struct mtd_info *mtd)
+ {
++	const struct mtk_bmt_ops *ops;
+ 	struct device_node *np;
+ 	int ret = 0;
+ 	u32 overridden_oobsize = 0;
+ 
+-	if (bmtd.mtd)
+-		return -ENOSPC;
+-
+ 	np = mtd_get_of_node(mtd);
+ 	if (!np)
  		return 0;
  
+ 	if (of_property_read_bool(np, "mediatek,bmt-v2"))
+-		bmtd.ops = &mtk_bmt_v2_ops;
++		ops = &mtk_bmt_v2_ops;
+ 	else if (of_property_read_bool(np, "mediatek,nmbm"))
+-		bmtd.ops = &mtk_bmt_nmbm_ops;
++		ops = &mtk_bmt_nmbm_ops;
+ 	else if (of_property_read_bool(np, "mediatek,bbt"))
+-		bmtd.ops = &mtk_bmt_bbt_ops;
++		ops = &mtk_bmt_bbt_ops;
++	else if (of_property_read_bool(np, "airoha,bmt"))
++		ops = &airoha_bmt_ops;
+ 	else
+ 		return 0;
++
++	/* Unconfigured devices may coexist with the singleton BMT owner.
++	 * Do not change its operations when a second mapped device is rejected.
++	 */
++	if (bmtd.mtd)
++		return -ENOSPC;
++	bmtd.ops = ops;
+ 
+ 	bmtd.remap_range = of_get_property(np, "mediatek,bmt-remap-range",
+ 					   &bmtd.remap_range_len);
 --- a/drivers/mtd/nand/mtk_bmt.h
 +++ b/drivers/mtd/nand/mtk_bmt.h
 @@ -77,6 +77,7 @@ extern struct bmt_desc bmtd;

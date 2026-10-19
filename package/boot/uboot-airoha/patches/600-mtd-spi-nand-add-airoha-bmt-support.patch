@@ -46,7 +46,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  endif
 --- /dev/null
 +++ b/drivers/mtd/nand/airoha_bmt.c
-@@ -0,0 +1,1195 @@
+@@ -0,0 +1,1205 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Airoha NAND Bad Block Management Table for U-Boot
@@ -174,6 +174,8 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	u32 logic_blks;
 +	int bmt_block;
 +	int bbt_block;
++	/* Still selected by the durable table until remap commit completes. */
++	int reserved_block;
 +
 +	u32 pg_size;
 +	u32 blk_size;
@@ -494,7 +496,8 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	for (i = 0; i < (int)ctx.pool_blks; i++) {
 +		int block = start + dir * i;
 +
-+		if (block == ctx.bmt_block || block == ctx.bbt_block)
++		if (block == ctx.bmt_block || block == ctx.bbt_block ||
++		    block == ctx.reserved_block)
 +			continue;
 +		if (airoha_isbad_any(block))
 +			continue;
@@ -636,7 +639,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +
 +	for (block = ctx.system_blks; block < ctx.total_blks; block++) {
 +		if (block == ctx.bmt_block || block == ctx.bbt_block ||
-+		    bmt_find_by_mapped(block) >= 0)
++		    block == ctx.reserved_block || bmt_find_by_mapped(block) >= 0)
 +			continue;
 +		ret = airoha_bad_markers(block);
 +		if (ret < 0)
@@ -843,6 +846,10 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +		 */
 +		orig_bad = le16_to_cpu(ctx.bmt->entries[idx].bad_index);
 +		saved = ctx.bmt->entries[idx];
++		/* Keep the old replacement out of metadata allocation and cleanup
++		 * while the on-flash table can still select it.
++		 */
++		ctx.reserved_block = mapped_block;
 +		ctx.bmt->entries[idx].mapped_index = cpu_to_le16((u16)new_block);
 +	} else {
 +		if (ctx.bmt->header.mapped_count >= AIROHA_MAX_BMT_ENTRIES) {
@@ -862,6 +869,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	if (airoha_write_oob_idx(new_block, orig_bad) || airoha_save_bmt()) {
 +		ctx.bmt->entries[idx] = saved;
 +		ctx.bmt->header.mapped_count = saved_count;
++		ctx.reserved_block = -1;
 +		printf("airoha-bmt: replacement was not committed\n");
 +		return false;
 +	}
@@ -870,6 +878,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	 */
 +	if (airoha_markbad(mapped_block))
 +		printf("airoha-bmt: cannot mark retired block %u bad\n", mapped_block);
++	ctx.reserved_block = -1;
 +
 +	printf("airoha-bmt: remapped block %u -> %d\n",
 +	       mapped_block, new_block);
@@ -1131,6 +1140,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	ctx.mtd       = mtd;
 +	ctx.bmt_block = -1;
 +	ctx.bbt_block = -1;
++	ctx.reserved_block = -1;
 +	ctx.blk_size  = mtd->erasesize;
 +	ctx.blk_shift = ffs(ctx.blk_size) - 1;
 +	ctx.pg_size   = mtd->writesize;
