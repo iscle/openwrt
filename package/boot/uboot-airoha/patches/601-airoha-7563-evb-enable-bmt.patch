@@ -28,17 +28,17 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 ---
 --- a/configs/an7563_evb_defconfig
 +++ b/configs/an7563_evb_defconfig
-@@ -51,6 +51,7 @@ CONFIG_LED_GPIO=y
+@@ -55,6 +55,7 @@ CONFIG_LED_GPIO=y
  CONFIG_MTD=y
  CONFIG_DM_MTD=y
  CONFIG_MTD_SPI_NAND=y
 +CONFIG_MTD_NAND_AIROHA_BMT=y
  CONFIG_AIROHA_ETH=y
  CONFIG_DM_MDIO=y
- CONFIG_CMD_MII=y
+ CONFIG_MDIO_MT7531_MMIO=y
 --- a/arch/arm/dts/an7563-evb.dts
 +++ b/arch/arm/dts/an7563-evb.dts
-@@ -47,6 +47,8 @@
+@@ -46,6 +46,8 @@
  };
  
  &spi_nand {
