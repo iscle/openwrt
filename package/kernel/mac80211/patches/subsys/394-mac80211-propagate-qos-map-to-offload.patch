@@ -7,7 +7,7 @@ configured map when rebuilding an interface after hardware restart.
 ---
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
-@@ -4362,6 +4362,13 @@
+@@ -4362,6 +4362,17 @@
   *	Returns a negative error code on failure.
   *	The callback can sleep.
   *
@@ -17,11 +17,15 @@ configured map when rebuilding an interface after hardware restart.
 + *	retain the previous map if this callback fails. mac80211 restores a
 + *	configured map after adding an interface during hardware restart.
 + *	This optional callback can sleep and returns a negative error on failure.
++ *	AP VLAN interfaces may call this without add_interface() having run;
++ *	drivers must check vif.type before accessing driver link state. Return
++ *	zero for software-only VLAN maps, or an error if existing offload cannot
++ *	safely preserve that policy. The previous software map is then retained.
 + *
   * @get_tsf: Get the current TSF timer value from firmware/hardware. Currently,
   *	this is only used for IBSS mode BSSID merging and debugging. Is not a
   *	required function.
-@@ -4861,6 +4868,8 @@
+@@ -4861,6 +4872,8 @@
  		       struct ieee80211_vif *vif,
  		       unsigned int link_id, u16 ac,
  		       const struct ieee80211_tx_queue_params *params);
@@ -79,7 +83,7 @@ configured map when rebuilding an interface after hardware restart.
  	}
  
  	return 0;
-@@ -248,6 +258,26 @@
+@@ -248,6 +258,25 @@
  	return ret;
  }
  
@@ -93,9 +97,8 @@ configured map when rebuilding an interface after hardware restart.
 +	lockdep_assert_wiphy(local->hw.wiphy);
 +	if (!local->ops->set_qos_map)
 +		return 0;
-+	if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
-+		return -EOPNOTSUPP;
-+	if (!check_sdata_in_driver(sdata))
++	if (sdata->vif.type != NL80211_IFTYPE_AP_VLAN &&
++	    !check_sdata_in_driver(sdata))
 +		return -EIO;
 +	trace_drv_set_qos_map(local, sdata);
 +	ret = local->ops->set_qos_map(&local->hw, &sdata->vif, qos_map);

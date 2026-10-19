@@ -1,0 +1,32 @@
+Subject: [PATCH] wifi: mt76: preserve software QoS maps on non-native AP VLANs
+
+The mac80211 callback now permits an AP VLAN without driver link state.
+Accept its software map on ordinary radios. Native offload cannot express
+per-VLAN maps, so retain the previous policy and explicitly reject that case
+before accessing driver-private state.
+
+---
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -931,7 +931,7 @@
+ 			      struct cfg80211_qos_map *qos)
+ {
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+-	struct mt7996_vif *mvif = (void *)vif->drv_priv;
++	struct mt7996_vif *mvif;
+ 	unsigned long links = vif->valid_links ?: BIT(0);
+ 	unsigned int id;
+ 	u8 map[64];
+@@ -939,6 +939,12 @@
+ 
+ 	if (!dev->mt76.mmio.an7552)
+ 		return 0;
++	/* AP VLANs have no driver link/BSS and cannot share the parent map.
++	 * Returning an error preserves their previous software policy.
++	 */
++	if (vif->type == NL80211_IFTYPE_AP_VLAN)
++		return -EOPNOTSUPP;
++	mvif = (void *)vif->drv_priv;
+ 	ret = mt7996_npu_build_qos_map(map, qos);
+ 	if (ret)
+ 		return ret;
