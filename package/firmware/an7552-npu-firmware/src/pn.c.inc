@@ -31,6 +31,57 @@ static uint32_t pn_compare(uint32_t wcid, uint32_t tid, uint32_t low,
 	return pn_domain_compare(entry[2], entry[3], tid, low, high);
 }
 
+/* One receive batch only. Mutable counters remain write-through so a fault
+ * cannot expose a packet whose replay limit was left only in a CPU cache.
+ * All PN commands execute on this same core between batches.
+ */
+struct pn_cache {
+	uint32_t wcid, cookie, handle, key;
+	uint32_t counter_handle, counter_key, tid, low, high;
+	volatile uint32_t *counter;
+};
+__attribute__((unused)) static void pc_reset(struct pn_cache *c)
+{
+	*c = (struct pn_cache){ .wcid = UINT32_MAX };
+}
+__attribute__((unused)) static uint32_t pn_compare_cached(struct pn_cache *c, uint32_t wcid,
+				 uint32_t tid, uint32_t low, uint32_t high)
+{
+	volatile uint32_t *entry, *domain;
+	if (!c)
+		return pn_compare(wcid, tid, low, high);
+	if (wcid >= AN7552_STATION_COUNT || tid > 16 || high > 65535)
+		return 3;
+	entry = pn_entry(wcid);
+	/* Linux may revoke this word before the quiesce handshake. */
+	if (!entry[0])
+		return 2;
+	if (c->wcid != wcid) {
+		c->wcid = wcid;
+		c->cookie = entry[1];
+		c->handle = entry[2];
+		c->key = entry[3];
+	}
+	if (!c->counter || c->counter_handle != c->handle ||
+	    c->counter_key != c->key || c->tid != tid) {
+		domain = pn_domain_lookup(c->handle, c->key);
+		if (!domain)
+			return 3;
+		c->counter = domain + 4 + tid * 2;
+		c->counter_handle = c->handle;
+		c->counter_key = c->key;
+		c->tid = tid;
+		c->low = c->counter[0];
+		c->high = c->counter[1];
+	}
+	if (high < c->high || (high == c->high && low <= c->low))
+		return 0;
+	pn_domain_store(c->counter, low, high);
+	c->low = low;
+	c->high = high;
+	return 1;
+}
+
 static void pn_detach(volatile uint32_t *entry)
 {
 	if (entry[2])
@@ -89,7 +140,7 @@ static uint32_t pn_install(uint32_t wcid, uint32_t enable, uint32_t handle,
 }
 
 /* All per-link snapshots must be merged and radio keys installed before
- * any link can accept RX with the new common counter. Core 1 processes the
+ * any link can accept RX with the new common counter. Core 0 processes the
  * complete commit without interleaving receive work between link updates.
  */
 static uint32_t pn_commit(uint32_t count, uint32_t key, const uint32_t *wcids)

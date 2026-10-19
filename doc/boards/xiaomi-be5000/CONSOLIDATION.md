@@ -15,10 +15,14 @@ is ported to it. PR #2 supplies the updated mt76 revision, `-O2` firmware build,
 PCIe retraining, reboot DMA shutdown, receive-fragment allocation-failure fix,
 and separate UBI overlay. Calibration remains read-only in Linux.
 
-The ABI 1 dual-core upload pipeline, cached packet-view/PN cache and TX buffer
-pool are not enabled. They need a separate ABI 5 port and validation; merging
-their data structures directly would break the host/firmware interface and
-remove security checks. Their original commits remain in repository history.
+The PR's performance work is now ported to ABI 5: bounded per-frame header
+snapshots backed by uncached DMA access, local SRAM receive ownership state,
+batch-local replay and station caches, TXFREE snapshots, a packet-buffer pool,
+fused download on core 0 and split upload across both cores. Replay counters
+remain write-through; the upload back end always checks the full key cookie
+and is quiesced before PN commands complete. ABI 5 bridge domains, shared MLO
+replay state, QoS routing and revocation checks remain active.
+
 The independent batching branch duplicates the squashed PR #1 changes.
 The old vendor-kernel branch and archived development stages do not supply
 additional required code for this source-built port.
@@ -36,8 +40,8 @@ and ABI 5 hooks were rebased to the updated station lifecycle.
 * DMA receive metadata uses uncached access. Reusing a token after radio recovery
   cannot rely on an undocumented FIFO cache-eviction assumption.
 * The original split pipeline's epoch-wrap cookie bypass was fixed immediately
-  after merging PR #2. The final ABI 5 implementation has no split upload queue
-  or truncated-epoch authorization shortcut.
+  after merging PR #2. The ABI 5 split port unconditionally compares full cookies and has no
+  truncated-epoch authorization shortcut.
 
 Host regression tests cover upgrade failure paths, replay/key lifecycle,
 bridge domains, batching, buffer ownership, MLO routing and fragment allocation

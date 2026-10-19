@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Shared replay domain. Core 1 serializes every operation.
+/* Shared replay domain. Core 0 serializes every operation.
  * Per-link packet cookies and A-MSDU continuation state remain separate.
  */
 #define PN_DOMAIN_COUNT AN7552_STATION_COUNT

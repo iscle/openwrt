@@ -13,11 +13,6 @@ static uint32_t read32(uint32_t address)
 {
 	return *(volatile uint32_t *)(uintptr_t)address;
 }
-static uint32_t packet_word(volatile uint8_t *p)
-{
-	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
-	       (uint32_t)p[3] << 24;
-}
 #include "../pn.c.inc"
 #include "../rx-security.c.inc"
 static void put32(uint8_t *p, uint32_t value)

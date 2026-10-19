@@ -14,6 +14,8 @@ static uint32_t read32(uint32_t address)
 	return *(volatile uint32_t *)(uintptr_t)address;
 }
 
+#include "../tdma.c.inc"
+#include "../tx-pool.c.inc"
 #include "../station.c.inc"
 #include "../native-tx.c.inc"
 #include "../txfree.c.inc"
@@ -38,7 +40,7 @@ static volatile uint32_t *station(unsigned int wcid)
 
 static volatile uint32_t *work(unsigned int token)
 {
-	return (void *)(uintptr_t)(AN7552_FORWARD_WORK_NPU + token * 16);
+	return (void *)(uintptr_t)(AN7552_TDMA_RING_NPU + token * 32);
 }
 
 static volatile uint32_t *txwi(unsigned int token)
@@ -58,25 +60,31 @@ static void setup(unsigned int token, unsigned int band, uint8_t tos)
 	packet[12] = 8;
 	packet[14] = 0x45;
 	packet[15] = tos;
-	entry[1] = 34;
-	entry[2] = ((10 + band) << 14) | (band << 25);
-	entry[3] = 2 + band;
-	entry[0] = 1;
+	entry[1] = 0x80000000 | 34;
+	entry[2] = TX_BUFFER_HOST(token);
+	entry[4] = ((10 + band) << 14) | (band << 25);
+	entry[6] = (2 + band) << 24;
 }
 
 int main(void)
 {
 	volatile uint32_t *forward =
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_FORWARD_CONTROL);
-	uint32_t consumer = 0, active = 0, complete[3], stats[16] = { 0 };
+	struct tx_band download[2] = { 0 };
+	volatile uint32_t *tdma = (void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_STRIDE);
+	uint32_t complete[3], stats[16] = { 0 };
 
 	(void)native_transmit;
 	(void)native_txfree;
 	map(AN7552_NPU_BASE, 4096);
+	map(TX_POOL_ADDR, 0xc000);
+	map(AN7552_TDMA_RING_NPU, 0x10000);
+	map(0x1fb50000, 4096);
+	tx_pool_boot();
 	map(AN7552_FORWARD_WORK_NPU, 0x10000);
 	map(AN7552_STATION_NPU, 0x10000);
 	map(AN7552_QOS_NPU, 0x8000);
-	map(AN7552_TDMA_BUFFER_NPU, 0x400000);
+	map(AN7552_TDMA_BUFFER_NPU, 0x5f0000);
 	map(AN7552_TXWI_NPU, 0x40000);
 	map(0x44240000, 0x10000);
 	map(0x200d4000, 0x5000);
@@ -104,8 +112,8 @@ int main(void)
 	/* Same flow, changed DSCP: both queues must receive their own packet. */
 	setup(0, 0, 0);
 	setup(1, 0, 160);
-	native_forward(&consumer, &active, 0);
-	assert(consumer == 2 && work(0)[0] == 2 && work(1)[0] == 2);
+	native_download(tdma, &download[0], 0);
+	assert(download[0].consumer == 2 && tx_pool_token_busy(0) && tx_pool_token_busy(1));
 	assert(queue(0)[4] == 1 && queue(1)[4] == 1);
 	assert(txwi(0)[9] == (1U << 24 | 10U << 8 | 2));
 	assert(txwi(1)[9] == (1U << 24 | 11U << 8 | 3));
@@ -117,38 +125,39 @@ int main(void)
 	complete[1] = 5U << 16;
 	complete[2] = 32767U << 15 | 1;
 	assert(!txfree_walk((void *)complete, sizeof(complete), stats, 1));
-	assert(work(1)[0] == 3 && work(0)[0] == 2);
+	assert(!tx_pool_token_busy(1) && tx_pool_token_busy(0));
 	/* Full destination queue must retain work and its token for retry. */
 	setup(2, 0, 160);
 	*(volatile uint32_t *)(uintptr_t)0x200d845c = 2;
-	native_forward(&consumer, &active, 0);
-	assert(consumer == 2 && work(2)[0] == 1 && queue(1)[4] == 1);
+	tx_pool()->radio_producer[1] = TX_RADIO_STALE;
+	native_download(tdma, &download[0], 0);
+	assert(download[0].consumer == 2 && (work(2)[1] & 0x80000000) && queue(1)[4] == 1);
 	*(volatile uint32_t *)(uintptr_t)0x200d845c = 0;
-	native_forward(&consumer, &active, 0);
-	assert(consumer == 3 && work(2)[0] == 2 && queue(1)[4] == 2);
+	native_download(tdma, &download[0], 0);
+	assert(download[0].consumer == 3 && tx_pool_token_busy(1) && queue(1)[4] == 2);
 	/* Revocation and WCID reuse cannot authorize the selected peer. */
 	station(11)[0] = 0;
 	setup(3, 0, 160);
-	native_forward(&consumer, &active, 0);
-	assert(work(3)[0] == 3 && queue(1)[4] == 2);
+	native_download(tdma, &download[0], 0);
+	assert(download[0].consumer == 4 && queue(1)[4] == 2);
 	station(11)[0] = 3;
 	station(11)[2] = 4;
 	setup(4, 0, 160);
-	native_forward(&consumer, &active, 0);
-	assert(work(4)[0] == 3 && queue(1)[4] == 2);
+	native_download(tdma, &download[0], 0);
+	assert(download[0].consumer == 5 && queue(1)[4] == 2);
 	station(11)[2] = 2;
 	station(11)[1] = 1 | (4U << 8);
 	setup(5, 0, 160);
-	native_forward(&consumer, &active, 0);
-	assert(work(5)[0] == 3 && queue(1)[4] == 2);
+	native_download(tdma, &download[0], 0);
+	assert(download[0].consumer == 6 && queue(1)[4] == 2);
 	station(11)[1] = 1 | (3U << 8);
 	/* Reverse routing keeps a band-1 token, even on the band-0 DMA ring. */
 	setup(AN7552_TDMA_COUNT, 1, 0);
-	consumer = active = 0;
-	native_forward(&consumer, &active, 1);
-	assert(work(AN7552_TDMA_COUNT)[0] == 2);
-	assert(txwi(AN7552_TDMA_COUNT)[8] >> 16 == AN7552_TDMA_COUNT);
-	assert(txwi(AN7552_TDMA_COUNT)[9] == (1U << 24 | 10U << 8 | 2));
+
+	native_download(tdma, &download[1], 1);
+	assert(download[1].consumer == 1 && tx_pool_token_busy(2));
+	assert(txwi(2)[8] >> 16 == 2);
+	assert(txwi(2)[9] == (1U << 24 | 10U << 8 | 2));
 	puts("PASS: per-packet MLO routing, queue pressure, cross-radio completion and peer revocation");
 	return 0;
 }

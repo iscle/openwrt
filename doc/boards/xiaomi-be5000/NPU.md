@@ -8,8 +8,10 @@ for the image format, memory layout, standalone build and regression tests.
 
 ## Packet paths
 
-Core 0 submits Wi-Fi transmit descriptors and handles transmit completion.
-Core 1 handles receive reordering, replay protection and Ethernet PPE input.
+Core 0 handles transmit completion, fused download and the receive front end,
+including replay protection. Core 1 handles PPE and Linux delivery through a
+bounded split upload queue. PN updates pause the back end; station updates
+quiesce both cores.
 The Linux drivers and `bridger` install supported bridge flows. Traffic for
 the router and unsupported forwarding rules remain on the CPU path.
 
@@ -57,7 +59,7 @@ The radio driver snapshots hardware transmit packet numbers before recovery,
 restores them after key installation and verifies the readback. Recovery keeps
 station and BSS identifiers stable for existing hardware flows.
 
-The driver detects exceptions and stalled heartbeats. A recovery interrupt
+The driver detects exceptions, sticky queue faults and stalled heartbeats. A recovery interrupt
 can park an otherwise unresponsive software loop. Both cores must acknowledge
 parking before DMA teardown and buffer reuse. Pending packets may be dropped;
 DMA-owned buffers must be retained until the ownership handshake completes.
