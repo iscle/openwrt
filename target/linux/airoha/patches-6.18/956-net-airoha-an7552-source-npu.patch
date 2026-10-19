@@ -32,7 +32,7 @@ station authorization, replay state and PPE queue teardown.
 +obj-$(CONFIG_NET_AIROHA_AN7552_NPU) += an7552_npu.o
 --- /dev/null
 +++ b/drivers/net/ethernet/airoha/an7552_npu.c
-@@ -0,0 +1,1804 @@
+@@ -0,0 +1,1889 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* AN7552 source-firmware transport and MT7992 DMA ownership. */
 +#include <linux/debugfs.h>
@@ -48,6 +48,7 @@ station authorization, replay state and PPE queue teardown.
 +#include <linux/of_platform.h>
 +#include <linux/of_reserved_mem.h>
 +#include <linux/platform_device.h>
++#include <linux/panic.h>
 +#include <linux/seq_file.h>
 +#include <linux/spinlock.h>
 +#include <linux/soc/airoha/an7552_npu.h>
@@ -140,14 +141,24 @@ station authorization, replay state and PPE queue teardown.
 +
 +	if (!ctx || !ctx->running || ctx->stopping)
 +		return 0;
-+	if (ctx->faulted)
-+		return -EIO;
 +	if (wcid >= AN7552_STATION_COUNT || band > 1 || bss > 255 ||
 +	    (authorized && !address))
 +		return -EINVAL;
 +	control = ctx->regs + 0x3000 + AN7552_STATION_CONTROL;
 +	entry = ctx->ram + AN7552_STATION_HOST - CODE_BASE + wcid * 32;
 +	spin_lock_irqsave(&ctx->station_lock, flags);
++	/* A preceding waiter may have lost handshake synchronization. */
++	if (ctx->faulted) {
++		/* Teardown still has to revoke an old identity after another
++		 * station's handshake fault, without reusing that mailbox.
++		 */
++		writel(0, entry);
++		writel(0, entry + 28);
++		writel(0, ctx->ram + 0x110000 + wcid * 256);
++		wmb();
++		spin_unlock_irqrestore(&ctx->station_lock, flags);
++		return -EIO;
++	}
 +	if (!authorized) {
 +		writel(0, entry);
 +		writel(0, entry + 28);
@@ -184,6 +195,11 @@ station authorization, replay state and PPE queue teardown.
 +						!value && !readl(control + 8),
 +						1, 10000);
 +	if (ret) {
++		/* Level acknowledgments may belong to the failed transaction.
++		 * Never reuse this mailbox until recovery has parked both cores.
++		 */
++		ctx->faulted = true;
++		ctx->fault_count++;
 +		/* Revoke the identity before releasing the lock on failure. */
 +		writel(0, entry);
 +		writel(0, entry + 28);
@@ -209,8 +225,13 @@ station authorization, replay state and PPE queue teardown.
 +
 +	spin_lock_irqsave(&ctx->station_lock, flags);
 +	writel(0, entry + count * 4);
-+	/* Revoke the old policy before requesting the two-core pause. */
++	/* Revocation is required even after a preceding transaction failed. */
 +	wmb();
++	/* A preceding waiter may have lost handshake synchronization. */
++	if (ctx->faulted) {
++		spin_unlock_irqrestore(&ctx->station_lock, flags);
++		return -EIO;
++	}
 +	writel(1, control);
 +	ret = readl_poll_timeout_atomic(control + 4, value,
 +					value == 1 && readl(control + 8) == 1,
@@ -227,8 +248,12 @@ station authorization, replay state and PPE queue teardown.
 +		ret = readl_poll_timeout_atomic(control + 4, value,
 +						!value && !readl(control + 8),
 +						1, 10000);
-+	if (ret)
++	if (ret) {
++		ctx->faulted = true;
++		ctx->fault_count++;
 +		writel(0, entry + count * 4);
++		wmb();
++	}
 +	spin_unlock_irqrestore(&ctx->station_lock, flags);
 +	return ret;
 +}
@@ -241,8 +266,6 @@ station authorization, replay state and PPE queue teardown.
 +
 +	if (!ctx || !ctx->running || ctx->stopping)
 +		return 0;
-+	if (ctx->faulted)
-+		return -EIO;
 +	if (wcid >= AN7552_STATION_COUNT || primary >= AN7552_STATION_COUNT ||
 +	    secondary >= AN7552_STATION_COUNT)
 +		return -EINVAL;
@@ -262,8 +285,6 @@ station authorization, replay state and PPE queue teardown.
 +
 +	if (!ctx || !ctx->running || ctx->stopping)
 +		return 0;
-+	if (ctx->faulted)
-+		return -EIO;
 +	if (!map)
 +		return an7552_npu_policy_write(ctx,
 +			ctx->ram + AN7552_QOS_HOST - CODE_BASE +
@@ -513,26 +534,36 @@ station authorization, replay state and PPE queue teardown.
 +	void __iomem *q = ctx->regs + 0x36c0;
 +	u32 value;
 +	unsigned int i;
++	bool failed = false;
 +
 +	if (!ctx->ppe_enabled)
 +		return;
 +	writel(AN7552_PPE_MODE_DRAIN, q);
-+	if (readl_poll_timeout(q + 48, value, !value, 10, 100000))
-+		dev_warn(ctx->dev,
-+			 " PPE drain timed out; reserved buffers retained\n");
++	if (readl_poll_timeout(q + 48, value, !value, 10, 100000)) {
++		dev_err(ctx->dev, "PPE drain timed out; reserved buffers retained\n");
++		failed = true;
++	}
 +	writel(readl(ctx->fe + 0xa04) & ~BIT(0), ctx->fe + 0xa04);
 +	if (readl_poll_timeout(ctx->fe + 0xa04, value, !(value & BIT(1)), 10,
 +			       100000)) {
-+		dev_err(ctx->dev, " PPE TX remains busy; retaining ring\n");
-+	} else {
-+		for (i = 0; i < 3; i++)
-+			writel(ctx->ppe_saved[i], ctx->fe + 0x800 + i * 4);
-+		writel(ctx->ppe_saved[5], ctx->fe + 0xa28);
-+		writel(ctx->ppe_saved[6], ctx->fe + 0xa2c);
-+		writel(readl(ctx->fe + 0xa04) & ~BIT(0), ctx->fe + 0xa04);
++		dev_err(ctx->dev, "PPE TX remains busy; retaining ring\n");
++		failed = true;
 +	}
 +	writel(0, q);
-+	readl_poll_timeout(q + 52, value, !value, 10, 100000);
++	if (readl_poll_timeout(q + 52, value, !value, 10, 100000)) {
++		dev_err(ctx->dev, "PPE firmware did not stop; retaining ring\n");
++		failed = true;
++	}
++	if (failed) {
++		/* Radio reset must not recycle tokens still owned by the PPE. */
++		ctx->failed = true;
++		return;
++	}
++	for (i = 0; i < 3; i++)
++		writel(ctx->ppe_saved[i], ctx->fe + 0x800 + i * 4);
++	writel(ctx->ppe_saved[5], ctx->fe + 0xa28);
++	writel(ctx->ppe_saved[6], ctx->fe + 0xa2c);
++	writel(readl(ctx->fe + 0xa04) & ~BIT(0), ctx->fe + 0xa04);
 +	ctx->ppe_enabled = false;
 +}
 +
@@ -1065,6 +1096,25 @@ station authorization, replay state and PPE queue teardown.
 +}
 +EXPORT_SYMBOL_GPL(an7552_npu_tx_setup);
 +
++/* Disabled queues can retain a previous generation's status until setup.
++ * An enabled queue with a sticky error has stopped making progress even if
++ * the firmware's outer loop continues publishing a healthy heartbeat.
++ */
++static bool an7552_npu_queue_failed(struct an7552_npu *ctx, u32 control,
++				  u32 enable, u32 error)
++{
++	void __iomem *q = ctx->regs + 0x3000 + control;
++	u32 value;
++
++	if (!readl(q + enable))
++		return false;
++	value = readl(q + error);
++	if (!value)
++		return false;
++	dev_err(ctx->dev, "source queue %03x fault: %u\n", control, value);
++	return true;
++}
++
 +/* The consumer serializes health checks with reset and device teardown. */
 +bool an7552_npu_healthy(struct an7552_npu *ctx)
 +{
@@ -1074,6 +1124,22 @@ station authorization, replay state and PPE queue teardown.
 +		return true;
 +	if (ctx->faulted)
 +		return false;
++	for (i = 0; i < 2; i++) {
++		if (an7552_npu_queue_failed(ctx, AN7552_NATIVE_CONTROL + i * 64,
++					   20, 28) ||
++		    an7552_npu_queue_failed(ctx, AN7552_TXFREE_CONTROL + i * 64,
++					   16, 24))
++			goto queue_fault;
++	}
++	if (an7552_npu_queue_failed(ctx, AN7552_RRO_CONTROL, 16, 24) ||
++	    an7552_npu_queue_failed(ctx, 0x6c0, 0, 12))
++		goto queue_fault;
++	/* TDMA faults clear their firmware enable bit, so use host ownership. */
++	if (ctx->tdma_enabled &&
++	    readl(ctx->regs + 0x3000 + AN7552_STRIDE + 56)) {
++		dev_err(ctx->dev, "TDMA buffer ownership fault\n");
++		goto queue_fault;
++	}
 +	for (i = 0; i < AN7552_CORES; i++) {
 +		void __iomem *state = ctx->regs + 0x3000 + i * AN7552_STRIDE;
 +		u32 magic = readl(state), heartbeat = readl(state + 4);
@@ -1094,6 +1160,10 @@ station authorization, replay state and PPE queue teardown.
 +		return false;
 +	}
 +	return true;
++queue_fault:
++	ctx->faulted = true;
++	ctx->fault_count++;
++	return false;
 +}
 +EXPORT_SYMBOL_GPL(an7552_npu_healthy);
 +
@@ -1353,6 +1423,24 @@ station authorization, replay state and PPE queue teardown.
 +	usleep_range(1000, 2000);
 +	return ret;
 +}
++
++/* Destructors cannot return an error to prevent devres from freeing DMA
++ * backing. If ownership cannot be proved, stop the kernel before any caller
++ * can release that memory. Ordinary reset failures remain quarantined and
++ * do not use this destructor-only guard.
++ */
++void an7552_npu_require_quiescent(struct an7552_npu *ctx)
++{
++	if (!ctx || !ctx->running)
++		return;
++	an7552_npu_stop(ctx);
++	if (an7552_npu_recovery_ready(ctx) && !halt_cores(ctx))
++		return;
++	/* A timed restart could enter the bootloader while a bus owner lives. */
++	WRITE_ONCE(panic_timeout, 0);
++	panic("AN7552 DMA ownership unresolved during teardown; power cycle required");
++}
++EXPORT_SYMBOL_GPL(an7552_npu_require_quiescent);
 +
 +static int boot_firmware(struct an7552_npu *ctx)
 +{
@@ -1633,8 +1721,7 @@ station authorization, replay state and PPE queue teardown.
 +	if (!ctx)
 +		return;
 +	mutex_lock(&ctx->attach_lock);
-+	an7552_npu_stop(ctx);
-+	halt_cores(ctx);
++	an7552_npu_require_quiescent(ctx);
 +	ctx->running = false;
 +	ctx->attached = false;
 +	mutex_unlock(&ctx->attach_lock);
@@ -1814,9 +1901,7 @@ station authorization, replay state and PPE queue teardown.
 +	struct an7552_npu *ctx = platform_get_drvdata(pdev);
 +
 +	debugfs_remove_recursive(ctx->debugfs);
-+	an7552_npu_stop(ctx);
-+	if (ctx->running)
-+		halt_cores(ctx);
++	an7552_npu_require_quiescent(ctx);
 +}
 +
 +static const struct of_device_id an7552_npu_match[] = {
@@ -1972,7 +2057,7 @@ station authorization, replay state and PPE queue teardown.
 +#endif
 --- a/include/linux/soc/airoha/an7552_npu.h
 +++ b/include/linux/soc/airoha/an7552_npu.h
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,242 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef _LINUX_SOC_AIROHA_AN7552_NPU_H
 +#define _LINUX_SOC_AIROHA_AN7552_NPU_H
@@ -2024,6 +2109,7 @@ station authorization, replay state and PPE queue teardown.
 +void an7552_npu_tx_setup(struct an7552_npu *ctx, unsigned int band, u32 base,
 +			 u32 count);
 +void an7552_npu_stop(struct an7552_npu *ctx);
++void an7552_npu_require_quiescent(struct an7552_npu *ctx);
 +int an7552_npu_prepare(struct an7552_npu *ctx, bool full);
 +int an7552_npu_queues_start(struct an7552_npu *ctx);
 +int an7552_npu_start(struct an7552_npu *ctx);
@@ -2200,6 +2286,10 @@ station authorization, replay state and PPE queue teardown.
 +}
 +
 +static inline void an7552_npu_stop(struct an7552_npu *ctx)
++{
++}
++
++static inline void an7552_npu_require_quiescent(struct an7552_npu *ctx)
 +{
 +}
 +
