@@ -1,0 +1,23 @@
+Subject: [PATCH] ucode: reject interrupted handler initialization
+
+ucode now reports STATUS_BREAK when execution is suspended by a break
+request. Handler initialization must complete before its callback can be
+used; uhttpd has no debugger resume loop here. Report an interrupted
+initialization as an error, as for other non-completing executions.
+
+This also keeps the exhaustive status switch building with the newer
+ucode headers and -Werror=switch.
+
+--- a/ucode.c
++++ b/ucode.c
+@@ -305,6 +305,10 @@
+ 		fprintf(stderr, "Error: Compilation error while executing ucode handler\n");
+ 		exit(1);
+ 
++	case STATUS_BREAK:
++		fprintf(stderr, "Error: Execution interrupted while initializing ucode handler\n");
++		exit(2);
++
+ 	case ERROR_RUNTIME:
+ 		fprintf(stderr, "Error: Runtime error while executing ucode handler\n");
+ 		exit(2);
