@@ -6,6 +6,7 @@ API. Enable the RX 2-byte offset to match the newer driver's NET_IP_ALIGN
 buffer placement;
 otherwise AN7563 DMA aligns the address down and drops the first two bytes
 from frames delivered to the stack.
+Retain checksum-error dropping: the RX path trusts hardware validation.
 Pass DSA port tags through the TX descriptors. Hardware offload remains
 unsupported on AN7563.
 
@@ -28,20 +29,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  #include <linux/u64_stats_sync.h>
  #include <net/dst_metadata.h>
  #include <net/ip6_checksum.h>
-@@ -18,10 +20,12 @@
- #include <uapi/linux/ppp_defs.h>
- 
- #include "airoha_regs.h"
- #include "airoha_eth.h"
- 
-+#define AN7563_SCU_SHARE_FEMEM_SEL		0x958
-+
- u32 airoha_rr(void __iomem *base, u32 offset)
- {
- 	return readl(base + offset);
- }
- 
-@@ -178,10 +182,16 @@
+@@ -178,10 +182,19 @@
  }
  
  static void airoha_fe_maccr_init(struct airoha_eth *eth)
@@ -50,7 +38,10 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +
 +	if (eth->soc->version == 0x7563) {
 +		for (p = 1; p <= ARRAY_SIZE(eth->ports); p++)
-+			airoha_fe_wr(eth, REG_GDM_FWD_CFG(p), GDM_PAD_EN_MASK);
++			airoha_fe_wr(eth, REG_GDM_FWD_CFG(p),
++				     GDM_PAD_EN_MASK | GDM_TCP_CKSUM_MASK |
++				     GDM_UDP_CKSUM_MASK | GDM_IP4_CKSUM_MASK |
++				     GDM_DROP_CRC_ERR_MASK);
 +		return;
 +	}
  
@@ -206,7 +197,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  	err = reset_control_bulk_deassert(ARRAY_SIZE(eth->rsts), eth->rsts);
  	if (err)
  		return err;
-@@ -1880,11 +1976,17 @@
+@@ -1880,11 +1976,19 @@
  		err = airoha_qdma_init(pdev, eth, &eth->qdma[i]);
  		if (err)
  			goto error;
@@ -215,7 +206,9 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 -	err = airoha_ppe_init(eth);
 +	if (eth->soc->version == 0x7563)
 +		airoha_fe_wr(eth, REG_GDM_FWD_CFG(AIROHA_GDM1_IDX),
-+			     GDM_PAD_EN_MASK);
++			     GDM_PAD_EN_MASK | GDM_TCP_CKSUM_MASK |
++			     GDM_UDP_CKSUM_MASK | GDM_IP4_CKSUM_MASK |
++			     GDM_DROP_CRC_ERR_MASK);
 +
 +	if (eth->soc->version != 0x7563)
 +		err = airoha_ppe_init(eth);
@@ -247,7 +240,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  	struct airoha_gdm_dev *dev = netdev_priv(netdev);
  	struct airoha_gdm_port *port = dev->port;
 +
-+	/* AN7563 uses QDMA directly without PPE/NPU acceleration. */
++	/* AN7563 shares QDMA0 and does not need the GDM2 WAN loopback. */
 +	if (dev->eth->soc->version == 0x7563) {
 +		airoha_dev_set_qdma(dev);
 +		return airoha_set_macaddr(dev, netdev->dev_addr);

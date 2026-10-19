@@ -48,7 +48,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  	struct airoha_gdm_dev *dev = netdev_priv(netdev);
  	struct airoha_gdm_port *port = dev->port;
  
- 	/* AN7563 uses QDMA directly without PPE/NPU acceleration. */
+ 	/* AN7563 shares QDMA0 and does not need the GDM2 WAN loopback. */
  	if (dev->eth->soc->version == 0x7563) {
 +		/* GDM2 has separate MAC registers, but shares the CPU QDMA. */
 +		if (port->id == AIROHA_GDM2_IDX)
