@@ -1,0 +1,93 @@
+From: Pavel Bragin <pabragin@yandex.ru>
+Subject: [PATCH] net: airoha: quiesce the frame engine and the NPU on shutdown
+
+A warm reboot on AN7563 resets neither the frame engine nor the AN7552
+NPU. Packets still arriving from the GDM ports and frames still moved by
+the TDMA were written into RAM while the bootloader loaded the next
+image, and about one reboot in five hung in BL2 or right after U-Boot
+relocated itself.
+
+Drop every GDM port, disable both QDMA engines and wait until they report
+idle. Stop the NPU queues and the TDMA and park the two cores the way
+an7552_npu_put() does.
+
+Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4618,9 +4618,39 @@
+ };
+ MODULE_DEVICE_TABLE(of, of_airoha_match);
+ 
++/* A warm reboot does not reset the frame engine. Drop the GDM ports and
++ * stop both QDMA engines so that no packet is written into RAM while the
++ * bootloader loads the next image.
++ */
++static void airoha_shutdown(struct platform_device *pdev)
++{
++	struct airoha_eth *eth = platform_get_drvdata(pdev);
++	u32 busy = GLOBAL_CFG_TX_DMA_BUSY_MASK | GLOBAL_CFG_RX_DMA_BUSY_MASK;
++	u32 val;
++	int i;
++
++	if (!eth)
++		return;
++	for (i = AIROHA_GDM1_IDX; i <= AIROHA_GDM4_IDX; i++)
++		airoha_set_gdm_port_fwd_cfg(eth, REG_GDM_FWD_CFG(i),
++					    FE_PSE_PORT_DROP);
++	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
++		struct airoha_qdma *qdma = &eth->qdma[i];
++
++		if (!qdma->regs)
++			continue;
++		airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
++				  GLOBAL_CFG_TX_DMA_EN_MASK |
++				  GLOBAL_CFG_RX_DMA_EN_MASK);
++		readl_poll_timeout(qdma->regs + REG_QDMA_GLOBAL_CFG, val,
++				   !(val & busy), 10, 10000);
++	}
++}
++
+ static struct platform_driver airoha_driver = {
+ 	.probe = airoha_probe,
+ 	.remove = airoha_remove,
++	.shutdown = airoha_shutdown,
+ 	.driver = {
+ 		.name = KBUILD_MODNAME,
+ 		.of_match_table = of_airoha_match,
+--- a/drivers/net/ethernet/airoha/an7552_npu.c
++++ b/drivers/net/ethernet/airoha/an7552_npu.c
+@@ -1383,6 +1383,25 @@
+ 		halt_cores(ctx);
+ }
+ 
++/* A warm reboot resets neither the NPU cores nor the TDMA. Stop the queues
++ * and park the cores the way an7552_npu_put() does, so that nothing writes
++ * into RAM while the bootloader loads the next image.
++ */
++static void an7552_npu_shutdown(struct platform_device *pdev)
++{
++	struct an7552_npu *ctx = platform_get_drvdata(pdev);
++
++	if (!ctx)
++		return;
++	mutex_lock(&ctx->attach_lock);
++	if (ctx->running) {
++		an7552_npu_stop(ctx);
++		halt_cores(ctx);
++		ctx->running = false;
++	}
++	mutex_unlock(&ctx->attach_lock);
++}
++
+ static const struct of_device_id an7552_npu_match[] = {
+ 	{ .compatible = "airoha,an7552-npu" },
+ 	{}
+@@ -1392,6 +1411,7 @@
+ static struct platform_driver an7552_npu_driver = {
+ 	.probe = an7552_npu_probe,
+ 	.remove = an7552_npu_remove,
++	.shutdown = an7552_npu_shutdown,
+ 	.driver = {
+ 		.name = "an7552-npu",
+ 		.of_match_table = an7552_npu_match,

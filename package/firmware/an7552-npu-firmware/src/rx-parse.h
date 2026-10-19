@@ -2,6 +2,7 @@
 #ifndef AN7552_RX_PARSE_H
 #define AN7552_RX_PARSE_H
 #include <stdint.h>
+#include "pkt-view.h"
 struct rx_metadata {
 	uint32_t wcid, band, bss, key, tid, pn_low, pn_high;
 	uint32_t offset, length, sequence;
@@ -15,25 +16,18 @@ enum rx_parse_result {
 	RX_PARSE_AGGREGATE,
 	RX_PARSE_PROTOCOL
 };
-static uint32_t rx_get32(const volatile uint8_t *p)
-{
-	if (!((uintptr_t)p & 3))
-		return *(const volatile uint32_t *)p;
-	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
-	       (uint32_t)p[3] << 24;
-}
 /* Conservative fast-path classifier. All other frames retain the Linux path. */
-static enum rx_parse_result rx_parse(const volatile uint8_t *packet,
-				     uint32_t length, uint32_t reason,
-				     struct rx_metadata *out)
+static enum rx_parse_result rx_parse_view(struct pkt_view *v,
+					  uint32_t length, uint32_t reason,
+					  struct rx_metadata *out)
 {
 	uint32_t d0, d1, d2, d3, offset, fc, sequence, qos, protocol;
 	if (length < 32)
 		return RX_PARSE_SHORT;
-	d0 = rx_get32(packet);
-	d1 = rx_get32(packet + 4);
-	d2 = rx_get32(packet + 8);
-	d3 = rx_get32(packet + 12);
+	d0 = pv_get32(v, 0);
+	d1 = pv_get32(v, 4);
+	d2 = pv_get32(v, 8);
+	d3 = pv_get32(v, 12);
 	if ((d0 & 65535) != length)
 		return RX_PARSE_SHORT;
 	if ((d0 >> 27) != 2 || reason == 1 || reason == 2 || !(d2 & (1U << 7)))
@@ -47,8 +41,8 @@ static enum rx_parse_result rx_parse(const volatile uint8_t *packet,
 		return RX_PARSE_SECURITY;
 	if (length < 64)
 		return RX_PARSE_SHORT;
-	fc = rx_get32(packet + 32) & 65535;
-	sequence = rx_get32(packet + 40);
+	fc = pv_get32(v, 32) & 65535;
+	sequence = pv_get32(v, 40);
 	qos = sequence >> 16;
 	sequence &= 65535;
 	if (((fc & 0xfc) != 0x08 && (fc & 0xfc) != 0x88) ||
@@ -67,34 +61,34 @@ static enum rx_parse_result rx_parse(const volatile uint8_t *packet,
 	offset += 2 * ((d2 >> 13) & 7);
 	if (offset > length || length - offset < 14)
 		return RX_PARSE_SHORT;
-	protocol = ((uint32_t)packet[offset + 12] << 8) | packet[offset + 13];
-	if ((packet[offset] & 1) || (protocol != 0x0800 && protocol != 0x86dd))
+	protocol = ((uint32_t)pv_byte(v, offset + 12) << 8) | pv_byte(v, offset + 13);
+	if ((pv_byte(v, offset) & 1) || (protocol != 0x0800 && protocol != 0x86dd))
 		return RX_PARSE_PROTOCOL;
 	/* Extension headers and IP fragments retain the Linux path. */
 	uint32_t ip = offset + 14, ip_size, l4, transport;
 	if (protocol == 0x0800) {
-		if (length - ip < 20 || (packet[ip] >> 4) != 4)
+		if (length - ip < 20 || (pv_byte(v, ip) >> 4) != 4)
 			return RX_PARSE_PROTOCOL;
-		ip_size = (packet[ip] & 15) * 4;
-		uint32_t total = ((uint32_t)packet[ip + 2] << 8) |
-				 packet[ip + 3];
+		ip_size = (pv_byte(v, ip) & 15) * 4;
+		uint32_t total = ((uint32_t)pv_byte(v, ip + 2) << 8) |
+				 pv_byte(v, ip + 3);
 		if (ip_size < 20 || total < ip_size || total > length - ip ||
-		    (((uint32_t)packet[ip + 6] << 8) | packet[ip + 7]) & 0x3fff)
+		    (((uint32_t)pv_byte(v, ip + 6) << 8) | pv_byte(v, ip + 7)) & 0x3fff)
 			return RX_PARSE_PROTOCOL;
-		transport = packet[ip + 9];
+		transport = pv_byte(v, ip + 9);
 		l4 = total - ip_size;
 	} else {
-		if (length - ip < 40 || (packet[ip] >> 4) != 6)
+		if (length - ip < 40 || (pv_byte(v, ip) >> 4) != 6)
 			return RX_PARSE_PROTOCOL;
 		ip_size = 40;
-		l4 = ((uint32_t)packet[ip + 4] << 8) | packet[ip + 5];
+		l4 = ((uint32_t)pv_byte(v, ip + 4) << 8) | pv_byte(v, ip + 5);
 		if (l4 > length - ip - 40)
 			return RX_PARSE_PROTOCOL;
-		transport = packet[ip + 6];
+		transport = pv_byte(v, ip + 6);
 	}
 	if (transport == 6) {
-		if (l4 < 20 || (packet[ip + ip_size + 12] >> 4) < 5 ||
-		    (packet[ip + ip_size + 12] >> 4) * 4 > l4)
+		if (l4 < 20 || (pv_byte(v, ip + ip_size + 12) >> 4) < 5 ||
+		    (pv_byte(v, ip + ip_size + 12) >> 4) * 4 > l4)
 			return RX_PARSE_PROTOCOL;
 	} else if (transport == 17) {
 		if (l4 < 8)
@@ -106,11 +100,22 @@ static enum rx_parse_result rx_parse(const volatile uint8_t *packet,
 	out->bss = d2 & 63;
 	out->key = (d1 >> 21) & 3;
 	out->tid = (fc & 0x80) ? (qos & 15) : 0;
-	out->pn_low = rx_get32(packet + 48);
-	out->pn_high = packet[52] | (uint32_t)packet[53] << 8;
+	out->pn_low = pv_get32(v, 48);
+	out->pn_high = pv_byte(v, 52) | (uint32_t)pv_byte(v, 53) << 8;
 	out->offset = offset;
 	out->length = length - offset;
 	out->sequence = sequence >> 4;
 	return RX_PARSE_OK;
+}
+
+/* Uncached-pointer entry point kept for host tests and other callers. */
+__attribute__((unused)) static enum rx_parse_result
+rx_parse(const volatile uint8_t *packet, uint32_t length, uint32_t reason,
+	 struct rx_metadata *out)
+{
+	struct pkt_view v;
+
+	pv_init(&v, packet, length);
+	return rx_parse_view(&v, length, reason, out);
 }
 #endif
