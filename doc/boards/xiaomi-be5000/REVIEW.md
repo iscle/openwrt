@@ -25,13 +25,16 @@ Confirmed issues addressed in this iteration include:
 * Firmware queues could stop on a sticky error while their heartbeats remained
   healthy. The host now detects those queue faults, including TDMA corruption.
 * L1 radio recovery could ignore reset failures and release live TX tokens.
-  All recovery phases must succeed before queues and DMA resume.
+  All recovery phases must succeed before queues and DMA resume, and
+  RX/TX polling state is tracked across failed recovery and teardown.
 * The mt76 NPU API depended on an Airoha-only kernel header even on other
   targets. A matching local interface and disabled-platform stubs preserve
   those builds.
 * NAND remapping ignored failed page copies and could retire the only good
   source. Mapping tables now use verified copy-on-write persistence before
-  retiring the old copy. Ambiguous persistence fails stopped; table scan order
+  retiring the old copy. Complete Airoha MTD transactions are serialized so
+  lookup, copy, commit and shared scratch cannot race. Ambiguous persistence
+  fails stopped; table scan order
   and on-flash format remain compatible with the existing bootloader.
 * U-Boot could reject corrected ECC reads, ignore short reads or expose raw
   NAND after BMT attachment failed. Attachment and initial-table persistence
@@ -44,6 +47,9 @@ Confirmed issues addressed in this iteration include:
   indices are rejected until full radio recovery; removed keys retain a
   tombstone so reinstall cannot reset counters under the same secret.
   This deliberately sacrifices seamless renewal and needs reconnect testing.
+* Adding an MLO link could leave its replay state prepared but never active.
+  Link addition now commits its prepared state transactionally and propagates
+  errors before authorization.
 * Splitting upload across cores introduced a PN-update/submission race.
   A fenced pause/active handshake protects both PPE completions and new
   submissions. Receive stop can also finish while a station pause is held.

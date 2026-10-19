@@ -112,9 +112,9 @@ class RecoveryTest(unittest.TestCase):
 
     def test_device_base_layout(self):
         source = post_image("mt7996/mt7996.h")
-        start = source.index("union { /* must be first */")
+        start = source.index("struct mt7996_dev {")
         end = source.index("struct mt7996_phy *radio_phy", start)
-        prefix = "struct mt7996_dev {\n" + source[start:end]
+        prefix = source[start:end]
         with tempfile.TemporaryDirectory(prefix="mt76-layout-") as directory:
             compile_run(directory, "#include <stddef.h>\n"
                         "#define DECLARE_BITMAP(n,b) unsigned long n[17]\n"
@@ -230,6 +230,87 @@ int main(void){
 """
         with tempfile.TemporaryDirectory(prefix="mt76-keyiter-") as directory:
             compile_run(directory, harness + source[start:end] + cases, ["-Wno-sign-compare"])
+
+    def test_nonce_tombstones_all_hardware_ciphers(self):
+        source = post_image("mt7996/main.c")
+        start = source.index("static int mt7996_npu_prepare_key(")
+        end = source.index("\n}", start) + 3
+        harness = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#define GFP_KERNEL 0
+#define kzalloc(n,f) calloc(1,n)
+#define memzero_explicit(p,n) memset(p,0,n)
+struct ieee80211_key_conf {unsigned cipher,keylen,keyidx;unsigned char key[32];};
+struct mt7996_npu_key {unsigned char key[32];unsigned cipher,keylen,keyidx;unsigned char pn[17][6];bool saved,disabled;int error;};
+struct mt7996_sta {struct mt7996_npu_key *npu_key[2];};
+struct ieee80211_sta {void *drv_priv;};
+struct mt7996_sta_link {struct {int idx;} wcid;};
+struct mt7996_dev {struct {struct {void *an7552;} mmio;} mt76;};
+enum set_key_cmd {SET_KEY,DISABLE_KEY};
+static struct mt7996_sta_link link;
+static unsigned reads;
+static bool mt76_npu_cipher_supported(unsigned c){return c==1;}
+static struct mt7996_sta_link *mt7996_sta_link_protected(struct mt7996_dev *d,struct mt7996_sta *s,unsigned i){return &link;}
+static int an7552_npu_pn_get(void *n,int w,unsigned k,unsigned char *p){reads++;memset(p,7,102);return 0;}
+"""
+        cases = r"""
+int main(void){
+ struct mt7996_dev d={0};
+ for(unsigned cipher=1;cipher<=3;cipher++){
+  struct mt7996_sta m={0};struct ieee80211_sta sta={.drv_priv=&m};
+  struct ieee80211_key_conf k={.cipher=cipher,.keylen=32};reads=0;
+  assert(!mt7996_npu_prepare_key(&d,&sta,0,SET_KEY,&k));
+  assert(m.npu_key[0]);
+  k.keyidx=1;assert(mt7996_npu_prepare_key(&d,&sta,0,SET_KEY,&k)==-EKEYREJECTED);
+  k.keyidx=0;assert(!mt7996_npu_prepare_key(&d,&sta,0,DISABLE_KEY,&k));
+  assert(m.npu_key[0]->disabled);
+  assert(mt7996_npu_prepare_key(&d,&sta,0,SET_KEY,&k)==-EKEYREJECTED);
+  k.keyidx=1;assert(mt7996_npu_prepare_key(&d,&sta,0,SET_KEY,&k)==-EKEYREJECTED);
+  k.key[0]=9;assert(!mt7996_npu_prepare_key(&d,&sta,0,SET_KEY,&k));
+  assert(!m.npu_key[0]->disabled && !m.npu_key[0]->saved);
+  assert(reads==(cipher==1?1U:0U));free(m.npu_key[0]);
+ }
+ return 0;
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="mt76-tombstone-") as directory:
+            compile_run(directory, harness + source[start:end] + cases)
+
+    def test_partial_napi_recovery_and_teardown(self):
+        source = post_image("mt7996/mac.c")
+        start = source.index("static void mt7996_recovery_tx_napi_disable(")
+        end = source.index("\n}", source.index("static void mt7996_recovery_napi_enable(")) + 3
+        harness = r"""
+#include <assert.h>
+#include <stdbool.h>
+struct napi {bool disabled;};
+struct mt7996_dev {struct {struct napi tx_napi,napi[4];bool tx_napi_disabled;} mt76;unsigned long recovery_napi_disabled;};
+static bool test_and_set_bit(unsigned i,unsigned long *p){bool old=*p&(1UL<<i);*p|=1UL<<i;return old;}
+static bool test_and_clear_bit(unsigned i,unsigned long *p){bool old=*p&(1UL<<i);*p&=~(1UL<<i);return old;}
+static void napi_disable(struct napi *n){assert(!n->disabled);n->disabled=true;}
+static void napi_enable(struct napi *n){assert(n->disabled);n->disabled=false;}
+"""
+        cases = r"""
+int main(void){struct mt7996_dev d={0};
+ for(unsigned i=0;i<4;i++)mt7996_recovery_napi_disable(&d,i);
+ mt7996_recovery_tx_napi_disable(&d);
+ mt7996_recovery_napi_enable(&d,1); /* MCU startup enabled only some queues */
+ for(unsigned i=0;i<4;i++)mt7996_recovery_napi_disable(&d,i);
+ mt7996_recovery_tx_napi_disable(&d);
+ assert(d.recovery_napi_disabled==15 && d.mt76.tx_napi_disabled);
+ /* Same predicate as common DMA cleanup: already disabled TX is not disabled twice. */
+ if(!d.mt76.tx_napi_disabled)napi_disable(&d.mt76.tx_napi);
+ for(unsigned i=0;i<4;i++)mt7996_recovery_napi_enable(&d,i);
+ mt7996_recovery_tx_napi_enable(&d);
+ assert(!d.recovery_napi_disabled && !d.mt76.tx_napi_disabled);
+ return 0;}
+"""
+        with tempfile.TemporaryDirectory(prefix="mt76-napi-") as directory:
+            compile_run(directory, harness + source[start:end] + cases)
 
     def test_portable_api_matches_transport(self):
         self.assertEqual(new_file(PATCH, "an7552_npu.h").rstrip(),

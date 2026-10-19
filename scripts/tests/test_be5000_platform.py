@@ -322,20 +322,20 @@ static struct {
 } ctx={&bmt,&bbt,8,16,8,-1,-1};
 static struct {u8 data_buf[2048];} bmtd;
 static u8 disk[16][2048];
-static int cut,event;
+static int cut,event,write_failure;
 static jmp_buf escape;
 static void point(void){if(++event==cut)longjmp(escape,1);}
 static int airoha_bad_markers(int b){return 0;}
 static bool airoha_isbad_any(int b){return false;}
 static int airoha_read_oob_idx(int b,u16 *idx){*idx=0xffff;return 0;}
 static int airoha_read_data(int b,void *out,size_t n){memcpy(out,disk[b],n);return 0;}
-static int airoha_write_data(int b,const void *data,size_t n){memcpy(disk[b],data,n);point();return 0;}
+static int airoha_write_data(int b,const void *data,size_t n){memcpy(disk[b],data,n);point();return write_failure?-EIO:0;}
 static int bbt_nand_erase(int b){memset(disk[b],255,2048);point();return 0;}
 static int airoha_erase(int b){return bbt_nand_erase(b);}
 static void airoha_metadata_ambiguous(void){assert(0);}
 """
             for signature in ('static u8 bmt_calc_checksum(', 'static u32 bbt_calc_checksum(',
-                              'static int bmt_find_by_mapped(',
+                              'static int bmt_find_by_mapped(', 'static int bmt_find_by_bad(',
                               'static int find_available_pool_block(',
                               'static bool bmt_entries_valid(', 'static bool bbt_entries_valid(',
                               'static int load_bmt(', 'static int load_bbt(',
@@ -346,6 +346,8 @@ static void airoha_metadata_ambiguous(void){assert(0);}
                 if signature == 'static int find_available_pool_block(':
                     code += 'static int airoha_markbad(int b){return 0;}\n'
                 code += function(source, signature) + '\n'
+            if 'static void airoha_unmap_block(' in source:
+                code += function(source, 'static void airoha_unmap_block(') + '\n'
             code += r"""
 static void boot(void) {
     ctx.bmt_block=ctx.bbt_block=-1;
@@ -384,12 +386,29 @@ int main(void) {
     }
 }
 """
+            if 'static void airoha_unmap_block(' in source:
+                extra = r"""
+    for(int index=0;index<3;index++) {
+        seed();bmt.header.mapped_count=3;
+        for(int i=0;i<3;i++)bmt.entries[i]=(struct airoha_bmt_entry){2+i,10+i};
+        assert(!airoha_save_bmt());
+        struct airoha_bmt_table saved=bmt;
+        write_failure=1;airoha_unmap_block(2+index);
+        assert(!memcmp(&bmt,&saved,sizeof(bmt)));
+        write_failure=0;airoha_unmap_block(2+index);boot();
+        assert(bmt.header.mapped_count==2);
+        for(int i=0;i<2;i++)assert(bmt.entries[i].bad_index!=2+index);
+    }
+"""
+                end = code.rfind('}')
+                code = code[:end] + extra + code[end:]
             run_c(code)
 
     def test_kernel_serializes_entire_mapping_transactions(self):
         source = postimage('target/linux/airoha/patches-6.18/961-mtd-airoha-serialize-remap-transactions.patch')
         code = r"""
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -434,7 +453,7 @@ static void *worker(void *arg) {
         assert(airoha_locked_mtd_erase(0,0)==-7);
         assert(airoha_locked_block_isbad(0,0)==-7);
         assert(airoha_locked_block_markbad(0,0)==-7);
-        assert(airoha_locked_debug_repair(0,0)==-7);
+        assert(airoha_locked_debug_repair(0,0)==-EOPNOTSUPP);
         assert(airoha_locked_debug_mark_good(0,0)==-7);
         assert(airoha_locked_debug_mark_bad(0,0)==-7);
         assert(airoha_locked_debug(0,0)==-7);
@@ -445,9 +464,9 @@ int main(void) {
     pthread_t threads[4];
     for(int i=0;i<4;i++)assert(!pthread_create(&threads[i],0,worker,0));
     for(int i=0;i<4;i++)assert(!pthread_join(threads[i],0));
-    assert(calls==3600 && !active);
+    assert(calls==3200 && !active);
     bmtd.ops=0;assert(airoha_locked_read(0,0,0)==-7);
-    assert(calls==3601);
+    assert(calls==3201);
 }
 """
         run_c(code)
