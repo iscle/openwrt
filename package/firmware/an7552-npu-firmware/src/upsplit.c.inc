@@ -79,8 +79,8 @@
  *
  * Replay table changes: core 0 runs the PN service between its batches. A
  * key install (op 2) or snapshot (op 3) bumps US_EPOCH before it touches the
- * entry. A record carries the low 16 epoch bits it was validated under; if
- * they differ, core 1 compares the record's cookie with entry word 1, exactly
+ * entry. A record carries the low 16 epoch bits for diagnostics;
+ * core 1 always compares the record's cookie with entry word 1, exactly
  * as the single-core code re-checked a parked frame.
  *
  * Shared memory: control words at NPU_BASE + 0x480 (debugfs status row
@@ -231,11 +231,7 @@ static int up_front_one(struct up_front_batch *b, volatile uint32_t *rec)
 		SPLIT_ST(&rec[UR_CLASS], UR_ERROR);
 		return UP_ERROR_RECORD;
 	}
-	/* Header words are read through the cached alias without invalidating
-	 * the cache first. The free list is a FIFO of AN7552_RX_BUFFER_COUNT
-	 * (6144) tokens, so a released buffer is reused only after every other
-	 * buffer has been; by then its old lines have long been evicted.
-	 */
+	/* pkt_view reads each header word once through the uncached DMA alias. */
 	pv_init(&view, RX_HEADER_ALIAS(d0), length);
 	/* A buffer after a non-final one continues the previous MPDU. */
 	if (b->chain)
@@ -497,21 +493,17 @@ static int up_back_one(struct up_back *u)
 		UP_TEST_AFTER_IDENTITY_CHECK();
 #endif
 		if (fast) {
-			/* Key word first, then the epoch: a key install bumps
-			 * the epoch before it clears or rewrites the entry.
+			/* A queued record can outlive any number of unrelated key
+			 * updates. Always compare its full per-station cookie.
 			 */
 			entry = pn_entry(wcid);
 			if (!entry[0]) {
 				fast = 0;
 			} else {
 				barrier();
-				if ((s[US_EPOCH] ^ (mac_high >> 16)) & 65535) {
-					uint32_t cookie = SPLIT_LD(&rec[UR_COOKIE]);
-
-					if (entry[1] != cookie) {
-						s[US_STALE]++;
-						fast = 0;
-					}
+				if (entry[1] != SPLIT_LD(&rec[UR_COOKIE])) {
+					s[US_STALE]++;
+					fast = 0;
 				}
 			}
 		}

@@ -5,8 +5,10 @@ static volatile uint32_t *rx_words(uint32_t host)
 }
 
 #ifndef RX_HEADER_ALIAS
-/* Cached view of a receive buffer (host address as seen by the NPU). */
-#define RX_HEADER_ALIAS(host) ((volatile uint8_t *)(uintptr_t)(host))
+/* DMA writes are not coherent with the NPU data cache. Cache only the
+ * per-packet stack copy in pkt_view, never the reusable DMA buffer.
+ */
+#define RX_HEADER_ALIAS(host) ((volatile uint8_t *)rx_words(host))
 #endif
 
 #ifndef RX_STATE_MIRROR

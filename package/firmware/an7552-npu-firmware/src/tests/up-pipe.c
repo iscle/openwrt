@@ -96,7 +96,6 @@ static uint32_t read32(uint32_t address)
 #include "../rx-parse.h"
 /* Tests inspect the DDR state words directly. */
 #define RX_STATE_MIRROR 0
-#define RX_HEADER_ALIAS(host) ((volatile uint8_t *)rx_words(host))
 #include "../rro.c.inc"
 #include "../ppe.c.inc"
 /* Linux revokes the station after core 1 read its eligibility. */
@@ -536,6 +535,48 @@ static void test_backpressure(void)
 		assert(!states()[t]);
 }
 
+/* A stalled record must not outlive the full key-cookie check. */
+static void test_epoch_wrap(void)
+{
+	reset();
+	packet(0, 0);
+	front_call();
+	assert(queued() == 1);
+	uint32_t cookie = up_slot(0)[UR_COOKIE];
+
+	for (unsigned int i = 0; i < 65536; i++) {
+		pn_request(2, i ? 3 : 2, 1);
+		up_pn_service();
+	}
+	assert(pn_entry(2)[1] != cookie);
+	back_call();
+	assert(!ppe_control()[1] && up_ctrl()[US_STALE] == 1);
+}
+
+/* Radio recovery recycles token 0 without restarting the NPU cores. */
+static void test_dma_restart(void)
+{
+	reset();
+	ppe_control()[0] = 0;
+	packet(0, 0);
+	step();
+	assert(control()[2] == 1 && (rx_words(0x842f9000)[0] & 15) == 1);
+	control()[4] = 0;
+	back_call();
+	front_call();
+	back_call();
+	assert(!control()[5] && !queued());
+	control()[16] = control()[17] = control()[30] = control()[22] = 0;
+	packet(0, 0);
+	rx_words(AN7552_RX_BUFFER_HOST)[12] = 2;
+	rx_words(AN7552_RX_BUFFER_HOST)[10] += 16;
+	control()[4] = 1;
+	back_call();
+	front_call();
+	back_call();
+	assert((rx_words(0x842f9010)[0] & 15) == 1);
+}
+
 int main(void)
 {
 	for (unsigned int i = 0; i < sizeof(regions) / sizeof(regions[0]); i++) {
@@ -555,6 +596,8 @@ int main(void)
 	test_continuation();
 	test_station_cache();
 	test_key_change();
+	test_epoch_wrap();
+	test_dma_restart();
 	test_errors();
 	test_retry_counters();
 	test_backpressure();
