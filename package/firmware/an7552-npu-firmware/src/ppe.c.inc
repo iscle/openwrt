@@ -29,7 +29,7 @@ static void native_ppe_receive(void)
 		q[7] = status;
 		q[8] = metadata;
 		if (token >= AN7552_RX_BUFFER_COUNT ||
-		    (rx_words(AN7552_RX_STATE_HOST)[token] & 255) != 2 ||
+		    (st_get(token) & 255) != 2 ||
 		    !q[12]) {
 			q[3] = 4;
 			return;

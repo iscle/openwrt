@@ -16,7 +16,7 @@ static uint32_t read32(uint32_t address)
 		return 0;
 	return *(volatile uint32_t *)(uintptr_t)address;
 }
-static uint32_t packet_word(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_word(volatile uint8_t *p)
 {
 	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
 	       ((uint32_t)p[3] << 24);
@@ -24,27 +24,43 @@ static uint32_t packet_word(volatile uint8_t *p)
 #include "../pn.c.inc"
 #include "../rx-security.c.inc"
 #include "../rx-parse.h"
-static uint32_t packet_mac_low(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_mac_low(volatile uint8_t *p)
 {
 	return packet_word(p);
 }
-static uint32_t packet_mac_high(volatile uint8_t *p)
+__attribute__((unused)) static uint32_t packet_mac_high(volatile uint8_t *p)
 {
 	return p[4] | (uint32_t)p[5] << 8;
 }
+/* Host tests only map the uncached alias. */
+/* Tests inspect the DDR state words directly. */
+#define RX_STATE_MIRROR 0
+#define RX_HEADER_ALIAS(host) ((volatile uint8_t *)rx_words(host))
 #include "../rro.c.inc"
 #include "../ppe.c.inc"
+#include "../upsplit.c.inc"
 static void map(uint32_t address, size_t length)
 {
 	assert(mmap((void *)(uintptr_t)address, length, PROT_READ | PROT_WRITE,
 		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1,
 		    0) == (void *)(uintptr_t)address);
 }
+/* One receive round: core 1 starts the pipeline (or finishes earlier
+ * records), core 0 produces the records, core 1 consumes them.
+ */
+static struct up_front front;
+static void receive(void)
+{
+	native_up_back();
+	native_up_front(&front);
+	native_up_back();
+}
 int main(void)
 {
 	volatile uint32_t *q, *data, *ring, *host, *free_ids, *states;
 	volatile uint8_t *packet;
 	map(AN7552_NPU_BASE, 4096);
+	map(0x3e900000, 0x3000);	/* local SRAM: PPE index cache, records */
 	map(0x44010000, 0xf0000);
 	map(0x441b0000, 0x30000);
 	map(0x442c0000, 0x40000);
@@ -94,17 +110,19 @@ int main(void)
 	packet = (void *)rx_words(AN7552_RX_BUFFER_HOST);
 	for (uint32_t i = 0; i < 64; i++)
 		packet[i] = i;
-	native_rro_receive();
+	up_init(0);
+	up_init(1);
+	receive();
 	assert(!q[6] && q[7] == 1 && q[2] == 1 && q[16] == 1);
 	assert(!memcmp((void *)packet, (void *)rx_words(0x89200000), 64));
 	assert((rx_words(q[0])[2] >> 16) == 1234);
 	assert(states[0] == 0 && free_ids[0] == 0 && q[21] == 1 &&
 	       q[22] == AN7552_RX_BUFFER_COUNT);
 	assert(read32(0x1ec0d1a8) == 1);
-	native_rro_receive();
+	receive();
 	assert(q[7] == 1);
 	*(volatile uint32_t *)(uintptr_t)0x200d450c = 1;
-	native_rro_receive();
+	receive();
 	assert(states[1] == 1 && q[20] == 2);
 	assert(rx_words(AN7552_RX_DATA_RING_HOST +
 			(AN7552_RX_RING_COUNT - 1) * 16)[0] ==

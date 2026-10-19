@@ -23,7 +23,12 @@ define Device/xiaomi_be5000
   DEVICE_DTS := an7563-xiaomi-be5000
   DEVICE_PACKAGES := an7552-npu-firmware kmod-phy-airoha-en8811h \
 	kmod-mt7996e kmod-mt7992-23-firmware wpad-basic-mbedtls iw
+  DEVICE_COMPAT_VERSION := 1.1
+  DEVICE_COMPAT_MESSAGE := rootfs_data moved to a UBI volume; reinstall with sysupgrade -n
   KERNEL_LOADADDR := 0x80088000
+  IMAGE_SIZE := 24576k
+  IMAGE/sysupgrade.bin := append-kernel | pad-to 128k | append-rootfs | \
+	pad-rootfs | append-metadata | check-size
   ARTIFACT/u-boot.bin := an7563-uboot xiaomi_be5000
   ARTIFACTS := u-boot.bin
 endef

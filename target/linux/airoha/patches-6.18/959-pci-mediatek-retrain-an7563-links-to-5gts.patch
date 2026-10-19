@@ -1,0 +1,62 @@
+From: Pavel Bragin <pabragin@yandex.ru>
+Subject: [PATCH] PCI: mediatek: retrain AN7563 links to 5 GT/s
+
+The AN7563 root ports train at 2.5 GT/s and never move up, although both
+they and the MT7992 endpoint support 5 GT/s. At 2.5 GT/s x1 the Wi-Fi TX
+DMA reads cap downloads at about 1 Gbit/s. The vendor kernel retrains
+both root complexes after link up; do the same from a final PCI fixup,
+limited to root ports of an airoha,an7563-pcie host bridge that have a
+device behind them.
+
+Signed-off-by: Pavel Bragin <pabragin@yandex.ru>
+---
+--- a/drivers/pci/controller/pcie-mediatek.c
++++ b/drivers/pci/controller/pcie-mediatek.c
+@@ -1359,6 +1359,47 @@
+ };
+ MODULE_DEVICE_TABLE(of, mtk_pcie_ids);
+ 
++/*
++ * AN7563 root ports train at 2.5 GT/s and stay there, although both they and
++ * the MT7992 endpoint support 5 GT/s. At 2.5 GT/s x1 the Wi-Fi TX DMA reads
++ * cap downloads at about 1 Gbit/s. Retrain once the link is up.
++ */
++static void an7563_pcie_retrain(struct pci_dev *dev)
++{
++	struct pci_host_bridge *host;
++	u32 lnkcap;
++	u16 lnksta;
++
++	/* Only root ports of an AN7563 host bridge. */
++	if (!pci_is_root_bus(dev->bus))
++		return;
++	host = pci_find_host_bridge(dev->bus);
++	if (!host || !host->dev.parent ||
++	    !of_device_is_compatible(host->dev.parent->of_node,
++				     "airoha,an7563-pcie"))
++		return;
++	/* pcie_retrain_link() would wait on a port with nothing behind it. */
++	if (!dev->subordinate || list_empty(&dev->subordinate->devices))
++		return;
++
++	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP, &lnkcap);
++	pcie_capability_read_word(dev, PCI_EXP_LNKSTA, &lnksta);
++	if ((lnksta & PCI_EXP_LNKSTA_CLS) >= (lnkcap & PCI_EXP_LNKCAP_SLS))
++		return;
++
++	pcie_capability_clear_and_set_word(dev, PCI_EXP_LNKCTL2,
++					   PCI_EXP_LNKCTL2_TLS,
++					   lnkcap & PCI_EXP_LNKCAP_SLS);
++	if (pcie_retrain_link(dev, true))
++		pci_warn(dev, "link retrain failed\n");
++
++	pcie_capability_read_word(dev, PCI_EXP_LNKSTA, &lnksta);
++	pci_info(dev, "link retrained to %s\n",
++		 pci_speed_string(pcie_link_speed[lnksta & PCI_EXP_LNKSTA_CLS]));
++}
++DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_MEDIATEK, 0x0810, an7563_pcie_retrain);
++DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_MEDIATEK, 0x0811, an7563_pcie_retrain);
++
+ static struct platform_driver mtk_pcie_driver = {
+ 	.probe = mtk_pcie_probe,
+ 	.remove = mtk_pcie_remove,
