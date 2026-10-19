@@ -151,6 +151,7 @@ sub mconf_depends {
 	my $dep = shift;
 	my $seen = shift;
 	my $parent_condition = shift;
+	my $parent_guards = shift || [];
 	$dep or $dep = {};
 	$seen or $seen = {};
 	my @t_depends;
@@ -162,6 +163,7 @@ sub mconf_depends {
 		my $flags = "";
 		$depend =~ s/^([@\+]+)// and $flags = $1;
 		my $condition = $parent_condition;
+		my @guards = @$parent_guards;
 
 		$depend = $2 if	$depend =~ /^(.+):(.+)$/ and $dep->{$1} eq 'select';
 
@@ -171,6 +173,7 @@ sub mconf_depends {
 		$seen->{"$parent_condition:$depend"} = 1;
 		if ($depend =~ /^(.+):(.+)$/) {
 			if ($1 ne "PACKAGE_$pkgname") {
+				push @guards, $1;
 				if ($condition) {
 					$condition = "$condition && $1";
 				} else {
@@ -179,6 +182,11 @@ sub mconf_depends {
 			}
 			$depend = $2;
 		}
+		# A selected package need not re-impose a prerequisite that already
+		# guards its selection. Keep the original guards: comparing only the
+		# combined condition misses nested guards (FEATURE && IPV6), adding
+		# redundant edges back to package-owned feature options in Kconfig.
+		next if grep { $_ eq $depend } @guards;
 		if ($flags =~ /\+/) {
 			my $vdep = $vpackage{$depend};
 			my $rank;
@@ -213,7 +221,8 @@ sub mconf_depends {
 			# negation instead of the rank, as before 1fd50531.
 			my $reemit = $condition;
 			$reemit = ($reemit ? "$reemit && " : '') . $negation if defined $negation;
-			$package{$depend} and push @t_depends, [ $package{$depend}->{depends}, $reemit ];
+			push @guards, $negation if defined $negation;
+			$package{$depend} and push @t_depends, [ $package{$depend}->{depends}, $reemit, [ @guards ] ];
 
 			$m = "select";
 			next if $only_dep;
@@ -247,7 +256,7 @@ sub mconf_depends {
 	}
 
 	foreach my $tdep (@t_depends) {
-		mconf_depends($pkgname, $tdep->[0], 1, $dep, $seen, $tdep->[1]);
+		mconf_depends($pkgname, $tdep->[0], 1, $dep, $seen, $tdep->[1], $tdep->[2]);
 	}
 
 	foreach my $depend (sort keys %$dep) {
