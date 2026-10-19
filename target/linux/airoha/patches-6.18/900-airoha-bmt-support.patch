@@ -29,7 +29,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  obj-$(CONFIG_MTD_NAND_QCOM) += qpic_common.o
 --- /dev/null
 +++ b/drivers/mtd/nand/airoha_bmt.c
-@@ -0,0 +1,910 @@
+@@ -0,0 +1,917 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Airoha NAND Bad Block Management Table driver
@@ -506,16 +506,16 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 + */
 +static int airoha_erase_metadata(int block)
 +{
-+	u8 check[sizeof(struct airoha_bmt_table)];
++	u8 *check = bmtd.data_buf;
 +	int i, ret;
 +
 +	ret = bbt_nand_erase(block);
 +	if (ret)
 +		return ret;
-+	ret = airoha_read_data(block, check, sizeof(check));
++	ret = airoha_read_data(block, check, sizeof(struct airoha_bmt_table));
 +	if (ret)
 +		return ret;
-+	for (i = 0; i < sizeof(check); i++)
++	for (i = 0; i < sizeof(struct airoha_bmt_table); i++)
 +		if (check[i] != 0xff)
 +			return -EIO;
 +	return 0;
@@ -564,7 +564,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +static int airoha_commit_table(const void *table, size_t len, size_t sig_len,
 +			       int *current_block, bool from_end)
 +{
-+	u8 check[sizeof(struct airoha_bmt_table)];
++	u8 *check = bmtd.data_buf;
 +	int block, ret;
 +	u16 index;
 +
@@ -778,13 +778,15 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +
 +static void airoha_unmap_block(u16 block)
 +{
-+	struct airoha_bmt_table saved;
++	struct airoha_bmt_header header;
++	struct airoha_bmt_entry saved;
 +	int idx = bmt_find_by_bad(block);
 +
 +	if (idx < 0)
 +		return;
 +
-+	saved = *ctx.bmt;
++	header = ctx.bmt->header;
++	saved = ctx.bmt->entries[idx];
 +	ctx.bmt->header.mapped_count--;
 +	memmove(&ctx.bmt->entries[idx],
 +		&ctx.bmt->entries[idx + 1],
@@ -792,8 +794,13 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +		sizeof(ctx.bmt->entries[0]));
 +	memset(&ctx.bmt->entries[ctx.bmt->header.mapped_count], 0,
 +	       sizeof(ctx.bmt->entries[0]));
-+	if (airoha_save_bmt())
-+		*ctx.bmt = saved;
++	if (airoha_save_bmt()) {
++		memmove(&ctx.bmt->entries[idx + 1], &ctx.bmt->entries[idx],
++			(ctx.bmt->header.mapped_count - idx) *
++			sizeof(ctx.bmt->entries[0]));
++		ctx.bmt->entries[idx] = saved;
++		ctx.bmt->header = header;
++	}
 +}
 +
 +static int airoha_debug(void *data, u64 val)
