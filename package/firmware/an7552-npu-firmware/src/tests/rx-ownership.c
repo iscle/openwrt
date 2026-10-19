@@ -16,17 +16,18 @@ static uint32_t read32(uint32_t address)
 		return 0;
 	return *(volatile uint32_t *)(uintptr_t)address;
 }
-static uint32_t packet_word(volatile uint8_t *p)
-{
-	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-	       ((uint32_t)p[3] << 24);
-}
 #include "../pn.c.inc"
 #include "../rx-security.c.inc"
 #include "../rx-parse.h"
 #include "../station.c.inc"
 #include "../rro.c.inc"
 #include "../ppe.c.inc"
+static void seed_state(uint32_t token, uint32_t state)
+{
+	rx_words(AN7552_RX_STATE_HOST)[token] = state;
+	st_set(token, state);
+}
+
 static void map(uint32_t address, size_t length)
 {
 	assert(mmap((void *)(uintptr_t)address, length, PROT_READ | PROT_WRITE,
@@ -62,10 +63,11 @@ int main(void)
 	q[22] = AN7552_RX_BUFFER_COUNT - 1;
 	*rx_words(q[18]) = AN7552_RX_RING_COUNT - 2;
 	free_ids = rx_words(AN7552_RX_FREE_HOST);
-	states = rx_words(AN7552_RX_STATE_HOST);
+	(void)states;
+	assert(mmap((void *)(uintptr_t)RX_STATE_SRAM, 0x3000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void *)(uintptr_t)RX_STATE_SRAM);
 	for (uint32_t i = 0; i < AN7552_RX_BUFFER_COUNT; i++)
 		free_ids[i] = i;
-	states[0] = 1;
+	seed_state(0, 1);
 	for (uint32_t band = 0; band < 2; band++) {
 		data = (void *)(uintptr_t)(AN7552_NPU_BASE +
 					   AN7552_RX_DATA_CONTROL + band * 64);
@@ -94,14 +96,14 @@ int main(void)
 	assert(!q[6] && q[7] == 1 && q[2] == 1 && q[16] == 1);
 	assert(!memcmp((void *)packet, (void *)rx_words(0x89200000), 64));
 	assert((rx_words(q[0])[2] >> 16) == 1234);
-	assert(states[0] == 0 && free_ids[0] == 0 && q[21] == 1 &&
+	assert(st_get(0) == 0 && free_ids[0] == 0 && q[21] == 1 &&
 	       q[22] == AN7552_RX_BUFFER_COUNT);
 	assert(read32(0x1ec0d1a8) == 1);
 	native_rro_receive();
 	assert(q[7] == 1);
 	*(volatile uint32_t *)(uintptr_t)0x200d450c = 1;
 	native_rro_receive();
-	assert(states[1] == 1 && q[20] == 2);
+	assert(st_get(1) == 1 && q[20] == 2);
 	assert(rx_words(AN7552_RX_DATA_RING_HOST +
 			(AN7552_RX_RING_COUNT - 1) * 16)[0] ==
 	       AN7552_RX_BUFFER_HOST + 2048);
@@ -113,7 +115,7 @@ int main(void)
 	volatile uint32_t *ppe = (void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
 	ppe[0] = 2;
 	rx_words(0x842f0000)[1] = 0x80000000;
-	states[42] = 2;
+	seed_state(42, 2);
 	/* The legacy untagged mode must not submit a packet. */
 	assert(!native_ppe_submit(42, AN7552_RX_BUFFER_HOST + 42 * 2048, 64));
 	assert(!ppe[12] && !ppe[1]);
@@ -137,14 +139,14 @@ int main(void)
 	*(volatile uint32_t *)(uintptr_t)0x1fb50fe0 = 0xbf00002a;
 	*(volatile uint32_t *)(uintptr_t)0x1fb50fdc = 0x000f0005;
 	native_ppe_service();
-	assert(!ppe[3] && !ppe[12] && ppe[15] == 1 && !states[42]);
+	assert(!ppe[3] && !ppe[12] && ppe[15] == 1 && !st_get(42));
 	assert(rx_words(0x842f9000)[2] == 0x200f0005);
 	assert(*(volatile uint8_t *)rx_words(0x89200000) == 7);
-	states[43] = 2;
+	seed_state(43, 2);
 	ppe[12] = 1;
 	*(volatile uint32_t *)(uintptr_t)0x1fb50fe0 = 0xc000002b;
 	native_ppe_service();
-	assert(!ppe[3] && !ppe[12] && ppe[14] == 1 && !states[43]);
+	assert(!ppe[3] && !ppe[12] && ppe[14] == 1 && !st_get(43));
 	*(volatile uint32_t *)(uintptr_t)0x1fb50fe0 = 0xc000002b;
 	native_ppe_service();
 	assert(ppe[3] == 4);
@@ -157,7 +159,7 @@ int main(void)
 	ppe[10] = 0;
 	ppe[12] = 0;
 	rx_words(0x842f0000)[1] = 0x80000000;
-	states[42] = 2;
+	seed_state(42, 2);
 	q[22] = AN7552_RX_BUFFER_COUNT - 1;
 	q[2] = 0;
 	data[2] = 0;
@@ -191,10 +193,10 @@ int main(void)
 	*(volatile uint32_t *)(uintptr_t)0x1fb50fe0 = 0xbf00002a;
 	*rx_words(q[18]) = 0;
 	native_ppe_service();
-	assert(ppe[12] == 1 && states[42] == 2 && rx_domain(42)->active);
+	assert(ppe[12] == 1 && st_get(42) == 2 && rx_domain(42)->active);
 	*rx_words(q[18]) = AN7552_RX_RING_COUNT - 2;
 	native_ppe_service();
-	assert(!ppe[12] && !states[42] && !rx_domain(42)->active);
+	assert(!ppe[12] && !st_get(42) && !rx_domain(42)->active);
 	assert(!memcmp((void *)packet, original, sizeof(original)));
 	assert(!memcmp((void *)rx_words(0x89200000), original,
 		       sizeof(original)));
@@ -218,7 +220,7 @@ int main(void)
 		volatile uint32_t *words;
 		uint32_t address = AN7552_RX_BUFFER_HOST + i * 2048;
 
-		states[i] = 1;
+		seed_state(i, 1);
 		ring[i * 4] = address;
 		ring[i * 4 + 1] = (96U << 16) | (i ? 1U << 30 : 0);
 		ring[i * 4 + 2] = (AN7552_RX_TOKEN_BASE + i) << 16;

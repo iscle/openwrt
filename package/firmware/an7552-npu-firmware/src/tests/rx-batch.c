@@ -30,11 +30,6 @@ static uint32_t read32(uint32_t address)
 	return *(volatile uint32_t *)(uintptr_t)address;
 }
 
-static uint32_t packet_word(volatile uint8_t *p)
-{
-	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
-	       (uint32_t)p[3] << 24;
-}
 
 #include "../pn.c.inc"
 #include "../rx-security.c.inc"
@@ -56,12 +51,19 @@ static int checked_station_rx_authorized(volatile uint32_t *entry,
 #define station_rx_authorized checked_station_rx_authorized
 #include "../rro.c.inc"
 #include "../ppe.c.inc"
+static void seed_state(uint32_t token, uint32_t state)
+{
+	rx_words(AN7552_RX_STATE_HOST)[token] = state;
+	st_set(token, state);
+}
+
 
 static const struct {
 	uint32_t address;
 	size_t length;
 } regions[] = {
 	{ AN7552_NPU_BASE, 4096 },
+	{ RX_STATE_SRAM, 0x3000 },
 	{ 0x44110000, 0xa0000 },
 	{ 0x441b0000, 0x60000 },
 	{ 0x44300000, 0x100000 },
@@ -157,7 +159,7 @@ static void packet(uint32_t token, int fragment)
 	ring[1] = (160U << 16) | (1U << 30);
 	ring[2] = (AN7552_RX_TOKEN_BASE + token) << 16;
 	ring[3] = 0;
-	rx_words(AN7552_RX_STATE_HOST)[token] = 1;
+	seed_state(token, 1);
 }
 
 static void test_revocation(void)
@@ -169,7 +171,7 @@ static void test_revocation(void)
 	assert(!*rx_words(AN7552_STATION_HOST + 64));
 	assert(!ppe_control()[1] && !ppe_control()[12]);
 	assert(control()[2] == 1 && control()[7] == 1);
-	assert(!control()[6] && !rx_words(AN7552_RX_STATE_HOST)[0]);
+	assert(!control()[6] && !st_get(0));
 }
 
 static void assert_ordered_delivery(void)
@@ -179,8 +181,8 @@ static void assert_ordered_delivery(void)
 	assert(!ppe_control()[12] && !ppe_control()[3] && !control()[6]);
 	assert(rx_words(0x89200000)[12] == 1);
 	assert(rx_words(0x89200100)[12] == 2);
-	assert(!rx_words(AN7552_RX_STATE_HOST)[0]);
-	assert(!rx_words(AN7552_RX_STATE_HOST)[1]);
+	assert(!st_get(0));
+	assert(!st_get(1));
 	/* Retries must reuse saved security checks, not reject the same PN. */
 	assert((rx_words(0x842f9000)[0] & 15) == 1);
 	assert((rx_words(0x842f9010)[0] & 15) == 1);
@@ -198,8 +200,8 @@ static void test_ordering(int delayed, int host_full)
 	if (delayed || host_full) {
 		assert(!control()[2] && control()[16] == 1);
 		assert(ppe_control()[12] == 1);
-		assert((rx_words(AN7552_RX_STATE_HOST)[0] & 255) == 2);
-		assert((rx_words(AN7552_RX_STATE_HOST)[1] & 255) == 1);
+		assert((st_get(0) & 255) == 2);
+		assert((st_get(1) & 255) == 1);
 		/* No progress must remain bounded and leave both buffers owned. */
 		native_rro_receive();
 		assert(!control()[2] && ppe_control()[12] == 1);

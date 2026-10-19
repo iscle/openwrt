@@ -23,7 +23,7 @@ all: build/an7552.bin
 build:
 	mkdir -p $@
 
-build/%.o: %.c protocol.h firmware-abi.h native-tx.c.inc station.c.inc txfree.c.inc rro.c.inc ppe.c.inc pn.c.inc pn-domain.c.inc rx-security.c.inc rx-parse.h tx-priority.h ppe-domain.h | build
+build/%.o: %.c protocol.h firmware-abi.h native-tx.c.inc station.c.inc txfree.c.inc rro.c.inc ppe.c.inc pn.c.inc pn-domain.c.inc rx-security.c.inc rx-parse.h tx-priority.h ppe-domain.h pkt-view.h tx-pool.c.inc tdma.c.inc upsplit.c.inc | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 build/start.o: start.S firmware-abi.h | build
@@ -39,10 +39,10 @@ build/an7552.bin: build/an7552.elf
 .PHONY: all
 
 HOSTCC ?= cc
-TESTS := ppe-domain forward-drain mlo-forward pn pn-domain pn-mlo rx-batch rx-ownership rx-parse station-frame txfree tx-priority
+TESTS := up-sync pn-cache pkt-view up-pipe up-split tx-pool ppe-domain forward-drain mlo-forward pn pn-domain pn-mlo rx-batch rx-ownership rx-parse station-frame txfree tx-priority
 
 build/test-%: tests/%.c $(wildcard *.h *.c.inc) | build
-	$(HOSTCC) -O2 -Wall -Wextra -Werror $< -o $@
+	$(HOSTCC) -pthread -O2 -Wall -Wextra -Werror $< -o $@
 
 check: $(addprefix build/test-,$(TESTS))
 	@set -e; for test in $^; do $$test; done

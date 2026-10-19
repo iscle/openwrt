@@ -38,7 +38,7 @@ static int txfree_walk(volatile uint8_t *packet, uint32_t length,
 			continue;
 		for (uint32_t i = 0; i < 2; i++) {
 			uint32_t token = (info >> (15 * i)) & 32767;
-			volatile uint32_t *work;
+
 
 			if (token == 32767)
 				continue;
@@ -50,12 +50,8 @@ static int txfree_walk(volatile uint8_t *packet, uint32_t length,
 				control[9]++;
 				continue;
 			}
-			work = (void *)(uintptr_t)(AN7552_FORWARD_WORK_NPU +
-						   token * 16);
-			if (work[0] != 2)
+			if (tx_pool_complete(token))
 				return 5;
-			barrier();
-			work[0] = 3;
 			control[8]++;
 		}
 	}
@@ -70,6 +66,8 @@ static void native_txfree(uint32_t band)
 	volatile uint32_t *descriptor, *host;
 	volatile uint8_t *packet, *destination;
 	uint32_t index, producer, info, length, result, address, capacity;
+	uint32_t event[512];
+	uint8_t *snapshot = (void *)event;
 	uint32_t hardware = AN7552_TXFREE_RING_HOST + band * 0x2000;
 
 	if (!q[4]) {
@@ -107,20 +105,29 @@ static void native_txfree(uint32_t band)
 		return;
 	}
 	packet = (void *)(uintptr_t)((address & 0x3fffffff) | 0x40000000);
-	result = txfree_walk(packet, length, q, 0);
+	for (uint32_t i = 0; i < length / 4; i++)
+		event[i] = ((volatile uint32_t *)packet)[i];
+	for (uint32_t i = length & ~3U; i < length; i++)
+		snapshot[i] = packet[i];
+	result = txfree_walk(snapshot, length, q, 0);
 	if (!result)
-		result = txfree_walk(packet, length, q, 1);
+		result = txfree_walk(snapshot, length, q, 1);
 	if (result) {
 		q[6] = result;
 		return;
 	}
 	/* Preserve host completions and station statistics for the normal driver. */
 	destination = (void *)(uintptr_t)((host[0] & 0x3fffffff) | 0x40000000);
-	for (uint32_t i = 0; i < length; i++)
-		destination[i] = packet[i];
+	uint32_t copied = 0;
+	if (!((uintptr_t)destination & 3))
+		for (; copied + 4 <= length; copied += 4)
+			*(volatile uint32_t *)(destination + copied) = event[copied / 4];
+	for (; copied < length; copied++)
+		destination[copied] = snapshot[copied];
 	host[3] = descriptor[3];
 	barrier();
 	host[1] = info;
+	tx_pool_publish(tx_pool());
 	q[7]++;
 	barrier();
 	q[2] = (producer + 1) % q[1];

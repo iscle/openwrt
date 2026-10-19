@@ -21,6 +21,10 @@ buffer ownership, station frame validation, transmit completion parsing and
 draining pending packets while radio queues are unavailable, per-packet MLO
 routing, cross-radio token completion and priority classification.
 They use Linux virtual-memory mappings to simulate the reserved workspace.
+The split-path test models two cores, radio, PPE and Linux with a seeded
+scheduler and reordered stores. Packet-view tests use a protected guard page.
+PN caches are batch-local and write through every accepted counter before
+packet publication; SRAM ownership state reloads from Linux at each start.
 
 ## Interface
 
@@ -30,25 +34,33 @@ and each core's runtime ABI announcement before enabling packet queues.
 `protocol.h` defines the shared-memory regions and queue sizes. The device
 tree must reserve the firmware workspace and packet buffers before boot.
 
-Core 0 submits Wi-Fi transmit descriptors and processes transmit completion.
-Core 1 processes receive reordering, replay checks and Ethernet PPE input.
+Core 0 handles transmit completion, fused Ethernet-to-Wi-Fi download and the
+receive front end (descriptor snapshots, replay checks and classification).
+Core 1 consumes a bounded 64-record receive queue, rechecks full key cookies
+and station identity, and owns PPE submission, completion and Linux delivery.
+Host PN commands pause the back end before modifying or exporting replay state.
+Station updates quiesce both cores, including an overlapping receive stop.
 Queue enable/active handshakes transfer ownership between Linux and the
 firmware. A separate park handshake stops both cores before driver teardown
 or a new firmware load. Cross-core state publication uses RISC-V fences.
 
 The recovery protocol uses fenced trap acknowledgments and per-core readiness for a recovery
-interrupt. The host detects exceptions or a stalled heartbeat. If normal
+interrupt. The host detects exceptions, sticky queue faults or a stalled heartbeat. If normal
 parking times out, NPU timer 0 interrupts both cores; the host still requires
 both park acknowledgments before stopping DMA and reusing buffers. A stalled
 interconnect transaction can prevent this handshake, in which case recovery
-retains the buffers and leaves acceleration stopped. Timer 0 is inside the
+retains the buffers and leaves acceleration stopped. Destructive removal must
+prove quiescence; if it cannot, it panics before reclaiming DMA-backed memory.
+Timed software panic reboot is disabled for this path; an external watchdog
+can still reset the system. Timer 0 is inside the
 existing NPU register aperture; no additional timer driver is involved.
 
 Transmit routing uses host-published DSCP maps and MLO transmit routes. Core 0 selects
 an eligible link for each packet using the driver's current TID parity policy.
 Both endpoints must retain the same peer identity and the selected BSS/radio;
-revoked or reused station identifiers cannot supply a route. Tokens retain
-their original TDMA pool identity when the destination radio changes.
+revoked or reused station identifiers cannot supply a route. A packet-buffer pool decouples TDMA descriptor reuse from radio completion;
+completion on either radio releases the original token and buffer exactly once.
+Per-radio caps preserve the host's token reservation and MLO routing limits.
 
 Replay protection uses generation-tagged replay domains shared by a peer's MLO links.
 Each link retains separate descriptor cookies, and A-MSDU continuation state
