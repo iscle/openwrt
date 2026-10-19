@@ -29,7 +29,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  obj-$(CONFIG_MTD_NAND_QCOM) += qpic_common.o
 --- /dev/null
 +++ b/drivers/mtd/nand/airoha_bmt.c
-@@ -0,0 +1,825 @@
+@@ -0,0 +1,898 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Airoha NAND Bad Block Management Table driver
@@ -65,6 +65,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 + */
 +
 +#include <linux/kernel.h>
++#include <linux/panic.h>
 +#include <linux/slab.h>
 +#include <linux/string.h>
 +#include "mtk_bmt.h"
@@ -155,7 +156,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 + * block previously marked runtime-bad is not re-used as a remap
 + * target (the stock _block_isbad only consults oob[0]).
 + */
-+static bool airoha_isbad_any(int block)
++static int airoha_bad_markers(int block)
 +{
 +	u8 fdm[2] = { 0xff, 0xff };
 +	struct mtd_oob_ops ops = {
@@ -168,8 +169,15 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +
 +	ret = bmtd._read_oob(bmtd.mtd, block_addr(block), &ops);
 +	if (ret < 0 && !mtd_is_bitflip(ret))
-+		return true;
++		return ret;
++	if (ops.oobretlen != sizeof(fdm))
++		return -EIO;
 +	return fdm[0] != 0xff || fdm[1] != 0xff;
++}
++
++static bool airoha_isbad_any(int block)
++{
++	return airoha_bad_markers(block) != 0;
 +}
 +
 +/* Byte-0 only (factory bad-block marker). oob_offset is not applied:
@@ -231,10 +239,16 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +
 +static int airoha_read_data(int block, void *buf, size_t len)
 +{
-+	u8 fdm[8];
-+	u32 page = (u32)block << (bmtd.blk_shift - bmtd.pg_shift);
++	struct mtd_oob_ops ops = {
++		.mode = MTD_OPS_PLACE_OOB,
++		.datbuf = buf,
++		.len = len,
++	};
++	int ret = bmtd._read_oob(bmtd.mtd, block_addr(block), &ops);
 +
-+	return bbt_nand_read(page, buf, (int)len, fdm, sizeof(fdm));
++	if (ret < 0 && !mtd_is_bitflip(ret))
++		return ret;
++	return ops.retlen == len ? 0 : -EIO;
 +}
 +
 +static int airoha_write_data(int block, const void *buf, size_t len)
@@ -269,6 +283,8 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	if (ret < 0 && !mtd_is_bitflip(ret))
 +		return ret;
 +
++	if (ops.oobretlen != sizeof(fdm))
++		return -EIO;
 +	*bad_idx = (u16)fdm[AIROHA_OOB_BADIDX_OFFSET] |
 +		   ((u16)fdm[AIROHA_OOB_BADIDX_OFFSET + 1] << 8);
 +	return 0;
@@ -484,82 +500,115 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	return -ENOENT;
 +}
 +
-+static int airoha_save_bmt(void)
++/* Preserve the stock format and its scan order. A spare is verified before
++ * retiring the current table. Power loss can leave two complete copies; remove
++ * those stale copies before a later commit can make them authoritative again.
++ */
++static int airoha_erase_metadata(int block)
 +{
++	u8 check[sizeof(struct airoha_bmt_table)];
++	int i, ret;
++
++	ret = bbt_nand_erase(block);
++	if (ret)
++		return ret;
++	ret = airoha_read_data(block, check, sizeof(check));
++	if (ret)
++		return ret;
++	for (i = 0; i < sizeof(check); i++)
++		if (check[i] != 0xff)
++			return -EIO;
++	return 0;
++}
++
++static void airoha_metadata_ambiguous(void)
++{
++	/* Returning could let a retry overwrite data selected after reboot. */
++	panic_timeout = 0;
++	panic("airoha-bmt: ambiguous metadata commit");
++}
++
++static int airoha_clear_stale_metadata(const void *table, size_t sig_len)
++{
++	u8 signature[AIROHA_BBT_SIG_LEN];
++	int block, ret;
++	u16 index;
++
++	for (block = ctx.system_blks; block < ctx.total_blks; block++) {
++		if (block == ctx.bmt_block || block == ctx.bbt_block ||
++		    bmt_find_by_mapped(block) >= 0)
++			continue;
++		ret = airoha_bad_markers(block);
++		if (ret < 0)
++			return ret;
++		if (ret)
++			continue;
++		ret = airoha_read_oob_idx(block, &index);
++		if (ret)
++			return ret;
++		/* A remapped data page can contain any signature. */
++		if (index != 0xffff)
++			continue;
++		ret = airoha_read_data(block, signature, sig_len);
++		if (ret)
++			return ret;
++		if (memcmp(signature, table, sig_len))
++			continue;
++		ret = airoha_erase_metadata(block);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int airoha_commit_table(const void *table, size_t len, size_t sig_len,
++			       int *current, bool from_end)
++{
++	u8 check[sizeof(struct airoha_bmt_table)];
 +	int block, ret;
 +
++	ret = airoha_clear_stale_metadata(table, sig_len);
++	if (ret)
++		return ret;
++	block = find_available_pool_block(from_end);
++	if (block < 0)
++		return -ENOSPC;
++	ret = airoha_write_data(block, table, len);
++	if (!ret)
++		ret = airoha_read_data(block, check, len);
++	if (!ret && memcmp(table, check, len))
++		ret = -EIO;
++	if (ret) {
++		/* Even a failed program may have left a valid, preferred table. */
++		if (airoha_erase_metadata(block))
++			airoha_metadata_ambiguous();
++		return ret;
++	}
++	/* Both snapshots are durable here. Do not roll back after beginning
++	 * retirement: the old erase may have succeeded despite an error.
++	 */
++	if (*current >= 0 && airoha_erase_metadata(*current))
++		airoha_metadata_ambiguous();
++	*current = block;
++	return 0;
++}
++
++static int airoha_save_bmt(void)
++{
 +	memcpy(ctx.bmt->header.signature, AIROHA_BMT_SIG, AIROHA_BMT_SIG_LEN);
 +	ctx.bmt->header.version = AIROHA_BMT_VERSION;
 +	ctx.bmt->header.checksum = bmt_calc_checksum(ctx.bmt);
-+
-+	if (ctx.bmt_block < 0) {
-+		ctx.bmt_block = find_available_pool_block(true);
-+		if (ctx.bmt_block < 0)
-+			return -ENOSPC;
-+	}
-+
-+	block = ctx.bmt_block;
-+retry:
-+	if (bbt_nand_erase(block)) {
-+		airoha_markbad(block);
-+		block = find_available_pool_block(true);
-+		if (block < 0)
-+			return -ENOSPC;
-+		ctx.bmt_block = block;
-+		goto retry;
-+	}
-+
-+	ret = airoha_write_data(block, ctx.bmt, sizeof(*ctx.bmt));
-+	if (ret) {
-+		airoha_markbad(block);
-+		block = find_available_pool_block(true);
-+		if (block < 0)
-+			return -ENOSPC;
-+		ctx.bmt_block = block;
-+		goto retry;
-+	}
-+
-+	pr_info("airoha-bmt: BMT written to block %d\n", ctx.bmt_block);
-+	return 0;
++	return airoha_commit_table(ctx.bmt, sizeof(*ctx.bmt), AIROHA_BMT_SIG_LEN,
++				   &ctx.bmt_block, true);
 +}
 +
 +static int airoha_save_bbt(void)
 +{
-+	int block, ret;
-+
 +	memcpy(ctx.bbt->header.signature, AIROHA_BBT_SIG, AIROHA_BBT_SIG_LEN);
 +	ctx.bbt->header.version = AIROHA_BBT_VERSION;
 +	ctx.bbt->header.checksum = cpu_to_le32(bbt_calc_checksum(ctx.bbt));
-+
-+	if (ctx.bbt_block < 0) {
-+		ctx.bbt_block = find_available_pool_block(false);
-+		if (ctx.bbt_block < 0)
-+			return -ENOSPC;
-+	}
-+
-+	block = ctx.bbt_block;
-+retry:
-+	if (bbt_nand_erase(block)) {
-+		airoha_markbad(block);
-+		block = find_available_pool_block(false);
-+		if (block < 0)
-+			return -ENOSPC;
-+		ctx.bbt_block = block;
-+		goto retry;
-+	}
-+
-+	ret = airoha_write_data(block, ctx.bbt, sizeof(*ctx.bbt));
-+	if (ret) {
-+		airoha_markbad(block);
-+		block = find_available_pool_block(false);
-+		if (block < 0)
-+			return -ENOSPC;
-+		ctx.bbt_block = block;
-+		goto retry;
-+	}
-+
-+	pr_info("airoha-bmt: BBT written to block %d\n", ctx.bbt_block);
-+	return 0;
++	return airoha_commit_table(ctx.bbt, sizeof(*ctx.bbt), AIROHA_BBT_SIG_LEN,
++				   &ctx.bbt_block, false);
 +}
 +
 +/* -------- Reconstruction --------
@@ -656,8 +705,10 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +
 +static bool airoha_remap_block(u16 block, u16 mapped_block, int copy_len)
 +{
++	struct airoha_bmt_entry saved;
 +	int new_block, idx;
 +	u16 orig_bad;
++	u8 saved_count;
 +
 +	new_block = find_available_pool_block(false);
 +	if (new_block < 0) {
@@ -665,9 +716,11 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +		return false;
 +	}
 +
-+	if (copy_len > 0)
-+		bbt_nand_copy(new_block, mapped_block, copy_len);
++	/* A partial copy must never replace the only readable source. */
++	if (copy_len > 0 && bbt_nand_copy(new_block, mapped_block, copy_len))
++		return false;
 +
++	saved_count = ctx.bmt->header.mapped_count;
 +	idx = bmt_find_by_mapped(mapped_block);
 +	if (idx >= 0) {
 +		/* `mapped_block` was already a pool replacement for an earlier
@@ -677,6 +730,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +		 * existing BMT entry's mapped_index to the new replacement.
 +		 */
 +		orig_bad = le16_to_cpu(ctx.bmt->entries[idx].bad_index);
++		saved = ctx.bmt->entries[idx];
 +		ctx.bmt->entries[idx].mapped_index = cpu_to_le16((u16)new_block);
 +	} else {
 +		if (ctx.bmt->header.mapped_count >= AIROHA_MAX_BMT_ENTRIES) {
@@ -684,25 +738,26 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +			return false;
 +		}
 +		idx = ctx.bmt->header.mapped_count++;
++		saved = ctx.bmt->entries[idx];
 +		orig_bad = mapped_block;
 +		ctx.bmt->entries[idx].bad_index    = cpu_to_le16(mapped_block);
 +		ctx.bmt->entries[idx].mapped_index = cpu_to_le16((u16)new_block);
 +	}
 +
-+	airoha_write_oob_idx(new_block, orig_bad);
-+	/* Match ATF update_bmt(): mark the failing block with the marker
-+	 * appropriate for its area (raw for system, GENERATE_LATER for
-+	 * pool).  airoha_markbad() picks the right marker based on the
-+	 * block index; using the standard SPI-NAND _block_markbad here
-+	 * would clear BOTH oob[0] and oob[1] and silently drift pool_size
-+	 * on every boot.
++	/* Publish only after the complete replacement and recovery index exist.
++	 * Until persistence succeeds, callers must keep using the old mapping.
 +	 */
-+	airoha_markbad(mapped_block);
-+
-+	if (airoha_save_bmt()) {
-+		pr_err("airoha-bmt: failed to persist BMT\n");
++	if (airoha_write_oob_idx(new_block, orig_bad) || airoha_save_bmt()) {
++		ctx.bmt->entries[idx] = saved;
++		ctx.bmt->header.mapped_count = saved_count;
++		pr_err("airoha-bmt: replacement was not committed\n");
 +		return false;
 +	}
++	/* The durable table is authoritative even if marking the old block
++	 * fails. Do not roll back a successfully persisted replacement.
++	 */
++	if (airoha_markbad(mapped_block))
++		pr_err("airoha-bmt: cannot mark retired block %u bad\n", mapped_block);
 +
 +	pr_info("airoha-bmt: remapped block %u -> %d\n",
 +		mapped_block, new_block);
@@ -711,11 +766,13 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +
 +static void airoha_unmap_block(u16 block)
 +{
++	struct airoha_bmt_table saved;
 +	int idx = bmt_find_by_bad(block);
 +
 +	if (idx < 0)
 +		return;
 +
++	saved = *ctx.bmt;
 +	ctx.bmt->header.mapped_count--;
 +	memmove(&ctx.bmt->entries[idx],
 +		&ctx.bmt->entries[idx + 1],
@@ -723,7 +780,8 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +		sizeof(ctx.bmt->entries[0]));
 +	memset(&ctx.bmt->entries[ctx.bmt->header.mapped_count], 0,
 +	       sizeof(ctx.bmt->entries[0]));
-+	airoha_save_bmt();
++	if (airoha_save_bmt())
++		*ctx.bmt = saved;
 +}
 +
 +static int airoha_debug(void *data, u64 val)
@@ -780,10 +838,26 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +}
 +
 +/* -------- init -------- */
++/* Do not expose a translated device whose initial mapping cannot persist. */
++static int airoha_create_tables(void)
++{
++	int ret;
++
++	if (ctx.bmt_block < 0) {
++		ret = airoha_save_bmt();
++		if (ret)
++			return ret;
++	}
++	if (ctx.bbt_block < 0)
++		return airoha_save_bbt();
++	return 0;
++}
++
 +static int airoha_bmt_init(struct device_node *np)
 +{
 +	u32 pool_size = 0;
 +	size_t total_buf;
++	int ret;
 +
 +	ctx.total_blks  = bmtd.total_blks;
 +	ctx.bmt_block   = -1;
@@ -834,10 +908,9 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +	bmtd.mtd->size = (u64)ctx.logic_blks << bmtd.blk_shift;
 +	bmtd.bmt_pgs = DIV_ROUND_UP(sizeof(*ctx.bmt), bmtd.pg_size);
 +
-+	if (ctx.bmt_block < 0)
-+		airoha_save_bmt();
-+	if (ctx.bbt_block < 0)
-+		airoha_save_bbt();
++	ret = airoha_create_tables();
++	if (ret)
++		return ret;
 +
 +	pr_info("airoha-bmt: total=%u system=%u pool=%u logic=%u BBT@%d BMT@%d\n",
 +		ctx.total_blks, ctx.system_blks, ctx.pool_blks, ctx.logic_blks,
@@ -857,6 +930,19 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +};
 --- a/drivers/mtd/nand/mtk_bmt.c
 +++ b/drivers/mtd/nand/mtk_bmt.c
+@@ -289,6 +289,12 @@ mtk_bmt_block_markbad(struct mtd_info *mtd, loff_t ofs)
+ 	if (block < 0)
+ 		return -EIO;
+ 
++	/* Airoha must preserve the distinction between factory and runtime
++	 * pool markers. Its remapper already retires the old block safely.
++	 */
++	if (bmtd.ops == &airoha_bmt_ops)
++		return mtk_bmt_remap_block(orig_block, block, bmtd.blk_size) ? 0 : -EIO;
++
+ 	mtk_bmt_remap_block(orig_block, block, bmtd.blk_size);
+ 
+ 	return bmtd._block_markbad(mtd, (loff_t)block << bmtd.blk_shift);
 @@ -421,6 +421,8 @@ int mtk_bmt_attach(struct mtd_info *mtd)
  		bmtd.ops = &mtk_bmt_nmbm_ops;
  	else if (of_property_read_bool(np, "mediatek,bbt"))
