@@ -20,21 +20,25 @@ platform_check_image() {
 xiaomi_be5000_do_upgrade() {
 	local ubidev
 
+	# Old kernels do not expose the new UBI partition. Boot the new
+	# initramfs before migrating; never write an image we cannot provision.
+	[ -n "$(find_mtd_index ubi)" ] || {
+		echo "Boot the new initramfs before migrating to the UBI layout." >&2
+		return 1
+	}
+	# An explicit upgrade may initialize the overlay partition. Normal
+	# preinit only attempts attachment and never formats on an error.
+	ubidev="$(nand_attach_ubi ubi)" || return 1
+	[ -n "$ubidev" ] || return 1
+
 	get_image "$1" | mtd write - "$PART_NAME" || return 1
 
-	ubidev="$(nand_find_ubi ubi)"
-	if [ -z "$ubidev" ]; then
-		# Not attached: preinit of the new image formats the partition
-		v "no UBI on the ubi partition, the overlay starts empty"
-		return 0
-	fi
-
 	[ -n "$(nand_find_volume "$ubidev" rootfs_data)" ] && \
-		ubirmvol "/dev/$ubidev" -N rootfs_data
+		{ ubirmvol "/dev/$ubidev" -N rootfs_data || return 1; }
 	ubimkvol "/dev/$ubidev" -N rootfs_data -m || return 1
 
 	if [ -n "$UPGRADE_BACKUP" ]; then
-		CI_UBIPART=ubi nand_restore_config "$UPGRADE_BACKUP"
+		CI_UBIPART=ubi nand_restore_config "$UPGRADE_BACKUP" || return 1
 	fi
 	return 0
 }

@@ -196,7 +196,6 @@ static void check_forward(uint32_t fast, uint32_t wcid,
 #include "../pn.c.inc"
 #include "../rx-security.c.inc"
 #include "../rx-parse.h"
-#define RX_HEADER_ALIAS(host) ((volatile uint8_t *)rx_words(host))
 #include "../rro.c.inc"
 #include "../ppe.c.inc"
 #include "../upsplit.c.inc"

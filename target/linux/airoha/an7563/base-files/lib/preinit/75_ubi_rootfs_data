@@ -2,7 +2,7 @@
 
 # JFFS2 on the SPI-NAND of the Xiaomi BE5000 corrupts pages it programs
 # twice (cleanmarker in OOB, then data), so the overlay lives in a UBI
-# volume. Format the "ubi" partition if it holds no UBI yet and create
+# volume. Attach an existing or blank "ubi" partition and create
 # the rootfs_data volume, with its /dev node, before mount_root looks
 # for it. An initramfs may run on a factory layout, where formatting
 # would destroy stock data: leave the flash alone there.
@@ -23,9 +23,12 @@ ubi_rootfs_data() {
 
 	ubidev="$(nand_find_ubi ubi)"
 	if [ -z "$ubidev" ]; then
-		echo "- formatting UBI on mtd$mtdnum -"
-		ubiformat "/dev/mtd$mtdnum" -y -q || return 0
-		ubiattach -m "$mtdnum" >/dev/null || return 0
+		# A failed attachment does not mean the existing data is disposable.
+		# Formatting is reserved for an explicit sysupgrade operation.
+		ubiattach -m "$mtdnum" >/dev/null || {
+			echo "Cannot attach UBI on mtd$mtdnum; preserving flash." >&2
+			return 1
+		}
 		ubidev="$(nand_find_ubi ubi)"
 		[ -n "$ubidev" ] || return 0
 	fi
