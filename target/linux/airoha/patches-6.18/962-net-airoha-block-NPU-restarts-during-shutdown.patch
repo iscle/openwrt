@@ -1,0 +1,634 @@
+Subject: [PATCH] net: airoha: close NPU setup admission before shutdown
+
+A radio reset worker can otherwise restart the NPU and TDMA after the
+supplier shutdown callback proved quiescence. Serialize terminal shutdown
+with every restart-capable public API without sleeping in atomic setup
+callers. Retain the closed state across full recovery and reattachment.
+
+---
+--- a/drivers/net/ethernet/airoha/an7552_npu.c
++++ b/drivers/net/ethernet/airoha/an7552_npu.c
+@@ -13,16 +13,17 @@
+ #include <linux/of_platform.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/platform_device.h>
+ #include <linux/panic.h>
+ #include <linux/seq_file.h>
+ #include <linux/spinlock.h>
+ #include <linux/soc/airoha/an7552_npu.h>
+ #include <linux/unaligned.h>
++#include <linux/wait.h>
+ #include "an7552_npu_fw.h"
+ 
+ #define CODE_BASE 0x84000000
+ #define CODE_SIZE 0x400000
+ #define PACKET_SIZE 0x1600000
+ #define BOOT_TRIGGER 0x306000
+ #define BOOT_CONFIG 0x306004
+ #define BOOT_PC(core) (0x306020 + (core) * 4)
+@@ -39,16 +40,24 @@
+ 	u32 band;
+ };
+ 
+ struct an7552_npu {
+ 	struct device *dev;
+ 	void __iomem *regs, *ram, *fe, *pool, *timer;
+ 	/* Serializes attachment, boot and teardown of the radio consumer. */
+ 	struct mutex attach_lock;
++	/* Setup can be entered under an mt76 queue spinlock. Shutdown closes
++	 * admission, waits for existing users, then proves DMA quiescence.
++	 */
++	spinlock_t setup_lock;
++	wait_queue_head_t setup_wait;
++	unsigned int setup_users;
++	bool shutdown;
++	bool shutdown_complete;
+ 	/* Serializes station table updates with the two-core quiesce handshake. */
+ 	spinlock_t station_lock;
+ 	/* Protects the shared replay command mailbox and staging buffer. */
+ 	spinlock_t pn_lock;
+ 	bool attached, running, failed, stopping, pn_failed;
+ 	bool ppe_enabled, tdma_enabled;
+ 	bool faulted, fault_quiesced;
+ 	bool pn_domains_initialized;
+@@ -70,16 +79,57 @@
+ 
+ 	void (*txfree_notify[2])(void *);
+ 	void *txfree_context[2];
+ 	struct an7552_npu_irq txfree_bands[2];
+ 	void (*rro_notify)(void *context);
+ 	void *rro_context;
+ 	struct dentry *debugfs;
+ };
++
++static bool an7552_npu_setup_enter(struct an7552_npu *ctx)
++{
++	unsigned long flags;
++	bool admitted;
++
++	spin_lock_irqsave(&ctx->setup_lock, flags);
++	admitted = !ctx->shutdown;
++	if (admitted)
++		ctx->setup_users++;
++	spin_unlock_irqrestore(&ctx->setup_lock, flags);
++	return admitted;
++}
++
++static void an7552_npu_setup_exit(struct an7552_npu *ctx)
++{
++	unsigned long flags;
++	bool idle;
++
++	spin_lock_irqsave(&ctx->setup_lock, flags);
++	idle = !--ctx->setup_users;
++	spin_unlock_irqrestore(&ctx->setup_lock, flags);
++	if (idle)
++		wake_up_all(&ctx->setup_wait);
++}
++
++/* Called in process context with attach_lock held. A stuck setup must
++ * never allow shutdown to continue into DDR reuse by the bootloader.
++ */
++static void an7552_npu_close_setup(struct an7552_npu *ctx)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ctx->setup_lock, flags);
++	ctx->shutdown = true;
++	spin_unlock_irqrestore(&ctx->setup_lock, flags);
++	wait_event(ctx->setup_wait, !READ_ONCE(ctx->setup_users));
++	/* Pair with the last exit's unlock even when wait_event did not sleep. */
++	spin_lock_irqsave(&ctx->setup_lock, flags);
++	spin_unlock_irqrestore(&ctx->setup_lock, flags);
++}
+ 
+ void an7552_npu_set_bridge(struct an7552_npu *ctx, bool enable)
+ {
+ 	/* Called before radio queues start; recovery retains this capability. */
+ 	ctx->bridge_domains = enable;
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_set_bridge);
+ 
+@@ -372,17 +422,17 @@
+ 	writel(1, q + 16);
+ 	an7552_npu_txfree_irq_enable(ctx, band);
+ 	dev_dbg(ctx->dev,
+ 		" own TXFREE band%u host=%08x hardware=%08x regs=%08x start=%u\n",
+ 		band, base, physical, regs, start);
+ 	return 0;
+ }
+ 
+-int an7552_npu_txfree_setup(struct an7552_npu *ctx, u32 band, u32 base,
++static int __an7552_npu_txfree_setup(struct an7552_npu *ctx, u32 band, u32 base,
+ 			    u32 count, u32 regs, void (*notify)(void *),
+ 			    void *context)
+ {
+ 	int ret;
+ 
+ 	if (ctx->defer_queues && band < 2) {
+ 		ctx->txfree_config[band].base = base;
+ 		ctx->txfree_config[band].count = count;
+@@ -394,16 +444,31 @@
+ 			  0, 64);
+ 		return 0;
+ 	}
+ 	ret = native_txfree_setup(ctx, band, base, count, regs, notify,
+ 				  context);
+ 
+ 	if (ret)
+ 		ctx->queue_error = ret;
++	return ret;
++}
++
++int an7552_npu_txfree_setup(struct an7552_npu *ctx, u32 band, u32 base,
++			    u32 count, u32 regs, void (*notify)(void *),
++			    void *context)
++{
++	int ret;
++
++	if (!ctx)
++		return 0;
++	if (!an7552_npu_setup_enter(ctx))
++		return -ESHUTDOWN;
++	ret = __an7552_npu_txfree_setup(ctx, band, base, count, regs, notify, context);
++	an7552_npu_setup_exit(ctx);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_txfree_setup);
+ 
+ void an7552_npu_txfree_write(struct an7552_npu *ctx, u32 band, u32 word,
+ 			     u32 value)
+ {
+ 	if (ctx->running && band < 2 && word == 15)
+@@ -554,17 +619,17 @@
+ 
+ void an7552_npu_rro_irq_enable(struct an7552_npu *ctx)
+ {
+ 	if (an7552_npu_rro_active(ctx))
+ 		writel(BIT(18), ctx->regs + 0x30d03c);
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_rro_irq_enable);
+ 
+-int an7552_npu_rro_setup(struct an7552_npu *ctx, u32 base, u32 count, u32 data0,
++static int __an7552_npu_rro_setup(struct an7552_npu *ctx, u32 base, u32 count, u32 data0,
+ 			 u32 data1, u32 regs0, u32 regs1, u32 emi,
+ 			 u32 capacity0, u32 capacity1, void (*notify)(void *),
+ 			 void *context)
+ {
+ 	void __iomem *q = ctx->regs + 0x3000 + AN7552_RRO_CONTROL;
+ 	void __iomem *radio, *data_regs[2] = {};
+ 	u32 bases[2] = { data0, data1 }, regs[2] = { regs0, regs1 };
+ 	u32 capacity[2] = { capacity0, capacity1 }, token = 0, value;
+@@ -693,16 +758,33 @@
+ release:
+ 	for (band = 0; band < 2; band++) {
+ 		if (data_regs[band])
+ 			iounmap(data_regs[band]);
+ 	}
+ 	iounmap(radio);
+ 	return ret;
+ }
++
++int an7552_npu_rro_setup(struct an7552_npu *ctx, u32 base, u32 count, u32 data0,
++			 u32 data1, u32 regs0, u32 regs1, u32 emi,
++			 u32 capacity0, u32 capacity1, void (*notify)(void *),
++			 void *context)
++{
++	int ret;
++
++	if (!ctx)
++		return 0;
++	if (!an7552_npu_setup_enter(ctx))
++		return -ESHUTDOWN;
++	ret = __an7552_npu_rro_setup(ctx, base, count, data0, data1, regs0, regs1, emi,
++				 capacity0, capacity1, notify, context);
++	an7552_npu_setup_exit(ctx);
++	return ret;
++}
+ EXPORT_SYMBOL_GPL(an7552_npu_rro_setup);
+ 
+ u32 an7552_npu_rro_index(struct an7552_npu *ctx)
+ {
+ 	return readl(ctx->regs + 0x3000 + AN7552_RRO_CONTROL + 8);
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_rro_index);
+ 
+@@ -995,17 +1077,17 @@
+ {
+ 	if (band > 1 || offset >= 16 || (offset & 3))
+ 		return;
+ 	writel(value,
+ 	       ctx->regs + 0x3000 + AN7552_NATIVE_CONTROL + band * 64 + offset);
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_tx_write);
+ 
+-void an7552_npu_tx_setup(struct an7552_npu *ctx, unsigned int band, u32 base,
++static void __an7552_npu_tx_setup(struct an7552_npu *ctx, unsigned int band, u32 base,
+ 			 u32 count)
+ {
+ 	void __iomem *control, *registers, *ring;
+ 	u32 start, value, physical;
+ 	unsigned int i;
+ 	int ret = -EINVAL;
+ 
+ 	if (band > 1 || ctx->stopping || !count || count > 4096 ||
+@@ -1054,16 +1136,29 @@
+ 	dev_dbg(ctx->dev,
+ 		" native queue %u host=%08x count=%u hardware=%08x start=%u\n",
+ 		band, base, count, physical, start);
+ 
+ 	return;
+ error:
+ 	ctx->queue_error = ret;
+ }
++
++void an7552_npu_tx_setup(struct an7552_npu *ctx, unsigned int band, u32 base,
++			 u32 count)
++{
++	if (!ctx)
++		return;
++	if (!an7552_npu_setup_enter(ctx)) {
++		ctx->queue_error = -ESHUTDOWN;
++		return;
++	}
++	__an7552_npu_tx_setup(ctx, band, base, count);
++	an7552_npu_setup_exit(ctx);
++}
+ EXPORT_SYMBOL_GPL(an7552_npu_tx_setup);
+ 
+ /* Disabled queues can retain a previous generation's status until setup.
+  * An enabled queue with a sticky error has stopped making progress even if
+  * the firmware's outer loop continues publishing a healthy heartbeat.
+  */
+ static bool an7552_npu_queue_failed(struct an7552_npu *ctx, u32 control,
+ 				  u32 enable, u32 error)
+@@ -1131,19 +1226,25 @@
+ 	return true;
+ queue_fault:
+ 	ctx->faulted = true;
+ 	ctx->fault_count++;
+ 	return false;
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_healthy);
+ 
++static bool __an7552_npu_recovery_ready(struct an7552_npu *ctx)
++{
++	return !ctx || (!ctx->failed && (!ctx->faulted || ctx->fault_quiesced));
++}
++
+ bool an7552_npu_recovery_ready(struct an7552_npu *ctx)
+ {
+-	return !ctx || (!ctx->failed && (!ctx->faulted || ctx->fault_quiesced));
++	return (!ctx || !READ_ONCE(ctx->shutdown)) &&
++	       __an7552_npu_recovery_ready(ctx);
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_recovery_ready);
+ 
+ /* No firmware mailbox can be trusted after a trap. Park both writers and
+  * stop TDMA before the consumer resets radio DMA. All packet storage remains
+  * reserved until that reset completes; only then may prepare() reuse it.
+  */
+ static int fault_drain_ppe(struct an7552_npu *ctx)
+@@ -1212,17 +1313,17 @@
+ 		writel(ctx->ppe_saved[6], ctx->fe + 0xa2c);
+ 	}
+ 	ctx->ppe_enabled = false;
+ 	ctx->tdma_enabled = false;
+ 	ctx->fault_quiesced = true;
+ 	return 0;
+ }
+ 
+-void an7552_npu_stop(struct an7552_npu *ctx)
++static void __an7552_npu_stop(struct an7552_npu *ctx)
+ {
+ 	unsigned int i;
+ 	u32 value;
+ 
+ 	if (!ctx || !ctx->running || ctx->stopping)
+ 		return;
+ 	/* Teardown may precede the periodic health check after a trap. */
+ 	an7552_npu_healthy(ctx);
+@@ -1246,16 +1347,24 @@
+ 				       100000)) {
+ 			ctx->failed = true;
+ 			dev_err(ctx->dev, "native queue stop timed out\n");
+ 			writel(0x300, ctx->regs + BOOT_CONFIG);
+ 			writel(2, ctx->regs + BOOT_TRIGGER);
+ 			usleep_range(1000, 2000);
+ 		}
+ 	}
++}
++
++void an7552_npu_stop(struct an7552_npu *ctx)
++{
++	if (!ctx || !an7552_npu_setup_enter(ctx))
++		return;
++	__an7552_npu_stop(ctx);
++	an7552_npu_setup_exit(ctx);
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_stop);
+ 
+ static int an7552_npu_forward_setup(struct an7552_npu *ctx, u32 band, u32 bss,
+ 				    u32 wcid, u32 flags, u32 start,
+ 				    u32 start_second)
+ {
+ 	void __iomem *control = ctx->regs + 0x3000 + AN7552_FORWARD_CONTROL;
+@@ -1393,26 +1502,41 @@
+ 	return ret;
+ }
+ 
+ /* Destructors cannot return an error to prevent devres from freeing DMA
+  * backing. If ownership cannot be proved, stop the kernel before any caller
+  * can release that memory. Ordinary reset failures remain quarantined and
+  * do not use this destructor-only guard.
+  */
+-void an7552_npu_require_quiescent(struct an7552_npu *ctx)
++static void __an7552_npu_require_quiescent(struct an7552_npu *ctx)
+ {
+ 	if (!ctx || !ctx->running)
+ 		return;
+-	an7552_npu_stop(ctx);
+-	if (an7552_npu_recovery_ready(ctx) && !halt_cores(ctx))
++	__an7552_npu_stop(ctx);
++	if (__an7552_npu_recovery_ready(ctx) && !halt_cores(ctx))
+ 		return;
+ 	/* A timed restart could enter the bootloader while a bus owner lives. */
+ 	WRITE_ONCE(panic_timeout, 0);
+ 	panic("AN7552 DMA ownership unresolved during teardown; power cycle required");
++}
++
++void an7552_npu_require_quiescent(struct an7552_npu *ctx)
++{
++	if (!ctx)
++		return;
++	if (!an7552_npu_setup_enter(ctx)) {
++		/* A terminal shutdown owns the proof. Do not let a concurrent
++		 * destructor free DMA backing until it has actually completed.
++		 */
++		wait_event(ctx->setup_wait, smp_load_acquire(&ctx->shutdown_complete));
++		return;
++	}
++	__an7552_npu_require_quiescent(ctx);
++	an7552_npu_setup_exit(ctx);
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_require_quiescent);
+ 
+ static int boot_firmware(struct an7552_npu *ctx)
+ {
+ 	const struct firmware *fw;
+ 	u32 value, heartbeat[2], entry;
+ 	unsigned int i;
+@@ -1636,16 +1760,20 @@
+ 		return ERR_PTR(-EPROBE_DEFER);
+ 	device_lock(&pdev->dev);
+ 	ctx = platform_get_drvdata(pdev);
+ 	if (pdev->dev.driver != &an7552_npu_driver.driver || !ctx) {
+ 		ret = -EPROBE_DEFER;
+ 		goto unlock;
+ 	}
+ 	mutex_lock(&ctx->attach_lock);
++	if (ctx->shutdown) {
++		ret = -ESHUTDOWN;
++		goto unlock_attach;
++	}
+ 	if (ctx->attached) {
+ 		ret = -EBUSY;
+ 		goto unlock_attach;
+ 	}
+ 	if (ctx->failed) {
+ 		ret = -EIO;
+ 		goto unlock_attach;
+ 	}
+@@ -1697,17 +1825,17 @@
+ 	put_device(ctx->dev);
+ 	module_put(THIS_MODULE);
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_put);
+ 
+ /* Queue memory belongs to mt76 and may only be replaced while quiesced.
+  * Keep station identities and replay counters across a radio DMA reset.
+  */
+-int an7552_npu_prepare(struct an7552_npu *ctx, bool full)
++static int __an7552_npu_prepare(struct an7552_npu *ctx, bool full)
+ {
+ 	int ret;
+ 
+ 	if (!ctx)
+ 		return 0;
+ 	if (ctx->faulted) {
+ 		if (!full || !ctx->fault_quiesced || ctx->failed)
+ 			return -EIO;
+@@ -1727,56 +1855,95 @@
+ 	memset_io(ctx->regs + 0x3000 + AN7552_RX_DATA_CONTROL, 0, 128);
+ 	memset_io(ctx->regs + 0x3000 + AN7552_RRO_CONTROL, 0, 128);
+ 	if (full)
+ 		memset_io(ctx->ram + AN7552_STATION_HOST - CODE_BASE, 0,
+ 			  AN7552_STATION_COUNT * 32);
+ 	ctx->stopping = false;
+ 	return 0;
+ }
++
++int an7552_npu_prepare(struct an7552_npu *ctx, bool full)
++{
++	int ret;
++
++	if (!ctx)
++		return 0;
++	if (!an7552_npu_setup_enter(ctx))
++		return -ESHUTDOWN;
++	ret = __an7552_npu_prepare(ctx, full);
++	an7552_npu_setup_exit(ctx);
++	return ret;
++}
+ EXPORT_SYMBOL_GPL(an7552_npu_prepare);
+ 
+-int an7552_npu_queues_start(struct an7552_npu *ctx)
++static int __an7552_npu_queues_start(struct an7552_npu *ctx)
+ {
+ 	unsigned int band;
+ 	int ret;
+ 
+ 	if (!ctx || !ctx->defer_queues)
+ 		return 0;
+ 	if (ctx->failed || ctx->stopping)
+ 		return -EIO;
+ 	ctx->defer_queues = false;
+ 	for (band = 0; band < 2; band++) {
+ 		if (ctx->tx_count[band])
+-			an7552_npu_tx_setup(ctx, band, ctx->tx_base[band],
++			__an7552_npu_tx_setup(ctx, band, ctx->tx_base[band],
+ 					    ctx->tx_count[band]);
+ 		if (!ctx->txfree_config[band].count)
+ 			continue;
+-		ret = an7552_npu_txfree_setup(ctx, band,
++		ret = __an7552_npu_txfree_setup(ctx, band,
+ 					      ctx->txfree_config[band].base,
+ 					      ctx->txfree_config[band].count,
+ 					      ctx->txfree_config[band].regs,
+ 					      ctx->txfree_config[band].notify,
+ 					      ctx->txfree_config[band].context);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 	return ctx->queue_error;
+ }
++
++int an7552_npu_queues_start(struct an7552_npu *ctx)
++{
++	int ret;
++
++	if (!ctx)
++		return 0;
++	if (!an7552_npu_setup_enter(ctx))
++		return -ESHUTDOWN;
++	ret = __an7552_npu_queues_start(ctx);
++	an7552_npu_setup_exit(ctx);
++	return ret;
++}
+ EXPORT_SYMBOL_GPL(an7552_npu_queues_start);
+ 
+-int an7552_npu_start(struct an7552_npu *ctx)
++static int __an7552_npu_start(struct an7552_npu *ctx)
+ {
+ 	if (!ctx)
+ 		return 0;
+ 	if (!ctx->running || ctx->failed || ctx->stopping || ctx->pn_failed)
+ 		return -EIO;
+ 	if (ctx->queue_error)
+ 		return ctx->queue_error;
+ 	return ctx->tdma_enabled ? 0 : tdma_start(ctx);
++}
++
++int an7552_npu_start(struct an7552_npu *ctx)
++{
++	int ret;
++
++	if (!ctx)
++		return 0;
++	if (!an7552_npu_setup_enter(ctx))
++		return -ESHUTDOWN;
++	ret = __an7552_npu_start(ctx);
++	an7552_npu_setup_exit(ctx);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(an7552_npu_start);
+ 
+ static int an7552_npu_debug_show(struct seq_file *seq, void *unused)
+ {
+ 	struct an7552_npu *ctx = seq->private;
+ 	void __iomem *ppe = ctx->regs + 0x36c0;
+ 	unsigned int i;
+@@ -1814,16 +1981,18 @@
+ 	struct an7552_npu *ctx;
+ 	int ret;
+ 
+ 	ctx = devm_kzalloc(dev, sizeof(*ctx), GFP_KERNEL);
+ 	if (!ctx)
+ 		return -ENOMEM;
+ 	ctx->dev = dev;
+ 	mutex_init(&ctx->attach_lock);
++	spin_lock_init(&ctx->setup_lock);
++	init_waitqueue_head(&ctx->setup_wait);
+ 	spin_lock_init(&ctx->station_lock);
+ 	spin_lock_init(&ctx->pn_lock);
+ 	ctx->regs = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(ctx->regs))
+ 		return PTR_ERR(ctx->regs);
+ 	/* Timer 0 is inside the NPU register aperture. */
+ 	ctx->timer = ctx->regs + 0x310100;
+ 	ret = of_reserved_mem_region_to_resource(dev->of_node, 0, &resource);
+@@ -1871,38 +2040,47 @@
+ 
+ 	debugfs_remove_recursive(ctx->debugfs);
+ 	an7552_npu_require_quiescent(ctx);
+ }
+ 
+ /* A warm reboot must satisfy the same ownership proof as removal before
+  * the bootloader can reuse DDR. Failed parking/draining is terminal.
+  */
+-static void an7552_npu_shutdown(struct platform_device *pdev)
+-{
+-	struct an7552_npu *ctx = platform_get_drvdata(pdev);
+-
++void an7552_npu_shutdown(struct an7552_npu *ctx)
++{
+ 	if (!ctx)
+ 		return;
+ 	mutex_lock(&ctx->attach_lock);
+-	an7552_npu_require_quiescent(ctx);
+-	ctx->running = false;
++	if (!ctx->shutdown_complete) {
++		an7552_npu_close_setup(ctx);
++		__an7552_npu_require_quiescent(ctx);
++		WRITE_ONCE(ctx->running, false);
++		smp_store_release(&ctx->shutdown_complete, true);
++		wake_up_all(&ctx->setup_wait);
++	}
+ 	mutex_unlock(&ctx->attach_lock);
++}
++EXPORT_SYMBOL_GPL(an7552_npu_shutdown);
++
++static void an7552_npu_shutdown_device(struct platform_device *pdev)
++{
++	an7552_npu_shutdown(platform_get_drvdata(pdev));
+ }
+ 
+ static const struct of_device_id an7552_npu_match[] = {
+ 	{ .compatible = "airoha,an7552-npu" },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, an7552_npu_match);
+ 
+ static struct platform_driver an7552_npu_driver = {
+ 	.probe = an7552_npu_probe,
+ 	.remove = an7552_npu_remove,
+-	.shutdown = an7552_npu_shutdown,
++	.shutdown = an7552_npu_shutdown_device,
+ 	.driver = {
+ 		.name = "an7552-npu",
+ 		.of_match_table = an7552_npu_match,
+ 	},
+ };
+ module_platform_driver(an7552_npu_driver);
+ MODULE_FIRMWARE("airoha/an7552.bin");
+ MODULE_LICENSE("GPL");
+--- a/include/linux/soc/airoha/an7552_npu.h
++++ b/include/linux/soc/airoha/an7552_npu.h
+@@ -45,16 +45,17 @@
+ bool an7552_npu_active(struct an7552_npu *ctx);
+ u32 an7552_npu_tx_read(struct an7552_npu *ctx, unsigned int band, u32 offset);
+ void an7552_npu_tx_write(struct an7552_npu *ctx, unsigned int band, u32 offset,
+ 			 u32 value);
+ void an7552_npu_tx_setup(struct an7552_npu *ctx, unsigned int band, u32 base,
+ 			 u32 count);
+ void an7552_npu_stop(struct an7552_npu *ctx);
+ void an7552_npu_require_quiescent(struct an7552_npu *ctx);
++void an7552_npu_shutdown(struct an7552_npu *ctx);
+ int an7552_npu_prepare(struct an7552_npu *ctx, bool full);
+ int an7552_npu_queues_start(struct an7552_npu *ctx);
+ int an7552_npu_start(struct an7552_npu *ctx);
+ bool an7552_npu_forward_path(struct an7552_npu *ctx, u32 band, u32 bss,
+ 			     u32 wcid);
+ #else
+ static inline void an7552_npu_set_bridge(struct an7552_npu *ctx, bool enable)
+ {
+@@ -228,15 +229,19 @@
+ static inline void an7552_npu_stop(struct an7552_npu *ctx)
+ {
+ }
+ 
+ static inline void an7552_npu_require_quiescent(struct an7552_npu *ctx)
+ {
+ }
+ 
++static inline void an7552_npu_shutdown(struct an7552_npu *ctx)
++{
++}
++
+ static inline bool an7552_npu_forward_path(struct an7552_npu *ctx, u32 band,
+ 					   u32 bss, u32 wcid)
+ {
+ 	return false;
+ }
+ #endif
+ #endif
