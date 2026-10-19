@@ -32,7 +32,7 @@ station authorization, replay state and PPE queue teardown.
 +obj-$(CONFIG_NET_AIROHA_AN7552_NPU) += an7552_npu.o
 --- /dev/null
 +++ b/drivers/net/ethernet/airoha/an7552_npu.c
-@@ -0,0 +1,1889 @@
+@@ -0,0 +1,1893 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* AN7552 source-firmware transport and MT7992 DMA ownership. */
 +#include <linux/debugfs.h>
@@ -1124,6 +1124,10 @@ station authorization, replay state and PPE queue teardown.
 +		return true;
 +	if (ctx->faulted)
 +		return false;
++	if (ctx->pn_failed) {
++		dev_err(ctx->dev, "source replay mailbox fault\n");
++		goto queue_fault;
++	}
 +	for (i = 0; i < 2; i++) {
 +		if (an7552_npu_queue_failed(ctx, AN7552_NATIVE_CONTROL + i * 64,
 +					   20, 28) ||

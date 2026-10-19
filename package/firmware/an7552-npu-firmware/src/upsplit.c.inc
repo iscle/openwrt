@@ -103,6 +103,7 @@ __attribute__((unused)) static void up_init(uint32_t core)
 	s[US_STALE] = 0;
 	s[US_STOPS] = 0;
 	s[US_BACK_ACTIVE] = 0;
+	RX_PPE_CACHE[1] = RX_PPE_STALE;
 }
 
 /* ---------------------------------------------------------------- core 0 */

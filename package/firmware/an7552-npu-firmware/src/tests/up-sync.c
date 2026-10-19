@@ -68,7 +68,10 @@ int main(void)
 		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) ==
 	       (void *)0x44100000);
 	up_init(0);
+	RX_PPE_CACHE[0] = UINT32_MAX;
+	RX_PPE_CACHE[1] = 0;
 	up_init(1);
+	assert(RX_PPE_CACHE[1] == RX_PPE_STALE);
 
 	/* An update cannot complete while the back end may submit an old frame. */
 	assert(up_back_enter());
