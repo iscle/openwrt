@@ -29,7 +29,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
  obj-$(CONFIG_MTD_NAND_QCOM) += qpic_common.o
 --- /dev/null
 +++ b/drivers/mtd/nand/airoha_bmt.c
-@@ -0,0 +1,831 @@
+@@ -0,0 +1,825 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Airoha NAND Bad Block Management Table driver
@@ -747,14 +747,8 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +			pr_info("  [%d] %u\n", i,
 +				le16_to_cpu(ctx.bbt->entries[i]));
 +		break;
-+	case 1:
-+		reconstruct_bbt();
-+		airoha_save_bbt();
-+		break;
-+	case 2:
-+		reconstruct_bmt();
-+		airoha_save_bmt();
-+		break;
++	default:
++		return -EOPNOTSUPP;
 +	}
 +	return 0;
 +}

@@ -1,0 +1,108 @@
+Subject: [PATCH] wifi: mac80211: defer RX DELBA until the replacement PTK is installed
+
+PTK0 rekey taints the old key before stopping aggregation sessions.
+With protected management frames, the DELBA sent by RX session teardown
+is discarded by ieee80211_tx_h_select_key(). The peer can keep transmitting
+against the old agreement and never establish a replacement RX BA session.
+
+Stop RX aggregation without sending DELBA and retain the affected TIDs.
+Notify the peer after successfully installing and publishing the new PTK,
+so the management frame is protected with a usable key. Keep the old key
+tainted throughout the transition and leave TX BA teardown unchanged.
+
+Observed with an MT7996 MLO AP and a Xiaomi 15 during PTK renewal.
+
+---
+
+diff --git a/net/mac80211/key.c b/net/mac80211/key.c
+--- a/net/mac80211/key.c
++++ b/net/mac80211/key.c
+@@ -290,11 +290,12 @@
+ 	return _ieee80211_set_tx_key(key, false);
+ }
+ 
+-static void ieee80211_pairwise_rekey(struct ieee80211_key *old,
+-				     struct ieee80211_key *new)
++static u16 ieee80211_pairwise_rekey(struct ieee80211_key *old,
++				    struct ieee80211_key *new)
+ {
+ 	struct ieee80211_local *local = new->local;
+ 	struct sta_info *sta = new->sta;
++	u16 rx_ba_tids = 0;
+ 	int i;
+ 
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+@@ -325,15 +326,26 @@
+ 		 * crypto, though.
+ 		 */
+ 		if (!(old->flags & KEY_FLAG_UPLOADED_TO_HARDWARE))
+-			return;
++			return 0;
+ 
+ 		/* Stop Tx till we are on the new key */
+ 		old->flags |= KEY_FLAG_TAINTED;
+ 		ieee80211_clear_fast_xmit(sta);
+ 		if (ieee80211_hw_check(&local->hw, AMPDU_AGGREGATION)) {
+ 			set_sta_flag(sta, WLAN_STA_BLOCK_BA);
+-			ieee80211_sta_tear_down_BA_sessions(sta,
+-							    AGG_STOP_LOCAL_REQUEST);
++			/* The old key is tainted, so protected DELBA frames
++			 * cannot be sent until the replacement key is installed.
++			 */
++			for (i = 0; i < IEEE80211_NUM_TIDS; i++) {
++				if (test_bit(i, sta->ampdu_mlme.agg_session_valid))
++					rx_ba_tids |= BIT(i);
++				__ieee80211_stop_rx_ba_session(sta, i,
++							       WLAN_BACK_RECIPIENT,
++							       WLAN_REASON_QSTA_LEAVE_QBSS, false);
++			}
++			for (i = 0; i < IEEE80211_NUM_TIDS; i++)
++				__ieee80211_stop_tx_ba_session(sta, i,
++							       AGG_STOP_LOCAL_REQUEST);
+ 		}
+ 		if (!wiphy_ext_feature_isset(local->hw.wiphy,
+ 					     NL80211_EXT_FEATURE_CAN_REPLACE_PTK0)) {
+@@ -345,6 +357,8 @@
+ 			ieee80211_flush_queues(local, old->sdata, false);
+ 		}
+ 	}
++
++	return rx_ba_tids;
+ }
+ 
+ static void __ieee80211_set_default_key(struct ieee80211_link_data *link,
+@@ -445,6 +459,8 @@
+ 				 struct ieee80211_key *new)
+ {
+ 	struct link_sta_info *link_sta = sta ? &sta->deflink : NULL;
++	u16 rx_ba_tids = 0;
++	int tid;
+ 	int link_id;
+ 	int idx;
+ 	int ret = 0;
+@@ -500,7 +516,7 @@
+ 		/* Unicast rekey needs special handling. With Extended Key ID
+ 		 * old is still NULL for the first rekey.
+ 		 */
+-		ieee80211_pairwise_rekey(old, new);
++		rx_ba_tids = ieee80211_pairwise_rekey(old, new);
+ 	}
+ 
+ 	if (old) {
+@@ -584,6 +600,16 @@
+ 		if (defbeaconkey && new)
+ 			__ieee80211_set_default_beacon_key(link,
+ 							   new->conf.keyidx);
++	}
++
++	/* Notify the peer only after publishing the replacement PTK. */
++	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++) {
++		if (!(rx_ba_tids & BIT(tid)))
++			continue;
++		ieee80211_send_delba(sdata, sta->sta.addr, tid,
++				     WLAN_BACK_RECIPIENT,
++				     WLAN_REASON_QSTA_LEAVE_QBSS,
++				     ieee80211_s1g_use_ndp_ba(sdata, sta));
+ 	}
+ 
+ 	if (old)

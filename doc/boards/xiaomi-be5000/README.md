@@ -20,7 +20,7 @@ and packet counters are unavailable. Source-built AN7552 NPU firmware enables
 Wi-Fi transmit and receive acceleration for supported bridge flows. The build
 includes this firmware without extracting Xiaomi NPU binaries. See [NPU.md](NPU.md)
 for the implementation, validation and remaining limits. The CPU
-cluster supports 500–1000 MHz in 50-MHz steps on the upstream branch, using
+cluster supports 500–1000 MHz in 50-MHz steps using
 `ondemand` by default. The AN7563 driver temporarily divides the CPU clock
 during the firmware's clock-source handoff, then restores the divider and
 verifies the resulting frequency. Both cores and all operating points remain
@@ -32,6 +32,10 @@ OpenWrt is ready. This indicates system readiness, not Internet connectivity.
 Both colours expose standard LED brightness and trigger controls as
 `blue:status` and `orange:status`.
 
+See [CONSOLIDATION.md](CONSOLIDATION.md) for the October 2026 branch merge and
+PR #2 fixes. See [REVIEW.md](REVIEW.md) for the source-review findings and remaining
+upstream-integration concerns. This port is not production-qualified.
+
 ## Build
 
 From this repository's root on an OpenWrt-supported build host:
@@ -39,11 +43,12 @@ From this repository's root on an OpenWrt-supported build host:
 ```sh
 cp doc/boards/xiaomi-be5000/feeds.conf feeds.conf
 ./scripts/feeds update -a
-./scripts/feeds install -a
+./scripts/feeds install luci pciutils
 cp doc/boards/xiaomi-be5000/config.buildinfo .config
 make defconfig
 make -j"$(nproc)"
-python3 scripts/tests/test_be5000_calibration.py
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+make -C package/firmware/an7552-npu-firmware/src check
 ```
 
 The build profile enables LuCI explicitly; the hardware device definition
@@ -79,11 +84,13 @@ before installing; do not flash it to an unmodified stock layout.
 | U-Boot | `0x000000` | `0x07c000` |
 | U-Boot environment | `0x07c000` | `0x004000` |
 | ART (including per-device calibration) | `0x080000` | `0x040000` |
-| Firmware | `0x0c0000` | `0x4000000` |
+| Firmware (raw FIT) | `0x0c0000` | `0x1800000` |
+| UBI (rootfs_data overlay) | `0x18c0000` | `0x2800000` |
 
 The first ART eraseblock is preserved; the second, at `0x0a0000`, holds
-calibration. Keeping ART as one MTD partition preserves the bootloader's root
-partition numbering.
+calibration. A separate page at `0x0a2000` stores the original wired MAC
+addresses, copied from the same unit's stock bdata. Keeping ART as one MTD
+partition preserves the bootloader's root partition numbering.
 
 Keep private backups of the complete original flash, stock Factory partition,
 bootloader, environment and configuration. The stock Factory data is outside
@@ -93,12 +100,16 @@ router's EEPROM: it includes per-unit calibration and addresses.
 ### One-time calibration provisioning
 
 `scripts/be5000-calibration.py` validates an original 4-MiB Factory backup,
-a 7680-byte EEPROM, or an already prepared 128-KiB calibration block. It rejects
-unknown non-erased trailing data. It creates a private output file and does not
-write flash:
+a 7680-byte EEPROM, or an already prepared 128-KiB calibration block. Supply
+the original bdata backup to preserve wired addresses as well. Its 64-KiB
+environment must have a valid CRC; only `ethaddr` and `ethaddr_wan2` are copied.
+The WAN MAC override, passwords and other environment settings are excluded.
+The tool rejects unknown non-erased trailing data and creates a private output
+file without writing flash:
 
 ```sh
-python3 scripts/be5000-calibration.py /path/to/own-Factory.bin /private/calibration.bin
+python3 scripts/be5000-calibration.py /path/to/own-Factory.bin /private/calibration.bin \
+    --bdata /path/to/own-bdata.bin
 ```
 
 For the replacement bootloader, the factory block occupies the second 128-KiB
@@ -130,7 +141,56 @@ Require an exact match. No erase or bootloader/environment write is involved.
 The generic Linux device tree exposes this block read-only through NVMEM.
 Keep the calibration file private; it is not part of any firmware release.
 
+### Adding wired identities to an existing calibration block
+
+Older provisioned blocks contain only the radio EEPROM. Back up the full ART
+partition and verify its checksum before updating one. Prepare a new block
+with the matching Factory and bdata backups. Require its EEPROM bytes to match
+the installed block exactly and verify that all remaining bytes of the
+installed second ART block are erased. If these checks fail, stop; do not erase
+or overwrite an unknown layout.
+
+After loading the new private block to `0x84000000`, compare the first `0x2000`
+bytes against flash. The following checks also verify that the separate target
+page is erased before programming it:
+
+```text
+mtd read spi-nand0 0x84200000 0xa0000 0x20000
+cmp.b 0x84000000 0x84200000 0x2000
+mw.b 0x84400000 0xff 0x800
+cmp.b 0x84202000 0x84400000 0x800
+```
+
+Continue only after both comparisons match. Write that previously unused page,
+then compare the complete block against the prepared file:
+
+```text
+mtd write spi-nand0 0x84002000 0xa2000 0x800
+mtd read spi-nand0 0x84200000 0xa0000 0x20000
+cmp.b 0x84000000 0x84200000 0x20000
+```
+
+This does not erase or rewrite the radio EEPROM. The 24-byte `BE5MAC01` record
+contains its version magic, two binary MAC addresses and a CRC32; the remainder
+of the page is erased padding. The generic device tree reads the MAC cells from
+ART offsets `0x22008` and `0x2200e`. A firmware upgrade alone cannot recover
+missing factory identities; retain the original backups.
+
 ### RAM test and sysupgrade
+
+The consolidated build uses image compatibility version 1.1 and a separate
+UBI overlay. When migrating from an earlier iscle build with the single
+64-MiB firmware partition, **boot this build's initramfs first**, then install
+its matching sysupgrade image with `sysupgrade -n`. Do not force a direct
+upgrade from the older kernel: it does not expose the new UBI partition and
+runs its own older upgrade script. Save your configuration privately before
+migration and reconfigure after the clean installation. This erases the old
+overlay, but does not update the bootloader or calibration partitions.
+
+Normal boot only attaches UBI and never formats it after an attachment failure.
+An explicit sysupgrade may initialize the dedicated UBI partition and creates
+its rootfs_data volume; volume and configuration-restore errors are propagated.
+
 
 First TFTP-load the generic initramfs image to `0x84000000` and run
 `bootm 0x84000000`. Check Ethernet, the ART calibration cell and Wi-Fi initialization
@@ -144,7 +204,7 @@ verify its published SHA-256, then validate it:
 sysupgrade -T /tmp/firmware.bin
 ```
 
-When upgrading from installed OpenWrt, use `sysupgrade /tmp/firmware.bin` to retain
+For subsequent upgrades from an installed version using this UBI layout, use `sysupgrade /tmp/firmware.bin` to retain
 configuration, or `sysupgrade -n /tmp/firmware.bin` for clean generic defaults.
 From a RAM boot, supply a previously saved, compatible configuration archive
 with `sysupgrade -f /tmp/config-backup.tar.gz /tmp/firmware.bin`, or use `-n`.
@@ -172,8 +232,6 @@ setting your country and choosing your own network names and credentials.
   unwinds MCU failure, and stops receive polling before freeing DMA page pools.
 * Beacon link fields are snapshotted under RCU before issuing sleeping MCU
   commands; nonblocking TX descriptor construction has an RCU read section.
-* The older mt76 baseline backports the unspecified link-ID bounds fix.
-  The upstream mt76 baseline already contains this fix.
 
 These changes address failures reproduced on this hardware. Validation on one
 router does not establish compatibility with all board revisions, long-term

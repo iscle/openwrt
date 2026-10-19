@@ -1,66 +1,8 @@
 /* SPDX-License-Identifier: MIT */
+#include "ppe-domain.h"
 static volatile uint32_t *rx_words(uint32_t host)
 {
 	return (void *)(uintptr_t)((host & 0x3fffffff) | 0x40000000);
-}
-
-#ifndef RX_HEADER_ALIAS
-/* DMA writes are not coherent with the NPU data cache. Cache only the
- * per-packet stack copy in pkt_view, never the reusable DMA buffer.
- */
-#define RX_HEADER_ALIAS(host) ((volatile uint8_t *)rx_words(host))
-#endif
-
-#ifndef RX_STATE_MIRROR
-#define RX_STATE_MIRROR 1
-#endif
-/* Core 1 owns the receive buffer states after setup. Keep them as one byte
- * per buffer in local SRAM (~14 cycles) instead of words in DDR (~80).
- * Byte layout: bits 0-1 state, bit 2 band, bit 3 parsed.
- */
-#define RX_STATE_SRAM 0x3e900000U
-static inline uint32_t st_get(uint32_t token)
-{
-#if RX_STATE_MIRROR
-	uint32_t b = ((volatile uint8_t *)(uintptr_t)RX_STATE_SRAM)[token];
-
-	return (b & 3) | ((b & 4) << 6) | ((b & 8) << 13);
-#else
-	return rx_words(AN7552_RX_STATE_HOST)[token];
-#endif
-}
-
-static inline void st_set(uint32_t token, uint32_t value)
-{
-#if RX_STATE_MIRROR
-	((volatile uint8_t *)(uintptr_t)RX_STATE_SRAM)[token] =
-		(value & 3) | ((value >> 6) & 4) | ((value >> 13) & 8);
-#else
-	rx_words(AN7552_RX_STATE_HOST)[token] = value;
-#endif
-}
-
-/* Last PPE hardware consumer index read by core 1 and the PPE producer it
- * was read against ([0], [1]), in local SRAM right after the buffer states.
- * The PPE only advances its index, so while nobody else moved the producer
- * a stale copy can only make the 64-entry ring look fuller;
- * native_ppe_queue() re-reads it when the ring looks full.
- */
-#define RX_PPE_CACHE                                                        \
-	((volatile uint32_t *)(uintptr_t)(RX_STATE_SRAM +                   \
-					  AN7552_RX_BUFFER_COUNT))
-#define RX_PPE_STALE 0xffffffffU
-
-/* Linux initializes the DDR copy before enabling receive processing. */
-static void st_load(void)
-{
-	RX_PPE_CACHE[1] = RX_PPE_STALE;
-#if RX_STATE_MIRROR
-	volatile uint32_t *ddr = rx_words(AN7552_RX_STATE_HOST);
-
-	for (uint32_t t = 0; t < AN7552_RX_BUFFER_COUNT; t++)
-		st_set(t, ddr[t]);
-#endif
 }
 
 static void native_rx_refill(uint32_t band)
@@ -71,6 +13,7 @@ static void native_rx_refill(uint32_t band)
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RX_DATA_CONTROL +
 				    band * 64);
 	volatile uint32_t *free_ids = rx_words(AN7552_RX_FREE_HOST);
+	volatile uint32_t *states = rx_words(AN7552_RX_STATE_HOST);
 	uint32_t producer = data[6], consumer = read32(data[4] + 12), filled = 0;
 
 	data[8] = consumer;
@@ -85,13 +28,13 @@ static void native_rx_refill(uint32_t band)
 		if (next == consumer || !q[22])
 			break;
 		token = free_ids[q[20]];
-		if (token >= AN7552_RX_BUFFER_COUNT || st_get(token)) {
+		if (token >= AN7552_RX_BUFFER_COUNT || states[token]) {
 			q[6] = 2;
 			return;
 		}
 		q[20] = (q[20] + 1) % AN7552_RX_BUFFER_COUNT;
 		q[22]--;
-		st_set(token, 1 | (band << 8));
+		states[token] = 1 | (band << 8);
 		descriptor = rx_words(AN7552_RX_DATA_RING_HOST + band * 0x8000 +
 				      producer * 16);
 		descriptor[0] = AN7552_RX_BUFFER_HOST + token * 2048;
@@ -116,37 +59,36 @@ static volatile uint32_t *rx_metadata(uint32_t token)
 {
 	return rx_words(0x841b0000 + token * 32);
 }
+static volatile struct ppe_domain_saved *rx_domain(uint32_t token)
+{
+	return (void *)rx_words(AN7552_PPE_DOMAIN_HOST +
+				token * AN7552_PPE_DOMAIN_STRIDE);
+}
 static void native_rx_release(uint32_t token)
 {
 	volatile uint32_t *q =
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
-	volatile uint32_t *free_ids = rx_words(AN7552_RX_FREE_HOST);
-	if (token >= AN7552_RX_BUFFER_COUNT || !st_get(token) ||
+	volatile uint32_t *states = rx_words(AN7552_RX_STATE_HOST),
+			  *free_ids = rx_words(AN7552_RX_FREE_HOST);
+	if (token >= AN7552_RX_BUFFER_COUNT || !states[token] ||
 	    q[22] >= AN7552_RX_BUFFER_COUNT) {
 		q[6] = 5;
 		return;
 	}
-	st_set(token, 0);
+	rx_domain(token)->active = 0;
+	states[token] = 0;
 	free_ids[q[21]] = token;
 	q[21] = (q[21] + 1) % AN7552_RX_BUFFER_COUNT;
 	q[22]++;
 }
-/* Copy one receive buffer to the Linux ring. saved[1..5] are the receive
- * descriptor words 1..3, the security verdict and the replay cookie, read
- * either from the DDR metadata of the token (frames returned by the PPE) or
- * from an upload pipeline record in SRAM (upsplit.c.inc). The packet address
- * is the token's buffer: every receive path checks that the descriptor
- * address equals it before anything is saved or queued.
- */
-static int rx_deliver_words(uint32_t token, uint32_t band,
-			    volatile uint32_t *saved, uint32_t ppe_info)
+static int native_rx_deliver(uint32_t token, uint32_t ppe_info)
 {
 	volatile uint32_t *q =
 		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
-	volatile uint32_t *data, *host, *completion, *sidecar;
-	volatile uint8_t *packet = (void *)rx_words(AN7552_RX_BUFFER_HOST +
-						    token * 2048),
-			 *destination;
+	volatile uint32_t *saved = rx_metadata(token), *data, *host,
+			  *completion, *sidecar;
+	volatile uint8_t *packet = (void *)rx_words(saved[0]), *destination;
+	uint32_t band = (rx_words(AN7552_RX_STATE_HOST)[token] >> 8) & 1;
 	uint32_t length = (saved[1] >> 16) & 16383, producer = q[2], host_index,
 		 info, copied = 0;
 	data = (void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RX_DATA_CONTROL +
@@ -161,6 +103,7 @@ static int rx_deliver_words(uint32_t token, uint32_t band,
 		q[6] = 4;
 		return 0;
 	}
+	ppe_domain_restore(packet, saved[6], rx_domain(token));
 	destination = (void *)rx_words(host[0]);
 	sidecar = rx_words(0x842f9000 + producer * 16);
 	sidecar[0] = saved[4];
@@ -193,34 +136,28 @@ static int rx_deliver_words(uint32_t token, uint32_t band,
 	native_rx_release(token);
 	return 1;
 }
-
-static int native_rx_deliver(uint32_t token, uint32_t ppe_info)
-{
-	return rx_deliver_words(token, (st_get(token) >> 8) & 1,
-				rx_metadata(token), ppe_info);
-}
-/* Per-call copies of the PPE input state and counters, published once per
- * call by native_ppe_flush().
- */
+/* Per-batch copies of shared indexes and counters, published once per batch. */
 struct rro_batch {
-	uint32_t mode, done;
+	uint32_t index, phase, mode, done, secure, chain;
 	uint32_t ppe_producer, ppe_hw, ppe_pending;
-	/* Station identity words 1..3 of st_wcid. Linux rewrites them only
-	 * under the quiesce handshake, which never overlaps a call. Word 0
-	 * (eligibility) can be revoked at any time and is always read live.
-	 */
-	uint32_t st_wcid, st1, st2, st3;
 };
 
 static int native_ppe_queue(struct rro_batch *b, uint32_t token,
 			    uint32_t address, uint32_t length)
 {
 	volatile uint32_t *q = (void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
-	uint32_t producer = b->ppe_producer, next = (producer + 1) % 64;
-	volatile uint32_t *descriptor = rx_words(0x842f0000 + producer * 32);
+	uint32_t producer = b->ppe_producer, next;
+	volatile uint32_t *descriptor, *saved;
+	volatile uint8_t *buffer;
 
-	if (b->mode != 2 || q[3])
+	if (b->mode != AN7552_PPE_MODE_BRIDGE || q[3])
 		return 0;
+	if (producer >= 64) {
+		q[3] = 2;
+		return 0;
+	}
+	next = (producer + 1) % 64;
+	descriptor = rx_words(0x842f0000 + producer * 32);
 	/* A stale hardware index only makes the ring look fuller. */
 	if (next == b->ppe_hw) {
 		b->ppe_hw = read32(0x1fb5080c);
@@ -229,6 +166,16 @@ static int native_ppe_queue(struct rro_batch *b, uint32_t token,
 	}
 	if (!(descriptor[1] & 0x80000000))
 		return 0;
+	if (token >= AN7552_RX_BUFFER_COUNT)
+		return -1;
+	saved = rx_metadata(token);
+	buffer = (void *)rx_words(saved[0]);
+	if (!ppe_domain_push(buffer, 2048, saved[6], length,
+			     (saved[4] >> 4) + 1, rx_domain(token)))
+		return -1;
+	address -= 4;
+	length += 4;
+
 	descriptor[2] = address;
 	descriptor[4] = 0x80000000 | (token << 14);
 	descriptor[5] = 0x7f4087ff;
@@ -254,21 +201,194 @@ static void native_ppe_flush(struct rro_batch *b)
 	b->ppe_pending = 0;
 }
 
-static inline void rro_ppe_hw_load(struct rro_batch *b)
+static void native_rro_flush(struct rro_batch *b)
 {
-	volatile uint32_t *cache = RX_PPE_CACHE;
+	volatile uint32_t *q =
+		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
 
-	b->ppe_hw = cache[1] == b->ppe_producer ? cache[0] :
-						  read32(0x1fb5080c);
+	native_ppe_flush(b);
+	/* Validation can succeed even when this batch cannot deliver a frame. */
+	if (b->secure) {
+		q[23] += b->secure;
+		b->secure = 0;
+	}
+	if (!b->done)
+		return;
+	barrier();
+	*rx_words(AN7552_RX_EMI_HOST) =
+		b->index ? b->index - 1 : AN7552_RX_RING_COUNT - 1;
+	q[16] = b->index;
+	q[17] = b->phase;
+	q[30] = b->chain;
+	q[7] += b->done;
+	b->done = 0;
 }
 
-static inline void rro_ppe_hw_save(struct rro_batch *b)
+#define RRO_EMPTY 0
+#define RRO_DONE 1
+#define RRO_BLOCKED 2
+static int native_rro_receive_one(struct rro_batch *b)
 {
-	volatile uint32_t *cache = RX_PPE_CACHE;
+	volatile uint32_t *q =
+		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
+	volatile uint32_t *states = rx_words(AN7552_RX_STATE_HOST), *descriptor,
+			  *saved, *station;
+	volatile uint8_t *packet;
+	struct rx_metadata parsed = { 0 };
+	uint32_t d0, d1, d2, d3, state, length, address, token, reason,
+		cookie = 0, security, band, split, offset = 0, fast = 0;
 
-	cache[0] = b->ppe_hw;
-	cache[1] = b->ppe_producer;
+	descriptor = rx_words(AN7552_RX_COMPLETE_HOST + b->index * 16);
+	d3 = descriptor[3];
+	if ((d3 >> 28) != b->phase)
+		return RRO_EMPTY;
+	barrier();
+	d0 = descriptor[0];
+	d1 = descriptor[1];
+	d2 = descriptor[2];
+	length = (d1 >> 16) & 16383;
+	address = d0;
+	token = (d2 >> 16) - AN7552_RX_TOKEN_BASE;
+	reason = (d2 >> 12) & 15;
+	state = token < AN7552_RX_BUFFER_COUNT ? states[token] : 0;
+	if (token >= AN7552_RX_BUFFER_COUNT || (state & 255) != 1 ||
+	    length > 2048 || address != AN7552_RX_BUFFER_HOST + token * 2048) {
+		q[8] = length;
+		q[9] = reason;
+		q[15] = token;
+		q[6] = 3;
+		return RRO_EMPTY;
+	}
+	packet = (void *)rx_words(address);
+	saved = rx_metadata(token);
+	band = (state >> 8) & 1;
+	if (!(state & 0x10000)) {
+		rx_domain(token)->active = 0;
+		saved[0] = d0;
+		saved[1] = d1;
+		saved[2] = d2;
+		saved[3] = d3;
+		/* Defer every part of a split frame to the host's assembled-frame
+		 * replay check. Continuations contain payload, not another RXD.
+		 */
+		split = b->chain || !(d1 & (1U << 30));
+		security = (split || reason == 1 || reason == 2) ?
+				   0 :
+				   native_rx_security(packet, length, &cookie);
+		saved[4] = security;
+		saved[5] = cookie;
+		b->secure += ((security & 15) == 1);
+		if ((security & 15) == 2)
+			q[24]++;
+		uint32_t parsed_result =
+			split ? RX_PARSE_FRAGMENT :
+				rx_parse(packet, length, reason, &parsed);
+
+		if (b->mode == AN7552_PPE_MODE_BRIDGE &&
+		    (security & 15) == 1 && parsed_result == RX_PARSE_OK &&
+		    parsed.wcid == (security >> 4) && parsed.band < 2) {
+			q[26]++;
+			station = (void *)(uintptr_t)(AN7552_STATION_NPU +
+						      parsed.wcid * 32);
+			volatile uint8_t *source = packet + parsed.offset + 6;
+			if (station_rx_authorized(station, parsed.band, source)) {
+				offset = parsed.offset;
+				fast = parsed.length;
+			} else
+				q[27]++;
+		}
+		saved[6] = offset;
+		saved[7] = fast;
+		states[token] = state | 0x10000;
+	} else {
+		offset = saved[6];
+		fast = saved[7];
+	}
+	/* Linux can revoke station eligibility before the core 1 handshake. */
+	if (fast) {
+		uint32_t wcid = saved[4] >> 4;
+		station = (void *)(uintptr_t)(AN7552_STATION_NPU + wcid * 32);
+		if (!station[0] || !pn_entry(wcid)[0] ||
+		    pn_entry(wcid)[1] != saved[5]) {
+			fast = 0;
+			saved[7] = 0;
+		}
+	}
+	if (fast) {
+		int ret = native_ppe_queue(b, token, address + offset, fast);
+
+		if (!ret)
+			return RRO_BLOCKED;
+		if (ret > 0)
+			states[token] = 2 | (band << 8);
+		else
+			fast = saved[7] = 0;
+	}
+	if (!fast) {
+		volatile uint32_t *ppe =
+			(void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
+
+		/* Earlier PPE input may still need delivery to the same host ring.
+		 * Publish outstanding work and let the bounded retry drain it.
+		 */
+		native_ppe_flush(b);
+		if (ppe[12])
+			return RRO_BLOCKED;
+		if (!native_rx_deliver(token, 0))
+			return RRO_BLOCKED;
+	}
+	/* Data1 bit 30 marks the last buffer of an MPDU. */
+	b->chain = !(d1 & (1U << 30));
+	b->index++;
+	if (b->index == AN7552_RX_RING_COUNT) {
+		b->index = 0;
+		b->phase = (b->phase + 1) & 15;
+	}
+	b->done++;
+	return RRO_DONE;
 }
 
-/* Records core 1 takes per call (upsplit.c.inc). */
 #define RRO_BATCH 32U
+/* Refill and publish shared state once per batch, not once per frame. */
+static void native_rro_receive(void)
+{
+	volatile uint32_t *q =
+		(void *)(uintptr_t)(AN7552_NPU_BASE + AN7552_RRO_CONTROL);
+	volatile uint32_t *ppe =
+		(void *)(uintptr_t)(AN7552_NPU_BASE + 0x6c0);
+	struct rro_batch b;
+	int result;
+
+	if (!q[4]) {
+		q[5] = 0;
+		return;
+	}
+	q[5] = 1;
+	if (q[6])
+		return;
+	native_rx_refill(0);
+	native_rx_refill(1);
+	b.index = q[16];
+	b.phase = q[17];
+	b.chain = q[30];
+	b.mode = ppe[0];
+	b.done = 0;
+	b.secure = 0;
+	b.ppe_producer = ppe[10];
+	b.ppe_hw = read32(0x1fb5080c);
+	b.ppe_pending = 0;
+	for (uint32_t n = 0; n < RRO_BATCH; n++) {
+		result = native_rro_receive_one(&b);
+		if (result == RRO_DONE)
+			continue;
+		if (result == RRO_EMPTY || q[6])
+			break;
+		/* PPE input/completions or host ring blocked: drain once and retry. */
+		native_rro_flush(&b);
+		native_ppe_service();
+		b.ppe_hw = read32(0x1fb5080c);
+		if (q[6] || native_rro_receive_one(&b) != RRO_DONE)
+			break;
+	}
+	native_rro_flush(&b);
+}

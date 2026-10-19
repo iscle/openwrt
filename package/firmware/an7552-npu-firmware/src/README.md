@@ -9,44 +9,18 @@ The OpenWrt package builds the bare-metal RISC-V toolchain and installs
 `/lib/firmware/airoha/an7552.bin`. No network settings, credentials,
 regulatory country, device MAC address or calibration data are compiled in.
 
-## Building
+For a standalone build:
 
 ```
-make CROSS_COMPILE=/path/to/riscv32-unknown-elf-   # GCC, as the package does
-make                                               # clang and lld (LLVM=/usr/bin)
-make PROF=1 CROSS_COMPILE=...                      # cycle profile, see below
-make check                                         # host tests
-make mutate                                        # mutation check of the pipeline tests
-make clean
+make CROSS_COMPILE=/path/to/riscv32-unknown-elf-
+make check
 ```
 
-Without `CROSS_COMPILE` the Makefile falls back to `$(LLVM)/clang` with
-`--target=riscv32-unknown-elf` and `ld.lld`. Both compilers must build the
-image; the package uses the GCC toolchain from `riscv32-elf-gcc/host`.
-
-`PROF=1` adds a cycle profile (`prof.h`) that publishes per-section cycle
-counts in the debugfs status rows `280:` (core 0) and `2c0:` (core 1). It is
-not built by default.
-
-The host tests (`tests/`, built with `HOSTCC`, default `cc`) use Linux
-virtual-memory mappings at the NPU addresses to simulate the reserved
-workspace:
-
-| test | covers |
-| --- | --- |
-| `pn` | replay counters: duplicate, carry, TID isolation, key revocation and reset, command ordering |
-| `pn-cache` | the batch PN cache gives the results and final table of the uncached checks |
-| `rx-ownership` | receive copy, token translation, buffer recycling, refill, empty ring, PPE returns |
-| `rx-parse` | fast-path classifier: cipher, error, fragment and control exclusions, truncation |
-| `station-frame` | station frame validation: data, EAPOL, VLAN, nested VLAN, truncated headers |
-| `txfree` | TXFREE event parsing, host/direct tokens, double completion, the ring copy, no PCIe read for an empty slot |
-| `tx-pool` | TDMA ring, buffer pool and radio model: buffer ownership and conservation, refill order, in-flight above the ring size, drops, completion, teardown and restart, a TDMA that ignores the CPU index, a radio ring shared with host frames |
-| `ppe-cache` | the PPE index cache re-reads only when the ring looks full and never overruns |
-| `up-pipe` | the upload pipeline on one thread, with an ordering contract on every head/tail store |
-| `up-split` | the upload pipeline across two harts with a weak-memory model: delivery, back-pressure, key and station changes, RRO stop/restart, buffer conservation |
-
-`make mutate` (`tests/mutate-upsplit.py`) breaks one rule of `upsplit.c.inc`
-at a time and requires `up-pipe` or `up-split` to fail for every mutant.
+The host tests exercise replay counters, packet classification, receive
+buffer ownership, station frame validation, transmit completion parsing and
+draining pending packets while radio queues are unavailable, per-packet MLO
+routing, cross-radio token completion and priority classification.
+They use Linux virtual-memory mappings to simulate the reserved workspace.
 
 ## Interface
 
@@ -56,23 +30,75 @@ and each core's runtime ABI announcement before enabling packet queues.
 `protocol.h` defines the shared-memory regions and queue sizes. The device
 tree must reserve the firmware workspace and packet buffers before boot.
 
-Core 0 owns the Ethernet to Wi-Fi direction: it consumes the TDMA ring and
-re-arms it from a buffer pool (`tx-pool.c.inc`), submits Wi-Fi transmit
-descriptors and processes transmit completion. The
-Wi-Fi to Ethernet direction is a two-stage pipeline (`upsplit.c.inc`): core
-0 reads the reordered receive descriptors, runs the replay checks and parses
-frames; core 1 checks buffer state and station identity, feeds the Ethernet
-PPE or Linux, pops the PPE return queue and owns every receive buffer.
+Core 0 submits Wi-Fi transmit descriptors and processes transmit completion.
+Core 1 processes receive reordering, replay checks and Ethernet PPE input.
 Queue enable/active handshakes transfer ownership between Linux and the
 firmware. A separate park handshake stops both cores before driver teardown
 or a new firmware load. Cross-core state publication uses RISC-V fences.
 
-The fast receive path accepts authorized, individually addressed CCMP data
-with supported IPv4/IPv6 TCP/UDP headers. Unsupported packet layouts and
+The recovery protocol uses fenced trap acknowledgments and per-core readiness for a recovery
+interrupt. The host detects exceptions or a stalled heartbeat. If normal
+parking times out, NPU timer 0 interrupts both cores; the host still requires
+both park acknowledgments before stopping DMA and reusing buffers. A stalled
+interconnect transaction can prevent this handshake, in which case recovery
+retains the buffers and leaves acceleration stopped. Timer 0 is inside the
+existing NPU register aperture; no additional timer driver is involved.
+
+Transmit routing uses host-published DSCP maps and MLO transmit routes. Core 0 selects
+an eligible link for each packet using the driver's current TID parity policy.
+Both endpoints must retain the same peer identity and the selected BSS/radio;
+revoked or reused station identifiers cannot supply a route. Tokens retain
+their original TDMA pool identity when the destination radio changes.
+
+Replay protection uses generation-tagged replay domains shared by a peer's MLO links.
+Each link retains separate descriptor cookies, and A-MSDU continuation state
+is separate for each receive radio. Pairwise-key installation prepares all
+changed links, merges their saved counters, and commits receive eligibility
+only after all radio keys have been installed. Domain references are released
+on key removal and station teardown; stale generations cannot be reused.
+
+ABI 5 requires a negotiated native-bridge receive mode. Each eligible frame gets
+an internal C-tag carrying its authenticated receive WCID plus one. The host
+PPE driver must use that domain in the lookup, remove it in bound actions,
+and invalidate both ingress and egress entries before station reuse. Per-token
+saved headers occupy 0x841e0000..0x84210000; CPU misses restore the complete
+original header and overwritten descriptor tail. Tagged and unsupported
+wireless frames retain the Linux path. Host-ring backpressure must not release
+a buffer while PPE still owns it.
+
+This ABI requires a 4 MiB firmware reservation at 0x84000000. Replay domains
+occupy 0x84300000..0x8437ffff and the second radio's continuation state occupies
+0x84380000..0x843fffff. The packet workspace still starts at 0x84400000.
+The host initializes these regions and preserves domain generations across
+firmware recovery. Load this ABI only with its matching host driver and DTB.
+Host regression tests cover counter sharing, staged activation, removal,
+slot reuse and fault boundaries. Hardware qualification remains in progress.
+
+The QoS workspace occupies 0x84290000..0x84297fff, between forwarding work
+and station state. Compile-time bounds prevent overlap with those regions.
+mac80211 supplies custom QoS maps through an optional driver callback and
+restores them when recreating an interface. The radio and NPU receive the
+same table derived from cfg80211's classifier. This does not implement a
+new adaptive MLO scheduler or negotiated TID-to-link policy.
+
+The fast receive path accepts authorized, individually addressed CCMP-128,
+CCMP-256, GCMP-128 and GCMP-256 data with supported IPv4/IPv6 TCP/UDP headers. Unsupported packet layouts and
 traffic requiring normal stack processing go to Linux. Replay checks use
-per-station, per-TID counters; a snapshot command revokes the old entry while
+per-peer, per-TID counters shared by MLO links using the same key;
+a snapshot command revokes the old link entry while
 exporting its counters for radio recovery. Counter errors must not fall back
 to stale host state.
+
+Packets spanning multiple receive DMA buffers are passed to Linux as a whole.
+Continuation buffers contain payload rather than RX descriptors and must not
+be parsed independently. Replay validation runs after host reassembly; the
+firmware preserves packet boundaries when the host queue is backpressured.
+
+Station authorization and encryption policy are controlled by Linux. A
+successful supported pairwise-key installation publishes encrypted TX policy
+before forwarding resumes. Key removal revokes forwarding. Learning from an
+ordinary CPU data frame can fill an unknown policy but cannot overwrite an
+established policy; EAPOL frames never supply data encryption policy.
 
 Transmit key counters belong to the radio hardware. The MT7992 driver,
 not this firmware, saves and restores those counters across radio recovery.

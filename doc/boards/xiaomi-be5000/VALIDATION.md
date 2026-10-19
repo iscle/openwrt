@@ -1,4 +1,7 @@
-# Upstream validation
+# Validation record
+
+The following hardware results describe earlier tested revisions. They are
+retained as engineering evidence, not qualification of every later build.
 
 ## External 2.5-Gbit Ethernet (2026-09-25)
 
@@ -135,7 +138,7 @@ The firmware still manages the PLL; this is a Linux-side correction around
 its incomplete handoff sequence, not a replacement secure-firmware release.
 Final installed-image checks and hashes are recorded in release notes.
 
-## Source cleanup validation
+## Previous source cleanup validation (2026-09-25)
 
 The cleaned series was built with Linux 6.18.52 and U-Boot 2026.07. Both
 AN7563 device trees compile without DTC warnings and pass the relevant DT
@@ -162,35 +165,15 @@ This validation covers one BE5000 unit with the documented replacement flash
 layout. It does not validate stock-layout conversion or a complete boot image;
 BL2 and BL31 remain external prerequisites.
 
-## Ethernet PPE acceleration
+## Forwarding and NPU validation
 
-The host-managed PPE candidate uses the AN7552 512-entry SRAM table, initializes
-flow learning limits and forwards active-Ethernet traffic directly to GDM2.
-It does not enable NPU Wi-Fi acceleration or hardware HTB/ETS queue offload.
+Current forwarding architecture, tests and unresolved limitations are described
+in [NPU.md](NPU.md). The earlier Ethernet-only and vendor RX-only experiments
+are superseded by source-built ABI 5 firmware and native bridge entries.
 
-RAM tests on the BE5000 passed bidirectional hardware binding between the
-2.5-Gbit socket and a gigabit uplink. A 53,111,056-byte HTTPS download matched
-its published SHA-256 (`a5d4ba3841e3b52e4ac9854f2cfc1796e3846b14f341d7ea94a987897226c545`).
-The tightly sampled transfer increased the CPU softnet processed count by
-2,082 packets while the gigabit MAC received 57,438,340 bytes. These measurements
-include incidental traffic and are evidence of CPU bypass, not a line-rate
-benchmark. Hardware-bound flow entries and their timestamps were also checked.
-A second complete download after the flow-manager fixes matched the same hash.
-A UDP test received 400 valid DNS replies to 400 requests, with both directions
-present as bound UDP flows. IPv6 offload and routed NAT were not hardware-tested.
+## Source review on current upstream
 
-Moving the 2.5-Gbit port from VLAN 1 to isolated VLAN 100 stopped an established
-hardware-offloaded download, cleared the bound entries and blocked new
-connections. Restoring VLAN 1 and the original filtering state restored new
-connections. Bridger fixes consume command acknowledgements correctly and
-invalidate member flows when bridge policy changes. No runtime VLAN changes
-are embedded in firmware.
-
-At the Ethernet-only milestone, Xiaomi 1.0.91 NPU firmware was examined
-without booting or flashing it. Its mailbox dispatcher at 0x84005d1a accepts SET_WAIT IDs 0–28 and GET_WAIT
-IDs 0–7. OpenWrt's current NPU/Wi-Fi integration requires additional buffer,
-token and version commands. This binary is not a compatible replacement for
-the EN7581 firmware and is not redistributed in this tree. NPU compatibility
-required a separately validated legacy interface or suitable vendor firmware.
-The subsequent source-built transmit/receive integration and its validation
-are described in [NPU.md](NPU.md).
+The source cleanup starts from official OpenWrt commit
+`5dcf6a3b3da3cf9cfb2a0e73cbeac9a656a58cf6`. Hardware results above predate this
+rebase. A build or host-test pass does not extend those results to a new image;
+repeat hardware regression checks before installing or releasing it.
