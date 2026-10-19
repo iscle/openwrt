@@ -189,7 +189,8 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 #define AIROHA_BBT_SIG_LEN 4
 struct airoha_bmt_table {char signature[4]; unsigned value; u8 pad[24];};
-struct {int system_blks,total_blks,bmt_block,bbt_block;} ctx;
+struct {int system_blks,total_blks,bmt_block,bbt_block;u8 data_buf[2048];} ctx;
+static struct {u8 data_buf[2048];} bmtd;
 static struct airoha_bmt_table disk[8], before, next;
 static int writes, erases, write_error, erase_error, corrupt_write, fatal;
 static int cut, event, direction, erase_fail_after_write, bad_oob;
@@ -271,6 +272,115 @@ int main(void) {
          * failure must never return into the caller's rollback/retry. */
         assert(setjmp(escape) || (airoha_commit_table(&next,sizeof(next),3,&ctx.bmt_block,end),0));
         assert(fatal && disk[boot()].value==456);
+    }
+}
+"""
+            run_c(code)
+
+    def test_real_table_loaders_after_powercuts(self):
+        for path in ('target/linux/airoha/patches-6.18/900-airoha-bmt-support.patch',
+                     'package/boot/uboot-airoha/patches/600-mtd-spi-nand-add-airoha-bmt-support.patch'):
+            source = postimage(path)
+            code = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include <errno.h>
+#include <setjmp.h>
+#include <stdio.h>
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint16_t __le16;
+typedef uint32_t __le32;
+#define __packed __attribute__((packed))
+#define le16_to_cpu(x) (x)
+#define le32_to_cpu(x) (x)
+#define cpu_to_le32(x) (x)
+#define pr_info(...) ((void)0)
+#define printf(...) ((void)0)
+#define AIROHA_MAX_BMT_ENTRIES 250
+#define AIROHA_MAX_BBT_ENTRIES 250
+#define AIROHA_BMT_SIG "BMT"
+#define AIROHA_BBT_SIG "RAWB"
+#define AIROHA_BMT_SIG_LEN 3
+#define AIROHA_BBT_SIG_LEN 4
+#define AIROHA_BMT_VERSION 1
+#define AIROHA_BBT_VERSION 1
+"""
+            code += source[source.index('struct airoha_bmt_entry {'):
+                           source.index('struct airoha_bmt_ctx {')]
+            code += r"""
+static struct airoha_bmt_table bmt;
+static struct airoha_bbt_table bbt;
+static struct {
+    struct airoha_bmt_table *bmt;
+    struct airoha_bbt_table *bbt;
+    int system_blks,total_blks,pool_blks,bmt_block,bbt_block;
+    u8 data_buf[2048];
+} ctx={&bmt,&bbt,8,16,8,-1,-1};
+static struct {u8 data_buf[2048];} bmtd;
+static u8 disk[16][2048];
+static int cut,event;
+static jmp_buf escape;
+static void point(void){if(++event==cut)longjmp(escape,1);}
+static int airoha_bad_markers(int b){return 0;}
+static bool airoha_isbad_any(int b){return false;}
+static int airoha_read_oob_idx(int b,u16 *idx){*idx=0xffff;return 0;}
+static int airoha_read_data(int b,void *out,size_t n){memcpy(out,disk[b],n);return 0;}
+static int airoha_write_data(int b,const void *data,size_t n){memcpy(disk[b],data,n);point();return 0;}
+static int bbt_nand_erase(int b){memset(disk[b],255,2048);point();return 0;}
+static int airoha_erase(int b){return bbt_nand_erase(b);}
+static void airoha_metadata_ambiguous(void){assert(0);}
+"""
+            for signature in ('static u8 bmt_calc_checksum(', 'static u32 bbt_calc_checksum(',
+                              'static int bmt_find_by_mapped(',
+                              'static int find_available_pool_block(',
+                              'static bool bmt_entries_valid(', 'static bool bbt_entries_valid(',
+                              'static int load_bmt(', 'static int load_bbt(',
+                              'static int airoha_erase_metadata(',
+                              'static int airoha_clear_stale_metadata(',
+                              'static int airoha_commit_table(',
+                              'static int airoha_save_bmt(', 'static int airoha_save_bbt('):
+                if signature == 'static int find_available_pool_block(':
+                    code += 'static int airoha_markbad(int b){return 0;}\n'
+                code += function(source, signature) + '\n'
+            code += r"""
+static void boot(void) {
+    ctx.bmt_block=ctx.bbt_block=-1;
+    memset(&bmt,0,sizeof(bmt));memset(&bbt,0,sizeof(bbt));
+    assert(!load_bmt() && !load_bbt());
+    assert(bmt.header.checksum==bmt_calc_checksum(&bmt));
+    assert(bbt.header.checksum==bbt_calc_checksum(&bbt));
+}
+static void seed(void) {
+    cut=event=0;ctx.bmt_block=ctx.bbt_block=-1;
+    memset(disk,255,sizeof(disk));memset(&bmt,0,sizeof(bmt));memset(&bbt,0,sizeof(bbt));
+    bmt.header.mapped_count=1;bmt.entries[0].bad_index=2;bmt.entries[0].mapped_index=10;
+    bbt.header.badblock_count=1;bbt.entries[0]=1;
+    assert(!airoha_save_bmt() && !airoha_save_bbt());
+    boot();
+}
+int main(void) {
+    assert(sizeof(bmt)==1020 && sizeof(bbt)==512);
+    for(int table=0;table<2;table++)for(int boundary=1;boundary<=3;boundary++) {
+        seed();
+        if(table)bbt.entries[0]=3;else bmt.entries[0].mapped_index=11;
+        event=0;cut=boundary;
+        if(!setjmp(escape))assert(!(table?airoha_save_bbt():airoha_save_bmt()));
+        cut=0;boot();
+        if(table) {
+            assert(bmt.entries[0].mapped_index==10);
+            assert(bbt.entries[0]==1 || bbt.entries[0]==3);
+            bbt.entries[0]=4;assert(!airoha_save_bbt());boot();
+            assert(bbt.entries[0]==4 && bmt.entries[0].mapped_index==10);
+        } else {
+            assert(bbt.entries[0]==1);
+            assert(bmt.entries[0].mapped_index==10 || bmt.entries[0].mapped_index==11);
+            bmt.entries[0].mapped_index=12;assert(!airoha_save_bmt());boot();
+            assert(bmt.entries[0].mapped_index==12 && bbt.entries[0]==1);
+        }
     }
 }
 """

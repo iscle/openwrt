@@ -607,16 +607,16 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 + */
 +static int airoha_erase_metadata(int block)
 +{
-+	u8 check[sizeof(struct airoha_bmt_table)];
++	u8 *check = ctx.data_buf;
 +	int i, ret;
 +
 +	ret = airoha_erase(block);
 +	if (ret)
 +		return ret;
-+	ret = airoha_read_data(block, check, sizeof(check));
++	ret = airoha_read_data(block, check, sizeof(struct airoha_bmt_table));
 +	if (ret)
 +		return ret;
-+	for (i = 0; i < sizeof(check); i++)
++	for (i = 0; i < sizeof(struct airoha_bmt_table); i++)
 +		if (check[i] != 0xff)
 +			return -EIO;
 +	return 0;
@@ -664,7 +664,7 @@ Signed-off-by: Iscle <albertiscle9@gmail.com>
 +static int airoha_commit_table(const void *table, size_t len, size_t sig_len,
 +			       int *current_block, bool from_end)
 +{
-+	u8 check[sizeof(struct airoha_bmt_table)];
++	u8 *check = ctx.data_buf;
 +	int block, ret;
 +	u16 index;
 +
