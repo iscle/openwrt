@@ -150,6 +150,7 @@ int main(void) {
     assert(an7552_npu_start(&c)==-ESHUTDOWN);
     assert(!an7552_npu_recovery_ready(&c)&&!boots&&!starts&&!c.setup_users);
     an7552_npu_require_quiescent(&c);assert(proofs==1);
+    pthread_mutex_destroy(&c.setup_lock);pthread_mutex_destroy(&c.attach_lock);
 
     for(int stopped=0;stopped<2;stopped++) {
         /* Shutdown must wait for both admitted recovery and admitted stop. */

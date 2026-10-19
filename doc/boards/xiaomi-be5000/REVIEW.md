@@ -24,15 +24,21 @@ uses that state to reject duplicate completions. A full or flushing queue is
 checked before packet mutation. The AN7563 switch identifier moves past the
 new upstream EN7528 identifier. Shutdown now requires NPU quiescence, and an
 unresolved AN7563 QDMA idle timeout stops the system before freeing DMA memory
-or returning RAM to the bootloader.
+or returning RAM to the bootloader. A terminal admission gate drains setup
+and stop operations already in progress and prevents later recovery from
+restarting the NPU. The PCI consumer invokes that proof before radio reset;
+a dependency on its companion PCI function preserves this shutdown order.
 
 Nested package-selection guards exposed a dnsmasq Kconfig dependency cycle.
 The metadata generator now recognizes prerequisites already guaranteed by an
 enclosing selection guard, while retaining unrelated prerequisites and virtual
 provider selection. The regression includes the actual generated Kconfig with
-fatal recursive-dependency checks. A separate reviewer checked the metadata
-fix and the refreshed Wi-Fi stack; Ethernet integration receives a separate
-review from its implementation author.
+fatal recursive-dependency checks. The updated ucode API also introduces an
+execution-break status: uhttpd now rejects interrupted handler initialization
+instead of failing its exhaustive-switch build or accepting partial setup. A separate reviewer checked the metadata
+fix and the refreshed Wi-Fi stack. A reviewer independent of the implementation
+authors checked Ethernet integration, terminal shutdown and PCI ordering;
+confirmed findings were fixed and returned for another review pass.
 
 ## October 19 consolidation and performance-port review
 
