@@ -1,0 +1,73 @@
+name: BE5000 regressions
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/be5000-regressions.yml'
+      - 'scripts/**'
+      - 'include/image*.mk'
+      - 'package/boot/uboot-airoha/**'
+      - 'package/firmware/an7552-npu-firmware/**'
+      - 'package/kernel/mac80211/**'
+      - 'package/kernel/mt76/**'
+      - 'package/network/services/bridger/**'
+      - 'target/linux/airoha/**'
+      - 'target/linux/generic/**'
+  push:
+    branches: [be5000-npu]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install firmware build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm device-tree-compiler
+      - name: Build Kconfig helper and run host fault injection
+        run: |
+          make -C scripts/config conf
+          python3 -m unittest discover -v -s scripts/tests -p 'test_*.py'
+      - name: Build RISC-V firmware and run firmware regressions
+        run: make -C package/firmware/an7552-npu-firmware/src all check
+      - name: Compile the BE5000 device tree
+        shell: bash
+        run: |
+          kernel_series=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/airoha/Makefile)
+          kernel_suffix=$(sed -n "s/^LINUX_VERSION-$kernel_series = //p" "target/linux/generic/kernel-$kernel_series")
+          [[ "$kernel_series$kernel_suffix" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          kernel_headers="$RUNNER_TEMP/linux-headers"
+          git clone --depth=1 --filter=blob:none --sparse --branch "v$kernel_series$kernel_suffix" \
+            https://github.com/gregkh/linux.git "$kernel_headers"
+          git -C "$kernel_headers" sparse-checkout set include
+          gcc -E -P -nostdinc -x assembler-with-cpp -I "$kernel_headers/include" \
+            -I target/linux/airoha/dts target/linux/airoha/dts/an7563-xiaomi-be5000.dts \
+            -o "$RUNNER_TEMP/be5000.dts"
+          dtc -I dts -O dtb -o "$RUNNER_TEMP/be5000.dtb" "$RUNNER_TEMP/be5000.dts"
+      - name: Apply the complete mt76 patch series and test RX fragmentation
+        shell: bash
+        run: |
+          mt76_source="$RUNNER_TEMP/mt76"
+          mt76_revision=$(sed -n 's/^PKG_SOURCE_VERSION:=//p' package/kernel/mt76/Makefile)
+          [[ "$mt76_revision" =~ ^[0-9a-f]{40}$ ]]
+          git init "$mt76_source"
+          git -C "$mt76_source" fetch --depth=1 https://github.com/openwrt/mt76.git "$mt76_revision"
+          git -C "$mt76_source" checkout --detach FETCH_HEAD
+          for patch_file in package/kernel/mt76/patches/*.patch; do
+            patch --batch --forward --fuzz=0 -d "$mt76_source" -p1 < "$patch_file"
+          done
+          python3 package/kernel/mt76/tests/rx-skip-frags.py "$mt76_source/dma.c"
+          python3 package/kernel/mt76/tests/probe-unwind.py "$mt76_source/mt7996/init.c"
+          python3 package/kernel/mt76/tests/qos-map-vlan.py "$mt76_source/mt7996/main.c"
